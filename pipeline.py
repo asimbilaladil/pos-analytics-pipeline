@@ -223,6 +223,63 @@ def fetch_items_for_orders(context, order_ids: list) -> list:
     return all_items
 
 
+# ─── Product Reference Cache ─────────────────────────────────────────────────
+def fetch_and_upsert_products(context, conn) -> None:
+    """
+    Fetch all products from /resources/Product/ and upsert into the products
+    reference table. Called once per pipeline run before the establishment loop
+    to satisfy the order_items.product_id FK constraint.
+    """
+    log.info("Fetching product reference data from Revel...")
+    records = fetch_all_pages(
+        context,
+        endpoint=f"{BASE_URL}/resources/Product/",
+        params={},
+        label="products",
+    )
+
+    if not records:
+        log.warning("No products returned — order_items inserts may fail on FK")
+        return
+
+    rows = []
+    for p in records:
+        pid = p.get("id")
+        if not pid:
+            continue
+        rows.append((
+            pid,
+            p.get("resource_uri"),
+            (p.get("name") or "").strip() or f"Product #{pid}",
+            p.get("product_class"),
+            bool(p.get("is_combo", False)),
+            bool(p.get("is_modifier", False)),
+            to_float(p.get("price")),
+            bool(p.get("active", True)),
+        ))
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO products (id, revel_uri, name, product_class, is_combo, is_modifier, base_price, active)
+            VALUES %s
+            ON CONFLICT (id) DO UPDATE SET
+                name          = EXCLUDED.name,
+                product_class = EXCLUDED.product_class,
+                is_combo      = EXCLUDED.is_combo,
+                is_modifier   = EXCLUDED.is_modifier,
+                base_price    = EXCLUDED.base_price,
+                active        = EXCLUDED.active,
+                updated_at    = NOW()
+            """,
+            rows,
+            page_size=500,
+        )
+    conn.commit()
+    log.info("Product cache ready: %d products upserted", len(rows))
+
+
 # ─── Modifier Reference Cache ────────────────────────────────────────────────
 def fetch_and_upsert_modifiers(context, conn) -> dict:
     """
@@ -647,7 +704,8 @@ def main():
 
         page.close()
 
-        # Fetch modifier reference data once — shared across all establishments
+        # Fetch reference data once — products and modifiers shared across all establishments
+        fetch_and_upsert_products(context, conn)
         modifier_cache = fetch_and_upsert_modifiers(context, conn)
 
         # Run each establishment
