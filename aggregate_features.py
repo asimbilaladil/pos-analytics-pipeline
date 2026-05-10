@@ -58,12 +58,12 @@ INSERT INTO features_hourly (
 )
 SELECT
     o.establishment_id,
-    DATE(o.created_date AT TIME ZONE 'US/Central')                          AS date,
-    EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT  AS hour,
-    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT - 1 AS day_of_week,
-    EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT AS week_of_year,
-    EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT AS month,
-    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central') IN (6,7) AS is_weekend,
+    DATE(o.created_date AT TIME ZONE 'America/Chicago')                          AS date,
+    EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT  AS hour,
+    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT - 1 AS day_of_week,
+    EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT AS week_of_year,
+    EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT AS month,
+    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago') IN (6,7) AS is_weekend,
 
     COUNT(DISTINCT o.id)                                AS order_count,
     COUNT(oi.id)                                        AS item_count,
@@ -103,11 +103,11 @@ WHERE
 
 GROUP BY
     o.establishment_id,
-    DATE(o.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'US/Central')
+    DATE(o.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'America/Chicago')
 
 ON CONFLICT (establishment_id, date, hour) DO UPDATE SET
     order_count          = EXCLUDED.order_count,
@@ -144,11 +144,11 @@ SELECT
     oi.establishment_id,
     oi.product_id,
     MAX(oi.product_name)                                        AS product_name,
-    DATE(oi.created_date AT TIME ZONE 'US/Central')             AS date,
-    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'US/Central')::SMALLINT - 1 AS day_of_week,
-    EXTRACT(WEEK   FROM oi.created_date AT TIME ZONE 'US/Central')::SMALLINT     AS week_of_year,
-    EXTRACT(MONTH  FROM oi.created_date AT TIME ZONE 'US/Central')::SMALLINT     AS month,
-    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'US/Central') IN (6,7)      AS is_weekend,
+    DATE(oi.created_date AT TIME ZONE 'America/Chicago')             AS date,
+    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'America/Chicago')::SMALLINT - 1 AS day_of_week,
+    EXTRACT(WEEK   FROM oi.created_date AT TIME ZONE 'America/Chicago')::SMALLINT     AS week_of_year,
+    EXTRACT(MONTH  FROM oi.created_date AT TIME ZONE 'America/Chicago')::SMALLINT     AS month,
+    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'America/Chicago') IN (6,7)      AS is_weekend,
 
     SUM(oi.quantity)                                            AS quantity_sold,
     COUNT(DISTINCT oi.order_id)                                 AS order_count,
@@ -196,10 +196,10 @@ WHERE
 GROUP BY
     oi.establishment_id,
     oi.product_id,
-    DATE(oi.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(WEEK   FROM oi.created_date AT TIME ZONE 'US/Central'),
-    EXTRACT(MONTH  FROM oi.created_date AT TIME ZONE 'US/Central')
+    DATE(oi.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(ISODOW FROM oi.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(WEEK   FROM oi.created_date AT TIME ZONE 'America/Chicago'),
+    EXTRACT(MONTH  FROM oi.created_date AT TIME ZONE 'America/Chicago')
 
 ON CONFLICT (establishment_id, product_id, date) DO UPDATE SET
     product_name        = EXCLUDED.product_name,
@@ -233,11 +233,11 @@ INSERT INTO features_daily_summary (
 WITH order_stats AS (
     SELECT
         o.establishment_id,
-        DATE(o.created_date AT TIME ZONE 'US/Central')             AS date,
-        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT - 1 AS day_of_week,
-        EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT     AS week_of_year,
-        EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'US/Central')::SMALLINT     AS month,
-        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central') IN (6,7)      AS is_weekend,
+        DATE(o.created_date AT TIME ZONE 'America/Chicago')             AS date,
+        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT - 1 AS day_of_week,
+        EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT     AS week_of_year,
+        EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'America/Chicago')::SMALLINT     AS month,
+        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago') IN (6,7)      AS is_weekend,
         COUNT(DISTINCT o.id)                                        AS total_orders,
         COALESCE(SUM(o.final_total), 0)                             AS total_revenue,
         AVG(o.final_total)                                          AS avg_order_value,
@@ -248,7 +248,7 @@ WITH order_stats AS (
         SUM(o.final_total) FILTER (WHERE o.dining_option = 4)       AS rev_drive_through,
         SUM(o.final_total) FILTER (WHERE o.dining_option IN (100,101)) AS rev_third_party,
         SUM(o.final_total) FILTER (WHERE o.dining_option IN (0,1,2,3)) AS rev_in_store,
-        EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'US/Central') AS hour,
+        EXTRACT(HOUR FROM o.created_date AT TIME ZONE 'America/Chicago') AS hour,
         COUNT(DISTINCT o.id)                                        AS hour_order_count
     FROM orders o
     WHERE
@@ -258,16 +258,16 @@ WITH order_stats AS (
         AND o.created_date <  %(day_end)s
     GROUP BY
         o.establishment_id,
-        DATE(o.created_date AT TIME ZONE 'US/Central'),
-        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'US/Central'),
-        EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'US/Central'),
-        EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'US/Central'),
-        EXTRACT(HOUR   FROM o.created_date AT TIME ZONE 'US/Central')
+        DATE(o.created_date AT TIME ZONE 'America/Chicago'),
+        EXTRACT(ISODOW FROM o.created_date AT TIME ZONE 'America/Chicago'),
+        EXTRACT(WEEK   FROM o.created_date AT TIME ZONE 'America/Chicago'),
+        EXTRACT(MONTH  FROM o.created_date AT TIME ZONE 'America/Chicago'),
+        EXTRACT(HOUR   FROM o.created_date AT TIME ZONE 'America/Chicago')
 ),
 item_stats AS (
     SELECT
         oi.establishment_id,
-        DATE(oi.created_date AT TIME ZONE 'US/Central')    AS date,
+        DATE(oi.created_date AT TIME ZONE 'America/Chicago')    AS date,
         COUNT(oi.id)                                        AS total_items,
         AVG(oi.kitchen_seconds)                             AS avg_kitchen_seconds,
         COUNT(DISTINCT oi.order_id) FILTER (
@@ -279,7 +279,7 @@ item_stats AS (
         oi.deleted = FALSE
         AND oi.created_date >= %(day_start)s
         AND oi.created_date <  %(day_end)s
-    GROUP BY oi.establishment_id, DATE(oi.created_date AT TIME ZONE 'US/Central')
+    GROUP BY oi.establishment_id, DATE(oi.created_date AT TIME ZONE 'America/Chicago')
 ),
 agg AS (
     SELECT
