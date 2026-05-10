@@ -1,0 +1,25 @@
+# macOS metadata
+._*
+.DS_Store
+
+# Revel session cache
+state.json
+revel_session.json
+/tmp/revel_session.json
+
+# Raw data dumps (large, not for version control)
+sample-one-day-data/
+orders_with_items_*.json
+
+# Environment / secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Logs
+*.log
