@@ -31,6 +31,9 @@ aggregate_features.py  ← nightly aggregation job (runs 3:00 AM via cron)
 |---|---|
 | `pipeline.py` | Main daily pipeline — logs into Revel, fetches all orders + items + modifiers for each location, inserts into PostgreSQL |
 | `aggregate_features.py` | Nightly aggregation — reads raw tables, populates feature tables for ML |
+| `run.sh` | Daily cron wrapper — runs `pipeline.py` then `aggregate_features.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
+| `backfill.sh` | Simple date-range backfill — loops day by day, runs pipeline + aggregation for each date |
+| `backfill3m.sh` | Smart 3-month backfill — auto-resume (skips completed dates), rate limiting, failure tracking, `--status` mode |
 | `ingest_to_db.py` | Offline ingestion — reads JSON files produced by `order_fixed.py` and inserts into DB |
 | `order_fixed.py` | Manual/debug tool — fetches from Revel and saves JSON files to disk |
 | `database_design.sql` | Full PostgreSQL schema (run once on a fresh DB) |
@@ -124,11 +127,27 @@ python3 aggregate_features.py --date 2026-05-04
 
 ### 5. Backfill historical data
 
+**Simple backfill** — loops day by day with a 2-second pause between dates:
+
 ```bash
 bash /opt/laynes/backfill.sh 2026-01-01 2026-04-30
 ```
 
-Loops day by day, runs pipeline + aggregation for each date. Takes ~10–15 min per month of data.
+**Smart backfill** — auto-resumes (skips already-completed dates), 30-minute sleep between dates to avoid API rate limits, tracks failures:
+
+```bash
+# Last 3 months → yesterday (default)
+nohup bash /opt/laynes/backfill3m.sh > /var/log/laynes/backfill3m.log 2>&1 &
+
+# Custom date range
+nohup bash /opt/laynes/backfill3m.sh 2026-01-01 2026-04-30 > /var/log/laynes/backfill3m.log 2>&1 &
+
+# Watch live progress
+tail -f /var/log/laynes/backfill3m.log
+
+# Check status / see incomplete dates
+bash /opt/laynes/backfill3m.sh --status
+```
 
 ---
 
