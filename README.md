@@ -1,6 +1,6 @@
 # POS Analytics Pipeline
 
-A production-grade data pipeline for **Laynes Chicken Fingers** that pulls daily order data from the Revel POS API across 11 locations, stores it in PostgreSQL, and builds pre-aggregated feature tables ready for ML demand prediction.
+A production-grade data pipeline for **Laynes Chicken Fingers** that pulls daily order data from the Revel POS API across 11 locations, stores it in PostgreSQL, builds pre-aggregated feature tables, and generates 15-minute interval item quantity predictions for each location.
 
 ---
 
@@ -10,17 +10,22 @@ A production-grade data pipeline for **Laynes Chicken Fingers** that pulls daily
 Revel POS API
      │
      ▼
-pipeline.py          ← daily fetch + DB insert (runs 2:00 AM via cron)
+pipeline.py              ← fetch yesterday's orders + items + modifiers, insert into DB
+     │
+     ▼
+aggregate_features.py    ← compute hourly/daily feature tables from raw data
+     │
+     ▼
+predict_daily.py         ← generate 15-min item predictions for today (all 11 locations)
      │
      ▼
 PostgreSQL (4 layers)
   ├── Layer 0: Reference tables  (establishments, products, modifiers, dining_channels)
   ├── Layer 1: Raw ingestion     (orders, order_items, modifier_items)  ← append-only, partitioned by month
   ├── Layer 2: Feature tables    (features_hourly, features_product_daily, features_daily_summary)
-  └── Layer 3: Prediction output (predictions_hourly_demand, predictions_prep_sheet, predictions_staffing)
-     │
-     ▼
-aggregate_features.py  ← nightly aggregation job (runs 3:00 AM via cron)
+  └── Layer 3: Prediction output (predictions_15min, predictions_hourly_demand, predictions_prep_sheet, predictions_staffing)
+
+All three scripts run sequentially at 2:00 AM via run.sh.
 ```
 
 ---
@@ -31,7 +36,8 @@ aggregate_features.py  ← nightly aggregation job (runs 3:00 AM via cron)
 |---|---|
 | `pipeline.py` | Main daily pipeline — logs into Revel, fetches all orders + items + modifiers for each location, inserts into PostgreSQL |
 | `aggregate_features.py` | Nightly aggregation — reads raw tables, populates feature tables for ML |
-| `run.sh` | Daily cron wrapper — runs `pipeline.py` then `aggregate_features.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
+| `predict_daily.py` | 15-min item prediction — generates per-product, per-slot quantity forecasts for each location; supports backtesting with `--validate` |
+| `run.sh` | Daily cron wrapper — runs `pipeline.py` → `aggregate_features.py` → `predict_daily.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
 | `backfill.sh` | Simple date-range backfill — loops day by day, runs pipeline + aggregation for each date |
 | `backfill3m.sh` | Smart 3-month backfill — auto-resume (skips completed dates), rate limiting, failure tracking, `--status` mode |
 | `ingest_to_db.py` | Offline ingestion — reads JSON files produced by `order_fixed.py` and inserts into DB |
@@ -60,6 +66,7 @@ aggregate_features.py  ← nightly aggregation job (runs 3:00 AM via cron)
 - **`features_daily_summary`** — daily rollup per location including peak hour, channel mix, void rate
 
 ### Layer 3 — Prediction Output
+- **`predictions_15min`** — predicted item quantities per product per 15-min slot per location (96 slots/day); written by `predict_daily.py`
 - **`predictions_hourly_demand`** — predicted order count and revenue per hour
 - **`predictions_prep_sheet`** — predicted prep quantities per item per shift
 - **`predictions_staffing`** — recommended headcount per shift
@@ -123,6 +130,18 @@ python3 pipeline.py --establishments 32,14
 
 # Aggregate feature tables (run after pipeline.py)
 python3 aggregate_features.py --date 2026-05-04
+
+# Generate 15-min predictions for today
+python3 predict_daily.py
+
+# Generate predictions for a specific date (backtest)
+python3 predict_daily.py --date 2026-05-13
+
+# Backtest + accuracy report vs actual data
+python3 predict_daily.py --date 2026-05-13 --validate
+
+# Use more historical weeks (default: 8)
+python3 predict_daily.py --lookback 12
 ```
 
 ### 5. Backfill historical data
@@ -154,10 +173,33 @@ bash /opt/laynes/backfill3m.sh --status
 ## Cron Schedule
 
 ```
-0 2 * * *   /opt/laynes/run.sh   # 2:00 AM — fetch from Revel + insert + aggregate
+0 2 * * *   /opt/laynes/run.sh   # 2:00 AM — fetch + insert + aggregate + predict
 ```
 
-`run.sh` runs `pipeline.py` then `aggregate_features.py` and logs to `/var/log/laynes/run_YYYY-MM-DD.log`. Logs are retained for 30 days.
+`run.sh` runs all three scripts in sequence and logs everything to `/var/log/laynes/run_YYYY-MM-DD.log`. Logs are retained for 30 days.
+
+---
+
+## 15-Min Item Prediction Model
+
+`predict_daily.py` generates a daily forecast before the business day starts. For each location, product, and 15-minute slot it:
+
+1. Looks back at the last 8 same-day-of-week dates (e.g. the last 8 Wednesdays)
+2. Drops any date where that location's total daily volume exceeded mean + 2σ (outlier filter)
+3. Computes a recency-weighted average — the most recent week gets weight `n`, the oldest gets weight `1`
+4. Outputs predicted quantity ± 1 std dev as the confidence interval
+
+The daily summary printed to the log shows:
+- **All-day prep totals** — top 10 items ranked by predicted daily quantity
+- **Peak period** — the 5-slot window around the busiest 15-min slot with per-item breakdown
+- **Shift breakdown** — Morning / Lunch / Afternoon / Dinner totals with top items
+
+**Backtested accuracy (May 13, 2026 — 8 weeks of history):**
+- Mean Absolute Error: 0.67 units/slot
+- 86% of slots within ±1 unit of actual
+- 94% of slots within ±2 units of actual
+
+Results are stored in `predictions_15min` and can be queried per location, product, or time slot.
 
 ---
 
