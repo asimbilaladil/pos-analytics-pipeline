@@ -33,5 +33,13 @@ else
     exit 1
 fi
 
+log "Running predict_daily.py..."
+if "$VENV/bin/python3" "$APP_DIR/predict_daily.py" >> "$LOG_FILE" 2>&1; then
+    log "predict_daily.py completed successfully"
+else
+    log "ERROR: predict_daily.py failed — check $LOG_FILE"
+    exit 1
+fi
+
 log "Pipeline complete for $DATE"
 find "$LOG_DIR" -name "run_*.log" -mtime +30 -delete 2>/dev/null || true
