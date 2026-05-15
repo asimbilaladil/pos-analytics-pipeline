@@ -46,7 +46,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SCRIPT_VERSION = "lgbm_v3"
+SCRIPT_VERSION = "lgbm_v4"
 DATA_START     = date(2026, 2, 10)
 MIN_DAYS       = 3
 DOW_NAMES      = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -57,6 +57,7 @@ FEATURE_COLS = [
     "slot_index", "day_of_week", "week_of_year", "month", "is_weekend",
     "lag_7d", "lag_14d", "lag_21d",
     "roll_dow_4w", "roll_dow_8w",
+    "roll_dow_std",    # std dev of last 8 same-DOW values — stops model chasing trends for volatile items
     "activity_rate",
 ]
 CAT_COLS     = ["establishment_id", "product_id"]
@@ -162,6 +163,7 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
     df_v['lag_21d']      = lags_mat[:, 2]
     df_v['roll_dow_4w']  = lags_mat[:, :4].mean(axis=1)
     df_v['roll_dow_8w']  = lags_mat[:, :8].mean(axis=1)
+    df_v['roll_dow_std'] = lags_mat[:, :8].std(axis=1)
     df_v['day_of_week']  = np.array([d.isoweekday() - 1 for d in df_v['sale_date']], dtype=np.int32)
     df_v['week_of_year'] = np.array([d.isocalendar()[1] for d in df_v['sale_date']], dtype=np.int32)
     df_v['month']        = np.array([d.month for d in df_v['sale_date']], dtype=np.int32)
@@ -210,6 +212,7 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
             "lag_21d":           lag_vals[2],
             "roll_dow_4w":       float(lag_vals[:4].mean()),
             "roll_dow_8w":       float(lag_vals[:8].mean()),
+            "roll_dow_std":      float(lag_vals[:8].std()),
             "recent_dow_count":  rdow_count,   # how many of last 8 same-DOW dates had sales
         })
 
