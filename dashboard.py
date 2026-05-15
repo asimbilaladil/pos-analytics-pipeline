@@ -281,8 +281,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("🕐 All times in **Central Time** (Houston, TX)")
-    st.caption("Predictions generated nightly at 2 AM CT by LightGBM (lgbm_v4).")
-    st.caption("Accuracy: 88% within ±1 unit, 94% within ±2 units.")
+    st.caption("Predictions generated nightly at 2 AM CT by LightGBM (lgbm_v5).")
+    st.caption("Per-location models for top-20 items; global fallback for the rest.")
 
 # ── Accuracy Report page ──────────────────────────────────────────────────────
 

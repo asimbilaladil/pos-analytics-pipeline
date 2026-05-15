@@ -1,22 +1,20 @@
 """
-predict_daily_ml.py  (v3 — consistent Python lag features)
-===========================================================
+predict_daily_ml.py  (v5 — per-location models for top-20 items + global fallback)
+====================================================================================
 LightGBM-based 15-min item quantity predictions.
 
-Key design decisions:
-  - All lag features computed in Python using dict lookups — training and
-    prediction features are computed identically, avoiding the mismatch
-    between SQL window LAG (occurrence-based) and calendar date offsets.
-  - Trains on positive observations only (no full-grid OOM).
-  - activity_rate feature prevents over-predicting low-frequency combos.
-  - Prediction filtered to combos active in at least 1 of last 8 same-DOW dates.
-  - 4 CPU threads for LightGBM.
+Architecture:
+  - Per-location LightGBM for each location's top-20 items by volume (~78% of sales).
+    These models drop establishment_id (constant within a location) and use softer
+    hyperparameters suited to the smaller per-location dataset.
+  - Global LightGBM fallback for all remaining low-volume items (same design as v4).
+  - Both models use the same Python-computed lag features for train/predict consistency.
 
 Features:
   slot_index, day_of_week, week_of_year, month, is_weekend,
-  establishment_id, product_id (categorical),
+  establishment_id (global only), product_id (categorical),
   lag_7d / lag_14d / lag_21d,
-  roll_dow_4w / roll_dow_8w,
+  roll_dow_4w / roll_dow_8w / roll_dow_std,
   activity_rate
 
 Usage:
@@ -38,6 +36,8 @@ import pandas as pd
 import lightgbm as lgb
 import psycopg2
 import psycopg2.extras
+from dotenv import load_dotenv
+load_dotenv("/opt/laynes/.env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,24 +46,30 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SCRIPT_VERSION = "lgbm_v4"
+SCRIPT_VERSION = "lgbm_v5"
 DATA_START     = date(2026, 2, 10)
 MIN_DAYS       = 3
+TOP_N          = 20          # items per location for per-location models
 DOW_NAMES      = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 LAG_OFFSETS    = [7, 14, 21, 28, 35, 42, 49, 56]
 
+# Global model features (includes establishment_id)
 FEATURE_COLS = [
     "establishment_id", "product_id",
     "slot_index", "day_of_week", "week_of_year", "month", "is_weekend",
     "lag_7d", "lag_14d", "lag_21d",
-    "roll_dow_4w", "roll_dow_8w",
-    "roll_dow_std",    # std dev of last 8 same-DOW values — stops model chasing trends for volatile items
+    "roll_dow_4w", "roll_dow_8w", "roll_dow_std",
     "activity_rate",
 ]
 CAT_COLS     = ["establishment_id", "product_id"]
 NUMERIC_COLS = [c for c in FEATURE_COLS if c not in CAT_COLS]
 
-# ── SQL: raw slot observations (no lag features — computed in Python) ──────────
+# Per-location model features (establishment_id is constant — drop it)
+LOC_FEATURE_COLS = [c for c in FEATURE_COLS if c != "establishment_id"]
+LOC_CAT_COLS     = ["product_id"]
+LOC_NUMERIC_COLS = [c for c in LOC_FEATURE_COLS if c not in LOC_CAT_COLS]
+
+# ── SQL ───────────────────────────────────────────────────────────────────────
 
 SLOT_DATA_SQL = """
 SELECT
@@ -93,7 +99,7 @@ def db_connect():
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", 5432)),
         dbname=os.getenv("DB_NAME", "laynes"),
-        user=os.getenv("DB_USER", "postgres"),
+        user=os.getenv("DB_USER", "laynes_user"),
         password=os.getenv("DB_PASS"),
     )
 
@@ -109,39 +115,47 @@ def df_from_query(conn, sql, params) -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
 
 
+def find_top_items(df_raw: pd.DataFrame, est_id: int, n: int = TOP_N) -> set:
+    """Return set of top-N product_ids by total quantity for one establishment."""
+    sub = df_raw[df_raw["establishment_id"] == est_id]
+    return set(
+        sub.groupby("product_id")["qty"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(n)
+        .index.tolist()
+    )
+
+
 # ── Feature engineering ───────────────────────────────────────────────────────
 
 def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> tuple:
     """
-    Returns (df_train, df_pred, val_start):
-      df_train: training rows with all features, sale_date < target_date - 14
+    Returns (df_train, df_val, df_pred):
+      df_train: rows with all features, sale_date < target_date - 14
+      df_val:   rows with all features, target_date-14 <= sale_date < target_date
       df_pred:  one row per active combo for target_date, with lag features
-      val_start: first date of validation window (target_date - 14)
     """
     df = df.copy()
-    df['sale_date'] = pd.to_datetime(df['sale_date']).dt.date
-    df['qty']       = df['qty'].astype(float)
+    df["sale_date"] = pd.to_datetime(df["sale_date"]).dt.date
+    df["qty"]       = df["qty"].astype(float)
 
-    # ── combo stats ───────────────────────────────────────────────────────────
-    combo_counts = (df.groupby(['establishment_id', 'product_id', 'slot_index'])
-                      ['sale_date'].nunique())
+    combo_counts = (df.groupby(["establishment_id", "product_id", "slot_index"])
+                      ["sale_date"].nunique())
     valid_set  = set(combo_counts[combo_counts >= MIN_DAYS].index)
     act_rate   = (combo_counts / float(total_days)).to_dict()
 
-    # latest product_name per (est, prod)
-    pname_df   = (df.sort_values('sale_date')
-                    .groupby(['establishment_id', 'product_id'])['product_name']
-                    .last()
-                    .to_dict())
+    pname_df = (df.sort_values("sale_date")
+                  .groupby(["establishment_id", "product_id"])["product_name"]
+                  .last()
+                  .to_dict())
 
-    # ── dict lookup: (est, prod, slot, date) -> qty ───────────────────────────
     log.info("  Building lookup dict (%d rows)...", len(df))
     lookup: dict = {}
     for r in df.itertuples(index=False):
         lookup[(int(r.establishment_id), int(r.product_id),
                 int(r.slot_index), r.sale_date)] = float(r.qty)
 
-    # ── filter training rows to valid combos ──────────────────────────────────
     mask = np.array([
         (int(r.establishment_id), int(r.product_id), int(r.slot_index)) in valid_set
         for r in df.itertuples(index=False)
@@ -149,7 +163,6 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
     df_v = df[mask].reset_index(drop=True)
     log.info("  Valid training rows: %d  (filtered from %d)", len(df_v), len(df))
 
-    # ── compute lag features for training rows ────────────────────────────────
     log.info("  Computing lag features for training data...")
     lags_mat = np.zeros((len(df_v), len(LAG_OFFSETS)), dtype=np.float32)
     for idx, r in enumerate(df_v.itertuples(index=False)):
@@ -158,33 +171,30 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
             lags_mat[idx, j] = lookup.get(base + (r.sale_date - timedelta(days=d),), 0.0)
 
     df_v = df_v.copy()
-    df_v['lag_7d']       = lags_mat[:, 0]
-    df_v['lag_14d']      = lags_mat[:, 1]
-    df_v['lag_21d']      = lags_mat[:, 2]
-    df_v['roll_dow_4w']  = lags_mat[:, :4].mean(axis=1)
-    df_v['roll_dow_8w']  = lags_mat[:, :8].mean(axis=1)
-    df_v['roll_dow_std'] = lags_mat[:, :8].std(axis=1)
-    df_v['day_of_week']  = np.array([d.isoweekday() - 1 for d in df_v['sale_date']], dtype=np.int32)
-    df_v['week_of_year'] = np.array([d.isocalendar()[1] for d in df_v['sale_date']], dtype=np.int32)
-    df_v['month']        = np.array([d.month for d in df_v['sale_date']], dtype=np.int32)
-    df_v['is_weekend']   = np.array([int(d.isoweekday() >= 6) for d in df_v['sale_date']], dtype=np.int32)
-    df_v['activity_rate'] = np.array([
+    df_v["lag_7d"]        = lags_mat[:, 0]
+    df_v["lag_14d"]       = lags_mat[:, 1]
+    df_v["lag_21d"]       = lags_mat[:, 2]
+    df_v["roll_dow_4w"]   = lags_mat[:, :4].mean(axis=1)
+    df_v["roll_dow_8w"]   = lags_mat[:, :8].mean(axis=1)
+    df_v["roll_dow_std"]  = lags_mat[:, :8].std(axis=1)
+    df_v["day_of_week"]   = np.array([d.isoweekday() - 1 for d in df_v["sale_date"]], dtype=np.int32)
+    df_v["week_of_year"]  = np.array([d.isocalendar()[1] for d in df_v["sale_date"]], dtype=np.int32)
+    df_v["month"]         = np.array([d.month for d in df_v["sale_date"]], dtype=np.int32)
+    df_v["is_weekend"]    = np.array([int(d.isoweekday() >= 6) for d in df_v["sale_date"]], dtype=np.int32)
+    df_v["activity_rate"] = np.array([
         act_rate.get((int(r.establishment_id), int(r.product_id), int(r.slot_index)), 0.0)
         for r in df_v.itertuples(index=False)
     ], dtype=np.float32)
 
     val_start = target_date - timedelta(days=14)
-    df_train  = df_v[df_v['sale_date'] <  val_start]
-    df_val    = df_v[df_v['sale_date'] >= val_start]
+    df_train  = df_v[df_v["sale_date"] <  val_start].reset_index(drop=True)
+    df_val    = df_v[df_v["sale_date"] >= val_start].reset_index(drop=True)
 
-    # ── build prediction rows ─────────────────────────────────────────────────
     log.info("  Building prediction features for %s...", target_date)
     last_8_dow_dates = {target_date - timedelta(days=7 * i) for i in range(1, 9)}
 
-    # active combos: appeared in at least 1 of the last 8 same-DOW dates
-    # track count per combo so we can scale by DOW activity rate
     active_combos: dict = defaultdict(int)
-    df_recent = df[df['sale_date'].isin(last_8_dow_dates)]
+    df_recent = df[df["sale_date"].isin(last_8_dow_dates)]
     for r in df_recent.itertuples(index=False):
         key = (int(r.establishment_id), int(r.product_id), int(r.slot_index))
         if key in valid_set:
@@ -194,49 +204,57 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
 
     pred_rows = []
     for (est, pid, slot), rdow_count in active_combos.items():
-        base = (est, pid, slot)
+        base     = (est, pid, slot)
         lag_vals = np.array([lookup.get(base + (target_date - timedelta(days=d),), 0.0)
                              for d in LAG_OFFSETS], dtype=np.float32)
         pred_rows.append({
-            "establishment_id":  est,
-            "product_id":        pid,
-            "product_name":      pname_df.get((est, pid), "Unknown"),
-            "slot_index":        slot,
-            "day_of_week":       target_date.isoweekday() - 1,
-            "week_of_year":      int(target_date.isocalendar()[1]),
-            "month":             target_date.month,
-            "is_weekend":        int(target_date.isoweekday() >= 6),
-            "activity_rate":     float(act_rate.get(base, 0.0)),
-            "lag_7d":            lag_vals[0],
-            "lag_14d":           lag_vals[1],
-            "lag_21d":           lag_vals[2],
-            "roll_dow_4w":       float(lag_vals[:4].mean()),
-            "roll_dow_8w":       float(lag_vals[:8].mean()),
-            "roll_dow_std":      float(lag_vals[:8].std()),
-            "recent_dow_count":  rdow_count,   # how many of last 8 same-DOW dates had sales
+            "establishment_id": est,
+            "product_id":       pid,
+            "product_name":     pname_df.get((est, pid), "Unknown"),
+            "slot_index":       slot,
+            "day_of_week":      target_date.isoweekday() - 1,
+            "week_of_year":     int(target_date.isocalendar()[1]),
+            "month":            target_date.month,
+            "is_weekend":       int(target_date.isoweekday() >= 6),
+            "activity_rate":    float(act_rate.get(base, 0.0)),
+            "lag_7d":           lag_vals[0],
+            "lag_14d":          lag_vals[1],
+            "lag_21d":          lag_vals[2],
+            "roll_dow_4w":      float(lag_vals[:4].mean()),
+            "roll_dow_8w":      float(lag_vals[:8].mean()),
+            "roll_dow_std":     float(lag_vals[:8].std()),
+            "recent_dow_count": rdow_count,
         })
 
-    df_pred = pd.DataFrame(pred_rows)
+    df_pred = pd.DataFrame(pred_rows).reset_index(drop=True)
     return df_train, df_val, df_pred
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── Model training ────────────────────────────────────────────────────────────
 
-def train_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
-    def prep(df):
-        X = df[FEATURE_COLS].copy()
-        for c in NUMERIC_COLS:
-            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).astype("float32")
-        for c in CAT_COLS:
-            X[c] = X[c].astype("category")
-        return X, df["qty"].values.astype("float32")
+def _prep_global(df):
+    X = df[FEATURE_COLS].copy()
+    for c in NUMERIC_COLS:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).astype("float32")
+    for c in CAT_COLS:
+        X[c] = X[c].astype("category")
+    return X, df["qty"].values.astype("float32")
 
-    X_tr, y_tr = prep(df_train)
-    X_va, y_va = prep(df_val)
 
+def _prep_loc(df):
+    X = df[LOC_FEATURE_COLS].copy()
+    for c in LOC_NUMERIC_COLS:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).astype("float32")
+    for c in LOC_CAT_COLS:
+        X[c] = X[c].astype("category")
+    return X, df["qty"].values.astype("float32")
+
+
+def train_global_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
+    X_tr, y_tr = _prep_global(df_train)
+    X_va, y_va = _prep_global(df_val)
     tr_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature=CAT_COLS, free_raw_data=False)
     va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,             free_raw_data=False)
-
     params = {
         "objective":        "regression_l1",
         "metric":           "mae",
@@ -250,7 +268,37 @@ def train_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
         "verbose":          -1,
         "seed":             42,
     }
+    model = lgb.train(
+        params, tr_set,
+        num_boost_round=1000,
+        valid_sets=[va_set],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=100),
+        ],
+    )
+    val_mae = float(np.mean(np.abs(model.predict(X_va) - y_va)))
+    return model, val_mae
 
+
+def train_loc_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
+    X_tr, y_tr = _prep_loc(df_train)
+    X_va, y_va = _prep_loc(df_val)
+    tr_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature=LOC_CAT_COLS, free_raw_data=False)
+    va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,                 free_raw_data=False)
+    params = {
+        "objective":        "regression_l1",
+        "metric":           "mae",
+        "num_leaves":       31,      # smaller model for smaller dataset
+        "learning_rate":    0.05,
+        "min_data_in_leaf": 10,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq":     5,
+        "num_threads":      4,
+        "verbose":          -1,
+        "seed":             42,
+    }
     model = lgb.train(
         params, tr_set,
         num_boost_round=1000,
@@ -437,43 +485,98 @@ def main():
         })
         log.info("  %d positive slot observations", len(df_raw))
 
-        # ── 2. Build features in Python (consistent train/pred) ───────────────
+        # ── 2. Build lag features ──────────────────────────────────────────────
         df_train, df_val, df_pred = build_lag_features(df_raw, target_date, total_days)
         log.info("  Train: %d rows  |  Val: %d rows  |  Pred combos: %d",
                  len(df_train), len(df_val), len(df_pred))
 
-        # ── 3. Train ───────────────────────────────────────────────────────────
-        log.info("Training LightGBM...")
-        model, val_mae = train_model(df_train, df_val)
-        log.info("  Best iteration: %d  |  Val MAE: %.4f", model.best_iteration, val_mae)
+        # ── 3. Per-location models (top-20 items each) ─────────────────────────
+        establishments = sorted(df_raw["establishment_id"].unique())
+        top20: dict          = {}   # est_id -> set of top-20 product_ids seen in training
+        loc_models: dict     = {}   # est_id -> (model, val_mae)
 
-        imp = sorted(zip(FEATURE_COLS, model.feature_importance("gain")),
+        for est_id in establishments:
+            top20_raw = find_top_items(df_raw, est_id, TOP_N)
+
+            tr_loc = df_train[
+                (df_train["establishment_id"] == est_id) &
+                (df_train["product_id"].isin(top20_raw))
+            ]
+            va_loc = df_val[
+                (df_val["establishment_id"] == est_id) &
+                (df_val["product_id"].isin(top20_raw))
+            ]
+
+            if len(tr_loc) < 200 or len(va_loc) < 10:
+                log.warning("  Est %s: too few data (train=%d, val=%d) — using global fallback only",
+                            est_id, len(tr_loc), len(va_loc))
+                continue
+
+            log.info("  Training per-location model — est %s  (train=%d, val=%d, items=%d)...",
+                     est_id, len(tr_loc), len(va_loc), tr_loc["product_id"].nunique())
+            model, mae = train_loc_model(tr_loc, va_loc)
+            loc_models[est_id] = (model, mae)
+            # track which product_ids the loc model actually saw in training
+            top20[est_id] = set(tr_loc["product_id"].unique())
+            log.info("    Val MAE: %.4f", mae)
+
+        log.info("Per-location models trained: %d / %d locations", len(loc_models), len(establishments))
+
+        # ── 4. Global fallback model ───────────────────────────────────────────
+        log.info("Training global fallback model...")
+        global_model, global_mae = train_global_model(df_train, df_val)
+        log.info("  Global Val MAE: %.4f  |  Best iter: %d",
+                 global_mae, global_model.best_iteration)
+
+        imp = sorted(zip(FEATURE_COLS, global_model.feature_importance("gain")),
                      key=lambda x: x[1], reverse=True)
         log.info("  Top features: %s", ", ".join(f"{n}={v:.0f}" for n, v in imp[:6]))
 
-        # ── 4. Predict ────────────────────────────────────────────────────────
+        # ── 5. Predict ────────────────────────────────────────────────────────
         if df_pred.empty:
             log.warning("No combos to predict — nothing written.")
             return
 
-        X_pred = df_pred[FEATURE_COLS].copy()
+        # Start with global predictions for every row
+        X_global = df_pred[FEATURE_COLS].copy()
         for c in NUMERIC_COLS:
-            X_pred[c] = pd.to_numeric(X_pred[c], errors="coerce").fillna(0).astype("float32")
+            X_global[c] = pd.to_numeric(X_global[c], errors="coerce").fillna(0).astype("float32")
         for c in CAT_COLS:
-            X_pred[c] = X_pred[c].astype("category")
+            X_global[c] = X_global[c].astype("category")
 
-        raw = np.maximum(model.predict(X_pred), 0.0)
+        raw      = np.maximum(global_model.predict(X_global), 0.0)
+        mae_arr  = np.full(len(df_pred), global_mae, dtype=np.float64)
+
+        # Override with per-location predictions for top-20 items
+        for est_id, (model, mae) in loc_models.items():
+            mask = (
+                (df_pred["establishment_id"] == est_id) &
+                (df_pred["product_id"].isin(top20[est_id]))
+            ).values
+
+            if not mask.any():
+                continue
+
+            X_loc = df_pred.loc[mask, LOC_FEATURE_COLS].copy()
+            for c in LOC_NUMERIC_COLS:
+                X_loc[c] = pd.to_numeric(X_loc[c], errors="coerce").fillna(0).astype("float32")
+            for c in LOC_CAT_COLS:
+                X_loc[c] = X_loc[c].astype("category")
+
+            raw[mask]     = np.maximum(model.predict(X_loc), 0.0)
+            mae_arr[mask] = mae
+
+        loc_slots   = int((mae_arr < global_mae).sum())
+        global_slots = int((mae_arr == global_mae).sum())
+        log.info("  Prediction routing — per-location: %d slots  |  global fallback: %d slots",
+                 loc_slots, global_slots)
 
         predictions = []
         for i, row in enumerate(df_pred.itertuples(index=False)):
-            qty = float(raw[i])
-            # Scale by fraction of last 8 same-DOW dates with sales.
-            # LightGBM is trained on positive observations only (conditional mean),
-            # so multiplying by this fraction converts to unconditional expected value —
-            # the same interpretation as the weighted-average baseline.
-            qty *= row.recent_dow_count / 8.0
+            qty = float(raw[i]) * (row.recent_dow_count / 8.0)
             if qty < 0.05:
                 continue
+            used_mae = float(mae_arr[i])
             predictions.append({
                 "establishment_id":   int(row.establishment_id),
                 "product_id":         int(row.product_id),
@@ -482,8 +585,8 @@ def main():
                 "slot_index":         int(row.slot_index),
                 "slot_start":         slot_to_time(int(row.slot_index)),
                 "predicted_quantity": round(qty, 2),
-                "confidence_low":     round(max(0.0, qty - val_mae), 2),
-                "confidence_high":    round(qty + val_mae, 2),
+                "confidence_low":     round(max(0.0, qty - used_mae), 2),
+                "confidence_high":    round(qty + used_mae, 2),
                 "historical_points":  0,
                 "model_version":      SCRIPT_VERSION,
             })
