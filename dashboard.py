@@ -80,6 +80,42 @@ def load_predictions(target_date, establishment_id):
     return rows
 
 @st.cache_data(ttl=120)
+def load_accuracy_metrics(target_date, establishment_id):
+    """Slot-level join of predictions vs actuals for accuracy report."""
+    conn = _connect()
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            SELECT
+                p.product_id,
+                p.product_name,
+                p.slot_index,
+                p.predicted_quantity,
+                COALESCE(a.actual_qty, 0) AS actual_qty
+            FROM predictions_15min p
+            LEFT JOIN (
+                SELECT
+                    oi.product_id,
+                    (EXTRACT(HOUR   FROM oi.created_date AT TIME ZONE 'America/Chicago') * 4
+                     + FLOOR(EXTRACT(MINUTE FROM oi.created_date AT TIME ZONE 'America/Chicago') / 15)
+                    )::SMALLINT AS slot_index,
+                    SUM(oi.quantity)::float AS actual_qty
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                    AND o.closed = TRUE AND o.deleted = FALSE
+                WHERE DATE(oi.created_date AT TIME ZONE 'America/Chicago') = %s
+                  AND oi.establishment_id = %s
+                  AND oi.deleted = FALSE AND oi.is_voided = FALSE
+                  AND oi.product_id IS NOT NULL
+                GROUP BY oi.product_id, slot_index
+            ) a ON a.product_id = p.product_id AND a.slot_index = p.slot_index
+            WHERE p.target_date = %s AND p.establishment_id = %s
+            ORDER BY p.slot_index, p.predicted_quantity DESC
+        """, (target_date, establishment_id, target_date, establishment_id))
+        rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+@st.cache_data(ttl=120)
 def load_actuals(target_date, establishment_id):
     """Load actual sales for a past date (for comparison)."""
     conn = _connect()
@@ -112,10 +148,10 @@ CHART_COLORS = (
 )
 
 SHIFTS = [
-    ("🌅 Morning",   24, 44),   # 06:00–11:00
+    ("🌅 Morning",   16, 44),   # 04:00–11:00  (locations open 4–5 AM)
     ("🍔 Lunch",     44, 56),   # 11:00–14:00
     ("☀️ Afternoon", 56, 68),   # 14:00–17:00
-    ("🌆 Dinner",    68, 84),   # 17:00–21:00
+    ("🌆 Dinner",    68, 96),   # 17:00–midnight (Shepherd open till 23:00)
 ]
 
 def slot_label(idx: int) -> str:
@@ -180,7 +216,7 @@ def build_chart(df: pd.DataFrame, top8: list, title: str, df_actual=None) -> go.
     fig.update_layout(
         barmode="stack",
         title=dict(text=title, font=dict(size=14)),
-        xaxis_title=None,
+        xaxis_title="Time (CT)",
         yaxis_title="Predicted qty",
         height=380,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
@@ -210,32 +246,167 @@ with st.sidebar:
     st.caption("Daily Prediction Dashboard")
     st.markdown("---")
 
+    page = st.radio("View", ["📋 Daily Predictions", "📊 Accuracy Report"], label_visibility="collapsed")
+
+    st.markdown("---")
+
     pred_dates = load_prediction_dates()
     if not pred_dates:
         st.error("No prediction data found.")
         st.stop()
 
-    selected_date = st.selectbox(
-        "Prediction date",
-        pred_dates,
-        format_func=lambda d: d.strftime("%A, %b %d %Y"),
-    )
+    past_dates = [d for d in pred_dates if d < date.today()]
 
-    show_actuals = selected_date < date.today()
-    if show_actuals:
-        compare = st.checkbox("Compare with actual sales", value=True)
+    if page == "📋 Daily Predictions":
+        selected_date = st.selectbox(
+            "Prediction date",
+            pred_dates,
+            format_func=lambda d: d.strftime("%A, %b %d %Y"),
+        )
+        show_actuals = selected_date < date.today()
+        if show_actuals:
+            compare = st.checkbox("Compare with actual sales", value=True)
+        else:
+            compare = False
+            st.info("Actuals available after the day ends.")
     else:
-        compare = False
-        st.info("Actuals available after the day ends.")
+        if not past_dates:
+            st.error("No past prediction dates available.")
+            st.stop()
+        acc_date = st.selectbox(
+            "Report date",
+            past_dates,
+            format_func=lambda d: d.strftime("%A, %b %d %Y"),
+        )
+        locations_for_acc = load_locations()
+        acc_loc_name = st.selectbox(
+            "Location",
+            [l["name"] for l in locations_for_acc],
+        )
+        acc_loc = next(l for l in locations_for_acc if l["name"] == acc_loc_name)
 
     st.markdown("---")
-    st.caption("Predictions generated nightly at 2 AM by LightGBM (lgbm_v4).")
+    st.caption("🕐 All times in **Central Time** (Houston, TX)")
+    st.caption("Predictions generated nightly at 2 AM CT by LightGBM (lgbm_v4).")
     st.caption("Accuracy: 88% within ±1 unit, 94% within ±2 units.")
+
+# ── Accuracy Report page ──────────────────────────────────────────────────────
+
+if page == "📊 Accuracy Report":
+    dow_acc = acc_date.strftime("%A")
+    st.title(f"📊 Accuracy Report — {dow_acc}, {acc_date.strftime('%B %d, %Y')}")
+    st.caption(f"Location: **{acc_loc_name}** · All times in Central Time (CT)")
+
+    acc_rows = load_accuracy_metrics(acc_date, acc_loc["id"])
+    if not acc_rows:
+        st.warning(f"No prediction data for **{acc_loc_name}** on {acc_date}.")
+        st.stop()
+
+    df_acc = pd.DataFrame(acc_rows)
+    df_acc["predicted_quantity"] = df_acc["predicted_quantity"].astype(float)
+    df_acc["actual_qty"]         = df_acc["actual_qty"].astype(float)
+    df_acc["abs_err"]            = (df_acc["predicted_quantity"] - df_acc["actual_qty"]).abs()
+    df_acc["slot_label"]         = df_acc["slot_index"].apply(slot_label)
+    df_acc = df_acc[(df_acc["slot_index"] >= 16) & (df_acc["slot_index"] < 96)]
+
+    total_pred   = df_acc["predicted_quantity"].sum()
+    total_actual = df_acc["actual_qty"].sum()
+    mae          = df_acc["abs_err"].mean()
+    n            = len(df_acc)
+    within_1     = (df_acc["abs_err"] <= 1).sum() / n * 100 if n else 0
+    within_2     = (df_acc["abs_err"] <= 2).sum() / n * 100 if n else 0
+    diff_total   = total_pred - total_actual
+    pct_diff     = diff_total / total_actual * 100 if total_actual else 0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Predicted Total",  f"{total_pred:,.0f}")
+    c2.metric("Actual Total",     f"{total_actual:,.0f}",
+              f"{diff_total:+.0f} ({pct_diff:+.1f}%)")
+    c3.metric("MAE / slot",       f"{mae:.3f} units")
+    c4.metric("Within ±1 unit",   f"{within_1:.1f}%")
+    c5.metric("Within ±2 units",  f"{within_2:.1f}%")
+
+    st.markdown("---")
+
+    # ── Comparison chart ──────────────────────────────────────────────────────
+    slot_pred = df_acc.groupby("slot_label")["predicted_quantity"].sum()
+    slot_act  = df_acc.groupby("slot_label")["actual_qty"].sum()
+    all_slots = sorted(set(slot_pred.index) | set(slot_act.index),
+                       key=lambda s: int(s.split(":")[0]) * 60 + int(s.split(":")[1]))
+    slot_pred = slot_pred.reindex(all_slots, fill_value=0)
+    slot_act  = slot_act.reindex(all_slots, fill_value=0)
+
+    fig_cmp = go.Figure()
+    fig_cmp.add_trace(go.Bar(
+        name="Predicted",
+        x=all_slots, y=slot_pred.values,
+        marker_color="#4C9BE8",
+        hovertemplate="%{y:.1f} predicted<extra></extra>",
+    ))
+    fig_cmp.add_trace(go.Scatter(
+        name="Actual",
+        x=all_slots, y=slot_act.values,
+        mode="lines+markers",
+        line=dict(color="black", width=2, dash="dot"),
+        marker=dict(size=4),
+        hovertemplate="%{y:.0f} actual<extra>Actual</extra>",
+    ))
+    hour_ticks_acc = [s for s in all_slots if s.endswith(":00")]
+    fig_cmp.update_layout(
+        barmode="group",
+        title=dict(text=f"{acc_loc_name} · Predicted vs Actual (15-min slots)", font=dict(size=14)),
+        xaxis_title="Time (CT)",
+        yaxis_title="Quantity",
+        height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                    font=dict(size=11)),
+        margin=dict(l=0, r=0, t=55, b=30),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig_cmp.update_xaxes(
+        tickangle=-45, tickmode="array",
+        tickvals=hour_ticks_acc, ticktext=hour_ticks_acc,
+        showgrid=True, gridcolor="#eee",
+    )
+    fig_cmp.update_yaxes(showgrid=True, gridcolor="#eee")
+    st.plotly_chart(fig_cmp, width='stretch', key="acc_chart")
+
+    st.markdown("---")
+
+    # ── Item-level summary table ───────────────────────────────────────────────
+    st.markdown("##### Item-Level Accuracy")
+    item_tbl = (
+        df_acc.groupby("product_name")
+        .agg(predicted=("predicted_quantity", "sum"),
+             actual=("actual_qty", "sum"))
+        .reset_index()
+    )
+    item_tbl["diff"]     = item_tbl["predicted"] - item_tbl["actual"]
+    item_tbl["pct_diff"] = item_tbl.apply(
+        lambda r: r["diff"] / r["actual"] * 100 if r["actual"] > 0 else float("nan"), axis=1
+    )
+    item_tbl = item_tbl.sort_values("actual", ascending=False)
+    item_tbl.columns = ["Product", "Predicted", "Actual", "Diff", "% Diff"]
+
+    def _color_diff(val):
+        if pd.isna(val):
+            return "color: #aaa"
+        return "color: #c0392b" if abs(val) > 20 else ("color: #e67e22" if abs(val) > 10 else "color: #27ae60")
+
+    styled = (
+        item_tbl.style
+        .format({"Predicted": "{:.1f}", "Actual": "{:.1f}", "Diff": "{:+.1f}", "% Diff": "{:+.1f}%"}, na_rep="—")
+        .map(_color_diff, subset=["% Diff"])
+    )
+    st.dataframe(styled, width='stretch', height=450)
+    st.stop()
 
 # ── Main content ──────────────────────────────────────────────────────────────
 
 dow = selected_date.strftime("%A")
 st.title(f"📋 Predictions — {dow}, {selected_date.strftime('%B %d, %Y')}")
+st.caption("🕐 All times shown in Central Time (CT) — Houston, TX")
 
 locations = load_locations()
 loc_names = [l["name"] for l in locations]
@@ -249,8 +420,9 @@ for tab, loc in zip(tabs, locations):
             continue
 
         df = prep_df(rows)
-        # Business hours only: 6 AM (slot 24) to 10 PM (slot 88)
-        df = df[(df["slot_index"] >= 24) & (df["slot_index"] < 88)]
+        # Full operating hours: 4 AM (slot 16) to midnight (slot 96)
+        # Locations open at 4–5 AM; Shepherd stays open until 23:00
+        df = df[(df["slot_index"] >= 16) & (df["slot_index"] < 96)]
 
         df_actual = None
         if compare:
@@ -259,7 +431,7 @@ for tab, loc in zip(tabs, locations):
                 df_actual = pd.DataFrame(act_rows)
                 df_actual["actual_qty"] = df_actual["actual_qty"].astype(float)
                 df_actual["slot_label"] = df_actual["slot_index"].apply(slot_label)
-                df_actual = df_actual[(df_actual["slot_index"] >= 24) & (df_actual["slot_index"] < 88)]
+                df_actual = df_actual[(df_actual["slot_index"] >= 16) & (df_actual["slot_index"] < 96)]
 
         # ── Summary metrics ───────────────────────────────────────────────────
         prod_totals  = df.groupby("product_name")["predicted_quantity"].sum()
@@ -287,7 +459,7 @@ for tab, loc in zip(tabs, locations):
         if compare and df_actual is not None:
             chart_title += " (vs Actual ···)"
         fig = build_chart(df, top8, chart_title, df_actual if compare else None)
-        st.plotly_chart(fig, use_container_width=True, key=f"chart_{loc['id']}")
+        st.plotly_chart(fig, width='stretch', key=f"chart_{loc['id']}")
 
         # ── Shift breakdown ───────────────────────────────────────────────────
         st.markdown("##### Shift Breakdown")
@@ -331,9 +503,7 @@ for tab, loc in zip(tabs, locations):
                 pivot_tbl["Diff"] = (pivot_tbl["Daily Total"] - pivot_tbl["Actual Total"]).round(1)
 
             st.dataframe(
-                pivot_tbl.style.format("{:.1f}").background_gradient(
-                    subset=["Daily Total"], cmap="YlOrRd"
-                ),
-                use_container_width=True,
+                pivot_tbl.style.format("{:.1f}"),
+                width='stretch',
                 height=400,
             )
