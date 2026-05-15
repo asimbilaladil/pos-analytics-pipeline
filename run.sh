@@ -33,11 +33,11 @@ else
     exit 1
 fi
 
-log "Running predict_daily.py..."
-if "$VENV/bin/python3" "$APP_DIR/predict_daily.py" >> "$LOG_FILE" 2>&1; then
-    log "predict_daily.py completed successfully"
+log "Running predict_daily_ml.py (LightGBM)..."
+if "$VENV/bin/python3" "$APP_DIR/predict_daily_ml.py" >> "$LOG_FILE" 2>&1; then
+    log "predict_daily_ml.py completed successfully"
 else
-    log "ERROR: predict_daily.py failed — check $LOG_FILE"
+    log "ERROR: predict_daily_ml.py failed — check $LOG_FILE"
     exit 1
 fi
 
