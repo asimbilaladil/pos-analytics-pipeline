@@ -1,18 +1,20 @@
 """
-predict_daily_ml.py  (v6 — recency weighting + location trend feature)
+predict_daily_ml.py  (v7 — calibration + DOW baseline + 56-day recency)
 ========================================================================
 LightGBM-based 15-min item quantity predictions.
 
 Architecture:
   - Per-location LightGBM for each location's top-20 items by volume (~78% of sales).
   - Global LightGBM fallback for all remaining low-volume items.
+  - DOW-average baseline for locations with insufficient training data.
   - Both models use Python-computed lag features for train/predict consistency.
 
-New in v6 vs v5:
-  - Recency weighting: training rows are exponentially downweighted with a
-    28-day half-life so the model tracks recent trends rather than a stale mean.
-  - loc_dow_4w: average total sales at this location on the same day-of-week
-    over the last 4 weeks — gives the model a signal about location-level drift.
+New in v7 vs v6:
+  - Post-hoc location calibration: scale each location's predictions by
+    mean(actual/predicted) over the last 7 days (requires ≥3 dates, clamped 0.5–2.0).
+  - DOW-average baseline: locations with < 200 training rows use roll_dow_4w
+    directly instead of falling through to the global model.
+  - Recency half-life extended 28 → 56 days (less aggressive, more stable).
 
 Usage:
     python predict_daily_ml.py                            # all locations, today
@@ -44,11 +46,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SCRIPT_VERSION    = "lgbm_v6"
+SCRIPT_VERSION    = "lgbm_v7"
 DATA_START        = date(2026, 2, 10)
 MIN_DAYS          = 3
 TOP_N             = 20          # items per location for per-location models
-RECENCY_HALF_LIFE = 28          # days — older rows down-weighted with this half-life
+RECENCY_HALF_LIFE = 56          # days — older rows down-weighted with this half-life
+CAL_DAYS          = 7           # past dates used to compute calibration factors
+CAL_MIN_DATES     = 3           # minimum past dates needed for calibration
 DOW_NAMES         = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 LAG_OFFSETS       = [7, 14, 21, 28, 35, 42, 49, 56]
 
@@ -484,6 +488,72 @@ def print_accuracy(conn, target_date: date):
     print(f"{'='*68}\n")
 
 
+# ── Calibration ───────────────────────────────────────────────────────────────
+
+def load_calibration_factors(conn, target_date: date) -> dict:
+    """
+    Per-location scale factor = mean(actual/predicted) over last CAL_DAYS past dates.
+    Returns {est_id: factor} only for locations with >= CAL_MIN_DATES data points.
+    Factor is clamped to [0.5, 2.0]; absent locations default to 1.0 at call site.
+    """
+    past_dates = [target_date - timedelta(days=i) for i in range(1, CAL_DAYS + 1)]
+    sql = """
+        WITH actuals AS (
+            SELECT
+                oi.establishment_id,
+                DATE(oi.created_date AT TIME ZONE 'America/Chicago') AS sale_date,
+                oi.product_id,
+                (EXTRACT(HOUR FROM oi.created_date AT TIME ZONE 'America/Chicago') * 4
+                 + FLOOR(EXTRACT(MINUTE FROM oi.created_date AT TIME ZONE 'America/Chicago') / 15.0)
+                )::SMALLINT AS slot_index,
+                SUM(oi.quantity) AS actual_qty
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id AND o.closed = TRUE AND o.deleted = FALSE
+            WHERE oi.deleted = FALSE AND oi.is_voided = FALSE AND oi.product_id IS NOT NULL
+              AND DATE(oi.created_date AT TIME ZONE 'America/Chicago') = ANY(%(past_dates)s)
+            GROUP BY oi.establishment_id, sale_date, oi.product_id, slot_index
+        ),
+        pred_latest AS (
+            SELECT DISTINCT ON (establishment_id, target_date, product_id, slot_index)
+                establishment_id, target_date, product_id, slot_index, predicted_quantity
+            FROM predictions_15min
+            WHERE target_date = ANY(%(past_dates)s) AND predicted_quantity > 0
+            ORDER BY establishment_id, target_date, product_id, slot_index, generated_at DESC
+        ),
+        daily AS (
+            SELECT
+                p.establishment_id,
+                p.target_date,
+                SUM(p.predicted_quantity)      AS total_pred,
+                SUM(COALESCE(a.actual_qty, 0)) AS total_actual
+            FROM pred_latest p
+            LEFT JOIN actuals a
+                ON a.establishment_id = p.establishment_id
+               AND a.sale_date        = p.target_date
+               AND a.product_id       = p.product_id
+               AND a.slot_index       = p.slot_index
+            GROUP BY p.establishment_id, p.target_date
+        )
+        SELECT establishment_id, target_date, total_pred, total_actual
+        FROM daily
+        WHERE total_pred > 0
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(sql, {"past_dates": past_dates})
+        rows = cur.fetchall()
+
+    by_est: dict = defaultdict(list)
+    for r in rows:
+        ratio = float(r["total_actual"]) / float(r["total_pred"])
+        by_est[int(r["establishment_id"])].append(ratio)
+
+    factors = {}
+    for est_id, ratios in by_est.items():
+        if len(ratios) >= CAL_MIN_DATES:
+            factors[est_id] = float(np.clip(np.mean(ratios), 0.5, 2.0))
+    return factors
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -538,8 +608,9 @@ def main():
 
         # ── 3. Per-location models (top-20 items each) ─────────────────────────
         establishments = sorted(df_raw["establishment_id"].unique())
-        top20: dict      = {}   # est_id -> set of top-20 product_ids seen in training
-        loc_models: dict = {}   # est_id -> (model, val_mae)
+        top20: dict       = {}   # est_id -> set of top-20 product_ids seen in training
+        loc_models: dict  = {}   # est_id -> (model, val_mae)
+        low_data_ests: set = set()  # ests that fall back to DOW-average baseline
 
         for est_id in establishments:
             top20_raw = find_top_items(df_raw, est_id, TOP_N)
@@ -554,8 +625,9 @@ def main():
             ]
 
             if len(tr_loc) < 200 or len(va_loc) < 10:
-                log.warning("  Est %s: too few data (train=%d, val=%d) — using global fallback only",
+                log.warning("  Est %s: too few data (train=%d, val=%d) — using DOW-average baseline",
                             est_id, len(tr_loc), len(va_loc))
+                low_data_ests.add(est_id)
                 continue
 
             log.info("  Training per-location model — est %s  (train=%d, val=%d, items=%d)...",
@@ -616,10 +688,21 @@ def main():
             raw[mask]     = np.maximum(model.predict(X_loc), 0.0)
             mae_arr[mask] = mae
 
+        # DOW-average baseline for low-data locations
+        dow_slots = 0
+        for est_id in low_data_ests:
+            mask = (df_pred["establishment_id"] == est_id).values
+            if not mask.any():
+                continue
+            raw[mask]     = df_pred.loc[mask, "roll_dow_4w"].values.astype(np.float64)
+            mae_arr[mask] = 0.0
+            dow_slots    += int(mask.sum())
+            log.info("  Est %s: applied DOW-average baseline (%d slots)", est_id, mask.sum())
+
         loc_slots    = int(sum(1 for v in mae_arr if v != global_mae))
         global_slots = int(sum(1 for v in mae_arr if v == global_mae))
-        log.info("  Prediction routing — per-location: %d slots  |  global fallback: %d slots",
-                 loc_slots, global_slots)
+        log.info("  Prediction routing — per-location: %d slots  |  DOW-baseline: %d slots  |  global fallback: %d slots",
+                 loc_slots - dow_slots, dow_slots, global_slots)
 
         predictions = []
         for i, row in enumerate(df_pred.itertuples(index=False)):
@@ -640,6 +723,20 @@ def main():
                 "historical_points":  0,
                 "model_version":      SCRIPT_VERSION,
             })
+
+        # Post-hoc location calibration
+        cal_factors = load_calibration_factors(conn, target_date)
+        if cal_factors:
+            log.info("  Calibration factors: %s",
+                     ", ".join(f"est{k}={v:.3f}" for k, v in sorted(cal_factors.items())))
+            for p in predictions:
+                f = cal_factors.get(p["establishment_id"], 1.0)
+                if f != 1.0:
+                    p["predicted_quantity"] = round(p["predicted_quantity"] * f, 2)
+                    p["confidence_low"]     = round(p["confidence_low"]     * f, 2)
+                    p["confidence_high"]    = round(p["confidence_high"]    * f, 2)
+        else:
+            log.info("  No calibration factors found (first run or no past predictions).")
 
         log.info("Saving %d prediction rows...", len(predictions))
         with conn.cursor() as cur:
