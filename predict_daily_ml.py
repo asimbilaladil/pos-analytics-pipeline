@@ -1,25 +1,23 @@
 """
-predict_daily_ml.py  (v5 — per-location models for top-20 items + global fallback)
-====================================================================================
+predict_daily_ml.py  (v6 — recency weighting + location trend feature)
+========================================================================
 LightGBM-based 15-min item quantity predictions.
 
 Architecture:
   - Per-location LightGBM for each location's top-20 items by volume (~78% of sales).
-    These models drop establishment_id (constant within a location) and use softer
-    hyperparameters suited to the smaller per-location dataset.
-  - Global LightGBM fallback for all remaining low-volume items (same design as v4).
-  - Both models use the same Python-computed lag features for train/predict consistency.
+  - Global LightGBM fallback for all remaining low-volume items.
+  - Both models use Python-computed lag features for train/predict consistency.
 
-Features:
-  slot_index, day_of_week, week_of_year, month, is_weekend,
-  establishment_id (global only), product_id (categorical),
-  lag_7d / lag_14d / lag_21d,
-  roll_dow_4w / roll_dow_8w / roll_dow_std,
-  activity_rate
+New in v6 vs v5:
+  - Recency weighting: training rows are exponentially downweighted with a
+    28-day half-life so the model tracks recent trends rather than a stale mean.
+  - loc_dow_4w: average total sales at this location on the same day-of-week
+    over the last 4 weeks — gives the model a signal about location-level drift.
 
 Usage:
-    python predict_daily_ml.py                       # predict for today
-    python predict_daily_ml.py --date 2026-05-13     # backtest
+    python predict_daily_ml.py                            # all locations, today
+    python predict_daily_ml.py --date 2026-05-13          # backtest all
+    python predict_daily_ml.py --date 2026-05-13 --location Airtex   # single loc
     python predict_daily_ml.py --date 2026-05-13 --validate
 """
 
@@ -46,12 +44,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SCRIPT_VERSION = "lgbm_v5"
-DATA_START     = date(2026, 2, 10)
-MIN_DAYS       = 3
-TOP_N          = 20          # items per location for per-location models
-DOW_NAMES      = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-LAG_OFFSETS    = [7, 14, 21, 28, 35, 42, 49, 56]
+SCRIPT_VERSION    = "lgbm_v6"
+DATA_START        = date(2026, 2, 10)
+MIN_DAYS          = 3
+TOP_N             = 20          # items per location for per-location models
+RECENCY_HALF_LIFE = 28          # days — older rows down-weighted with this half-life
+DOW_NAMES         = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+LAG_OFFSETS       = [7, 14, 21, 28, 35, 42, 49, 56]
 
 # Global model features (includes establishment_id)
 FEATURE_COLS = [
@@ -60,6 +59,7 @@ FEATURE_COLS = [
     "lag_7d", "lag_14d", "lag_21d",
     "roll_dow_4w", "roll_dow_8w", "roll_dow_std",
     "activity_rate",
+    "loc_dow_4w",   # avg total sales at this location on same DOW last 4 weeks
 ]
 CAT_COLS     = ["establishment_id", "product_id"]
 NUMERIC_COLS = [c for c in FEATURE_COLS if c not in CAT_COLS]
@@ -150,6 +150,11 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
                   .last()
                   .to_dict())
 
+    # ── location daily total dict: (est_id, date) -> total_qty ──────────────
+    loc_daily: dict = {}
+    for (est, dt), grp in df.groupby(["establishment_id", "sale_date"]):
+        loc_daily[(int(est), dt)] = float(grp["qty"].sum())
+
     log.info("  Building lookup dict (%d rows)...", len(df))
     lookup: dict = {}
     for r in df.itertuples(index=False):
@@ -186,6 +191,22 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
         for r in df_v.itertuples(index=False)
     ], dtype=np.float32)
 
+    # loc_dow_4w: avg location total on same DOW over last 4 same-DOW dates (vectorized)
+    dates_arr = df_v["sale_date"].values          # numpy array of date objects
+    ests_arr  = df_v["establishment_id"].values.astype(int)
+    loc_mat   = np.zeros((len(df_v), 4), dtype=np.float32)
+    for i in range(1, 5):
+        loc_mat[:, i-1] = np.array([
+            loc_daily.get((int(ests_arr[k]), dates_arr[k] - timedelta(days=7*i)), 0.0)
+            for k in range(len(df_v))
+        ], dtype=np.float32)
+    df_v["loc_dow_4w"] = loc_mat.mean(axis=1)
+
+    # recency weight: vectorized exponential decay
+    decay = np.log(2) / RECENCY_HALF_LIFE
+    days_old = np.array([(target_date - d).days for d in dates_arr], dtype=np.float32)
+    df_v["sample_weight"] = np.exp(-decay * days_old).astype(np.float32)
+
     val_start = target_date - timedelta(days=14)
     df_train  = df_v[df_v["sale_date"] <  val_start].reset_index(drop=True)
     df_val    = df_v[df_v["sale_date"] >= val_start].reset_index(drop=True)
@@ -207,6 +228,10 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
         base     = (est, pid, slot)
         lag_vals = np.array([lookup.get(base + (target_date - timedelta(days=d),), 0.0)
                              for d in LAG_OFFSETS], dtype=np.float32)
+        loc_dow_4w = np.mean([
+            loc_daily.get((est, target_date - timedelta(days=7*i)), 0.0)
+            for i in range(1, 5)
+        ])
         pred_rows.append({
             "establishment_id": est,
             "product_id":       pid,
@@ -223,6 +248,7 @@ def build_lag_features(df: pd.DataFrame, target_date: date, total_days: int) -> 
             "roll_dow_4w":      float(lag_vals[:4].mean()),
             "roll_dow_8w":      float(lag_vals[:8].mean()),
             "roll_dow_std":     float(lag_vals[:8].std()),
+            "loc_dow_4w":       float(loc_dow_4w),
             "recent_dow_count": rdow_count,
         })
 
@@ -253,8 +279,9 @@ def _prep_loc(df):
 def train_global_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
     X_tr, y_tr = _prep_global(df_train)
     X_va, y_va = _prep_global(df_val)
-    tr_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature=CAT_COLS, free_raw_data=False)
-    va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,             free_raw_data=False)
+    w_tr = df_train["sample_weight"].values.astype("float32")
+    tr_set = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, categorical_feature=CAT_COLS, free_raw_data=False)
+    va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,                          free_raw_data=False)
     params = {
         "objective":        "regression_l1",
         "metric":           "mae",
@@ -284,8 +311,9 @@ def train_global_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
 def train_loc_model(df_train: pd.DataFrame, df_val: pd.DataFrame):
     X_tr, y_tr = _prep_loc(df_train)
     X_va, y_va = _prep_loc(df_val)
-    tr_set = lgb.Dataset(X_tr, label=y_tr, categorical_feature=LOC_CAT_COLS, free_raw_data=False)
-    va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,                 free_raw_data=False)
+    w_tr = df_train["sample_weight"].values.astype("float32")
+    tr_set = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, categorical_feature=LOC_CAT_COLS, free_raw_data=False)
+    va_set = lgb.Dataset(X_va, label=y_va, reference=tr_set,                              free_raw_data=False)
     params = {
         "objective":        "regression_l1",
         "metric":           "mae",
@@ -462,6 +490,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date",     type=str, default=None)
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--location", type=str, default=None,
+                        help="Test a single location by name (e.g. 'Airtex'). "
+                             "Trains and predicts only for that location — much faster.")
     args = parser.parse_args()
 
     if not os.getenv("DB_PASS"):
@@ -485,6 +516,21 @@ def main():
         })
         log.info("  %d positive slot observations", len(df_raw))
 
+        # ── Resolve single-location filter ─────────────────────────────────────
+        single_est_id = None
+        if args.location:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT id, name FROM establishments")
+                est_map = {r["name"].lower(): r["id"] for r in cur.fetchall()}
+            key = args.location.lower()
+            if key not in est_map:
+                log.error("Location '%s' not found. Available: %s",
+                          args.location, ", ".join(sorted(est_map)))
+                sys.exit(1)
+            single_est_id = est_map[key]
+            log.info("Single-location mode: %s (id=%s)", args.location, single_est_id)
+            df_raw = df_raw[df_raw["establishment_id"] == single_est_id].reset_index(drop=True)
+
         # ── 2. Build lag features ──────────────────────────────────────────────
         df_train, df_val, df_pred = build_lag_features(df_raw, target_date, total_days)
         log.info("  Train: %d rows  |  Val: %d rows  |  Pred combos: %d",
@@ -492,8 +538,8 @@ def main():
 
         # ── 3. Per-location models (top-20 items each) ─────────────────────────
         establishments = sorted(df_raw["establishment_id"].unique())
-        top20: dict          = {}   # est_id -> set of top-20 product_ids seen in training
-        loc_models: dict     = {}   # est_id -> (model, val_mae)
+        top20: dict      = {}   # est_id -> set of top-20 product_ids seen in training
+        loc_models: dict = {}   # est_id -> (model, val_mae)
 
         for est_id in establishments:
             top20_raw = find_top_items(df_raw, est_id, TOP_N)
@@ -522,30 +568,34 @@ def main():
 
         log.info("Per-location models trained: %d / %d locations", len(loc_models), len(establishments))
 
-        # ── 4. Global fallback model ───────────────────────────────────────────
-        log.info("Training global fallback model...")
-        global_model, global_mae = train_global_model(df_train, df_val)
-        log.info("  Global Val MAE: %.4f  |  Best iter: %d",
-                 global_mae, global_model.best_iteration)
-
-        imp = sorted(zip(FEATURE_COLS, global_model.feature_importance("gain")),
-                     key=lambda x: x[1], reverse=True)
-        log.info("  Top features: %s", ", ".join(f"{n}={v:.0f}" for n, v in imp[:6]))
+        # ── 4. Global fallback model (skipped in single-location mode) ─────────
+        global_model, global_mae = None, 0.0
+        if single_est_id is None:
+            log.info("Training global fallback model...")
+            global_model, global_mae = train_global_model(df_train, df_val)
+            log.info("  Global Val MAE: %.4f  |  Best iter: %d",
+                     global_mae, global_model.best_iteration)
+            imp = sorted(zip(FEATURE_COLS, global_model.feature_importance("gain")),
+                         key=lambda x: x[1], reverse=True)
+            log.info("  Top features: %s", ", ".join(f"{n}={v:.0f}" for n, v in imp[:6]))
 
         # ── 5. Predict ────────────────────────────────────────────────────────
         if df_pred.empty:
             log.warning("No combos to predict — nothing written.")
             return
 
-        # Start with global predictions for every row
-        X_global = df_pred[FEATURE_COLS].copy()
-        for c in NUMERIC_COLS:
-            X_global[c] = pd.to_numeric(X_global[c], errors="coerce").fillna(0).astype("float32")
-        for c in CAT_COLS:
-            X_global[c] = X_global[c].astype("category")
+        # Base predictions: global model (or zeros in single-location mode)
+        if global_model is not None:
+            X_global = df_pred[FEATURE_COLS].copy()
+            for c in NUMERIC_COLS:
+                X_global[c] = pd.to_numeric(X_global[c], errors="coerce").fillna(0).astype("float32")
+            for c in CAT_COLS:
+                X_global[c] = X_global[c].astype("category")
+            raw = np.maximum(global_model.predict(X_global), 0.0)
+        else:
+            raw = np.zeros(len(df_pred), dtype=np.float64)
 
-        raw      = np.maximum(global_model.predict(X_global), 0.0)
-        mae_arr  = np.full(len(df_pred), global_mae, dtype=np.float64)
+        mae_arr = np.full(len(df_pred), global_mae, dtype=np.float64)
 
         # Override with per-location predictions for top-20 items
         for est_id, (model, mae) in loc_models.items():
@@ -566,8 +616,8 @@ def main():
             raw[mask]     = np.maximum(model.predict(X_loc), 0.0)
             mae_arr[mask] = mae
 
-        loc_slots   = int((mae_arr < global_mae).sum())
-        global_slots = int((mae_arr == global_mae).sum())
+        loc_slots    = int(sum(1 for v in mae_arr if v != global_mae))
+        global_slots = int(sum(1 for v in mae_arr if v == global_mae))
         log.info("  Prediction routing — per-location: %d slots  |  global fallback: %d slots",
                  loc_slots, global_slots)
 
@@ -593,7 +643,13 @@ def main():
 
         log.info("Saving %d prediction rows...", len(predictions))
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM predictions_15min WHERE target_date = %s", (target_date,))
+            if single_est_id is not None:
+                cur.execute(
+                    "DELETE FROM predictions_15min WHERE target_date = %s AND establishment_id = %s",
+                    (target_date, single_est_id),
+                )
+            else:
+                cur.execute("DELETE FROM predictions_15min WHERE target_date = %s", (target_date,))
             deleted = cur.rowcount
         log.info("  Cleared %d old prediction rows for %s", deleted, target_date)
         upsert_predictions(conn, predictions)
