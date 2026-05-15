@@ -139,6 +139,89 @@ def load_actuals(target_date, establishment_id):
     conn.close()
     return rows
 
+@st.cache_data(ttl=120)
+def load_cross_location_summary(report_date):
+    """Slot-level predicted vs actual for ALL locations on one date."""
+    conn = _connect()
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            WITH slot_actual AS (
+                SELECT
+                    oi.establishment_id, oi.product_id,
+                    (EXTRACT(HOUR   FROM oi.created_date AT TIME ZONE 'America/Chicago') * 4
+                     + FLOOR(EXTRACT(MINUTE FROM oi.created_date AT TIME ZONE 'America/Chicago') / 15)
+                    )::SMALLINT AS slot_index,
+                    SUM(oi.quantity)::float AS actual_qty
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id AND o.closed = TRUE AND o.deleted = FALSE
+                WHERE DATE(oi.created_date AT TIME ZONE 'America/Chicago') = %s
+                  AND oi.deleted = FALSE AND oi.is_voided = FALSE AND oi.product_id IS NOT NULL
+                GROUP BY oi.establishment_id, oi.product_id, slot_index
+            )
+            SELECT
+                e.name                                                          AS location,
+                p.establishment_id,
+                ROUND(SUM(p.predicted_quantity)::numeric, 1)                   AS predicted,
+                ROUND(SUM(COALESCE(sa.actual_qty, 0))::numeric, 1)             AS actual,
+                ROUND(AVG(ABS(p.predicted_quantity - COALESCE(sa.actual_qty, 0)))::numeric, 3) AS mae,
+                COUNT(*)                                                        AS slots,
+                COUNT(*) FILTER (WHERE ABS(p.predicted_quantity - COALESCE(sa.actual_qty,0)) <= 1) AS within_1,
+                COUNT(*) FILTER (WHERE ABS(p.predicted_quantity - COALESCE(sa.actual_qty,0)) <= 2) AS within_2
+            FROM predictions_15min p
+            JOIN establishments e ON e.id = p.establishment_id
+            LEFT JOIN slot_actual sa ON sa.establishment_id = p.establishment_id
+                AND sa.product_id = p.product_id AND sa.slot_index = p.slot_index
+            WHERE p.target_date = %s
+            GROUP BY e.name, p.establishment_id
+            ORDER BY e.name
+        """, (report_date, report_date))
+        rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+@st.cache_data(ttl=300)
+def load_accuracy_trend(n_dates=30):
+    """Daily predicted vs actual totals per location for the last N past dates."""
+    conn = _connect()
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            WITH dates AS (
+                SELECT DISTINCT target_date FROM predictions_15min
+                WHERE target_date < CURRENT_DATE
+                ORDER BY target_date DESC LIMIT %s
+            ),
+            slot_actual AS (
+                SELECT
+                    DATE(oi.created_date AT TIME ZONE 'America/Chicago') AS sale_date,
+                    oi.establishment_id, oi.product_id,
+                    (EXTRACT(HOUR   FROM oi.created_date AT TIME ZONE 'America/Chicago') * 4
+                     + FLOOR(EXTRACT(MINUTE FROM oi.created_date AT TIME ZONE 'America/Chicago') / 15)
+                    )::SMALLINT AS slot_index,
+                    SUM(oi.quantity)::float AS actual_qty
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id AND o.closed = TRUE AND o.deleted = FALSE
+                WHERE DATE(oi.created_date AT TIME ZONE 'America/Chicago') IN (SELECT target_date FROM dates)
+                  AND oi.deleted = FALSE AND oi.is_voided = FALSE AND oi.product_id IS NOT NULL
+                GROUP BY sale_date, oi.establishment_id, oi.product_id, slot_index
+            )
+            SELECT
+                p.target_date,
+                e.name                                             AS location,
+                ROUND(SUM(p.predicted_quantity)::numeric, 1)      AS predicted,
+                ROUND(SUM(COALESCE(sa.actual_qty, 0))::numeric, 1) AS actual
+            FROM predictions_15min p
+            JOIN establishments e ON e.id = p.establishment_id
+            LEFT JOIN slot_actual sa ON sa.establishment_id = p.establishment_id
+                AND sa.product_id = p.product_id AND sa.slot_index = p.slot_index
+                AND sa.sale_date = p.target_date
+            WHERE p.target_date IN (SELECT target_date FROM dates)
+            GROUP BY p.target_date, e.name
+            ORDER BY p.target_date, e.name
+        """, (n_dates,))
+        rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 CHART_COLORS = (
@@ -281,15 +364,24 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("🕐 All times in **Central Time** (Houston, TX)")
-    st.caption("Predictions generated nightly at 2 AM CT by LightGBM (lgbm_v5).")
+    st.caption("Predictions generated nightly at 2 AM CT by LightGBM (lgbm_v6).")
     st.caption("Per-location models for top-20 items; global fallback for the rest.")
 
 # ── Accuracy Report page ──────────────────────────────────────────────────────
 
-def _color_diff(val):
+def _color_gap(val):
     if pd.isna(val):
         return "color: #aaa"
     return "color: #c0392b" if abs(val) > 20 else ("color: #e67e22" if abs(val) > 10 else "color: #27ae60")
+
+def _bg_gap(val):
+    if pd.isna(val):
+        return ""
+    if abs(val) > 20:
+        return "background-color: #fdecea"
+    if abs(val) > 10:
+        return "background-color: #fff3e0"
+    return "background-color: #e8f5e9"
 
 def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
     acc_rows = load_accuracy_metrics(report_date, loc_id)
@@ -333,14 +425,12 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
 
     fig_cmp = go.Figure()
     fig_cmp.add_trace(go.Bar(
-        name="Predicted",
-        x=all_slots, y=slot_pred.values,
+        name="Predicted", x=all_slots, y=slot_pred.values,
         marker_color="#4C9BE8",
         hovertemplate="%{y:.1f} predicted<extra></extra>",
     ))
     fig_cmp.add_trace(go.Scatter(
-        name="Actual",
-        x=all_slots, y=slot_act.values,
+        name="Actual", x=all_slots, y=slot_act.values,
         mode="lines+markers",
         line=dict(color="black", width=2, dash="dot"),
         marker=dict(size=4),
@@ -350,20 +440,14 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
     fig_cmp.update_layout(
         barmode="group",
         title=dict(text=f"{loc_name} · Predicted vs Actual (15-min slots)", font=dict(size=14)),
-        xaxis_title="Time (CT)",
-        yaxis_title="Quantity",
-        height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
-                    font=dict(size=11)),
+        xaxis_title="Time (CT)", yaxis_title="Quantity", height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=11)),
         margin=dict(l=0, r=0, t=55, b=30),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
+        plot_bgcolor="white", paper_bgcolor="white",
     )
-    fig_cmp.update_xaxes(
-        tickangle=-45, tickmode="array",
-        tickvals=hour_ticks_acc, ticktext=hour_ticks_acc,
-        showgrid=True, gridcolor="#eee",
-    )
+    fig_cmp.update_xaxes(tickangle=-45, tickmode="array",
+                         tickvals=hour_ticks_acc, ticktext=hour_ticks_acc,
+                         showgrid=True, gridcolor="#eee")
     fig_cmp.update_yaxes(showgrid=True, gridcolor="#eee")
     st.plotly_chart(fig_cmp, width='stretch', key=f"acc_chart_{tab_key}")
 
@@ -373,8 +457,7 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
     st.markdown("##### Item-Level Accuracy")
     item_tbl = (
         df_acc.groupby("product_name")
-        .agg(predicted=("predicted_quantity", "sum"),
-             actual=("actual_qty", "sum"))
+        .agg(predicted=("predicted_quantity", "sum"), actual=("actual_qty", "sum"))
         .reset_index()
     )
     item_tbl["diff"]     = item_tbl["predicted"] - item_tbl["actual"]
@@ -383,11 +466,10 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
     )
     item_tbl = item_tbl.sort_values("actual", ascending=False)
     item_tbl.columns = ["Product", "Predicted", "Actual", "Diff", "% Diff"]
-
     styled = (
         item_tbl.style
         .format({"Predicted": "{:.1f}", "Actual": "{:.1f}", "Diff": "{:+.1f}", "% Diff": "{:+.1f}%"}, na_rep="—")
-        .map(_color_diff, subset=["% Diff"])
+        .map(_color_gap, subset=["% Diff"])
     )
     st.dataframe(styled, width='stretch', height=450)
 
@@ -395,8 +477,145 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
 if page == "📊 Accuracy Report":
     dow_acc = acc_date.strftime("%A")
     st.title(f"📊 Accuracy Report — {dow_acc}, {acc_date.strftime('%B %d, %Y')}")
-    st.caption("All times in Central Time (CT)")
+    st.caption("🕐 All times in Central Time (CT)")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Cross-location summary table
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("All Locations — Daily Summary")
+    summary_rows = load_cross_location_summary(acc_date)
+
+    if summary_rows:
+        df_sum = pd.DataFrame(summary_rows)
+        df_sum["predicted"] = df_sum["predicted"].astype(float)
+        df_sum["actual"]    = df_sum["actual"].astype(float)
+        df_sum["mae"]       = df_sum["mae"].astype(float)
+        df_sum["slots"]     = df_sum["slots"].astype(int)
+        df_sum["within_1"]  = df_sum["within_1"].astype(int)
+        df_sum["within_2"]  = df_sum["within_2"].astype(int)
+
+        df_sum["diff"]      = df_sum["predicted"] - df_sum["actual"]
+        df_sum["gap_pct"]   = df_sum.apply(
+            lambda r: r["diff"] / r["actual"] * 100 if r["actual"] > 0 else float("nan"), axis=1
+        )
+        df_sum["w1_pct"]    = df_sum["within_1"] / df_sum["slots"] * 100
+        df_sum["w2_pct"]    = df_sum["within_2"] / df_sum["slots"] * 100
+
+        # totals row
+        tot = {
+            "location": "TOTAL", "predicted": df_sum["predicted"].sum(),
+            "actual": df_sum["actual"].sum(), "mae": df_sum["mae"].mean(),
+            "diff": df_sum["diff"].sum(), "slots": df_sum["slots"].sum(),
+            "w1_pct": df_sum["within_1"].sum() / df_sum["slots"].sum() * 100,
+            "w2_pct": df_sum["within_2"].sum() / df_sum["slots"].sum() * 100,
+        }
+        tot["gap_pct"] = tot["diff"] / tot["actual"] * 100 if tot["actual"] else float("nan")
+        df_sum = pd.concat([df_sum, pd.DataFrame([tot])], ignore_index=True)
+
+        tbl = df_sum[["location","predicted","actual","diff","gap_pct","mae","w1_pct","w2_pct"]].copy()
+        tbl.columns = ["Location","Predicted","Actual","Diff","Gap %","MAE","±1 %","±2 %"]
+
+        styled_sum = (
+            tbl.style
+            .format({
+                "Predicted": "{:,.0f}", "Actual": "{:,.0f}",
+                "Diff": "{:+,.0f}", "Gap %": "{:+.1f}%",
+                "MAE": "{:.3f}", "±1 %": "{:.1f}%", "±2 %": "{:.1f}%",
+            }, na_rep="—")
+            .map(_bg_gap, subset=["Gap %"])
+            .map(_color_gap, subset=["Gap %"])
+        )
+        st.dataframe(styled_sum, width='stretch', height=460)
+    else:
+        st.warning("No prediction data for this date.")
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Accuracy trend (gap % over time, all locations)
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("Accuracy Trend — Last 30 Days")
+    trend_rows = load_accuracy_trend(n_dates=30)
+
+    if trend_rows:
+        df_trend = pd.DataFrame(trend_rows)
+        df_trend["predicted"] = df_trend["predicted"].astype(float)
+        df_trend["actual"]    = df_trend["actual"].astype(float)
+        df_trend["gap_pct"]   = df_trend.apply(
+            lambda r: (r["predicted"] - r["actual"]) / r["actual"] * 100
+            if r["actual"] > 0 else float("nan"), axis=1
+        )
+        df_trend["target_date"] = pd.to_datetime(df_trend["target_date"])
+
+        dates_available = df_trend["target_date"].nunique()
+
+        if dates_available < 2:
+            st.info("Trend chart needs at least 2 past dates with predictions. Check back as more days accumulate.")
+        else:
+            # Overall daily gap line (all locations combined)
+            df_overall = (
+                df_trend.groupby("target_date")
+                .apply(lambda g: pd.Series({
+                    "predicted": g["predicted"].sum(),
+                    "actual":    g["actual"].sum(),
+                }))
+                .reset_index()
+            )
+            df_overall["gap_pct"] = (
+                (df_overall["predicted"] - df_overall["actual"])
+                / df_overall["actual"].replace(0, float("nan")) * 100
+            )
+
+            locations_list = sorted(df_trend["location"].unique())
+            trend_colors   = CHART_COLORS
+
+            fig_trend = go.Figure()
+
+            # Per-location faint lines
+            for i, loc in enumerate(locations_list):
+                sub = df_trend[df_trend["location"] == loc].sort_values("target_date")
+                fig_trend.add_trace(go.Scatter(
+                    name=loc, x=sub["target_date"], y=sub["gap_pct"],
+                    mode="lines+markers",
+                    line=dict(color=trend_colors[i % len(trend_colors)], width=1.5),
+                    marker=dict(size=5),
+                    hovertemplate=f"<b>{loc}</b><br>%{{x|%b %d}}: %{{y:+.1f}}%<extra></extra>",
+                ))
+
+            # Bold overall average line
+            fig_trend.add_trace(go.Scatter(
+                name="ALL (avg)", x=df_overall["target_date"], y=df_overall["gap_pct"],
+                mode="lines+markers",
+                line=dict(color="black", width=3),
+                marker=dict(size=7, symbol="diamond"),
+                hovertemplate="<b>All locations</b><br>%{x|%b %d}: %{y:+.1f}%<extra></extra>",
+            ))
+
+            # Zero reference line
+            fig_trend.add_hline(y=0, line_dash="dash", line_color="#aaa", line_width=1)
+            fig_trend.add_hrect(y0=-10, y1=10, fillcolor="rgba(39,174,96,0.06)", line_width=0)
+
+            fig_trend.update_layout(
+                title=dict(text="Volume Gap % by Location (positive = over-predicted)", font=dict(size=14)),
+                xaxis_title="Date", yaxis_title="Gap %",
+                height=420,
+                legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                            font=dict(size=10)),
+                margin=dict(l=0, r=0, t=55, b=30),
+                plot_bgcolor="white", paper_bgcolor="white",
+            )
+            fig_trend.update_xaxes(showgrid=True, gridcolor="#eee")
+            fig_trend.update_yaxes(showgrid=True, gridcolor="#eee", ticksuffix="%")
+            st.plotly_chart(fig_trend, width='stretch', key="trend_chart")
+    else:
+        st.info("No past prediction data found for trend analysis.")
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Per-location drill-down tabs (existing)
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("Per-Location Drill-Down")
     acc_locations = load_locations()
     acc_tabs = st.tabs([l["name"] for l in acc_locations])
     for tab, loc in zip(acc_tabs, acc_locations):
