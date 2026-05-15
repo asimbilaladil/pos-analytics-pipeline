@@ -16,7 +16,7 @@ pipeline.py              ← fetch yesterday's orders + items + modifiers, inser
 aggregate_features.py    ← compute hourly/daily feature tables from raw data
      │
      ▼
-predict_daily.py         ← generate 15-min item predictions for today (all 11 locations)
+predict_daily_ml.py      ← LightGBM 15-min item predictions for today (all 11 locations)
      │
      ▼
 PostgreSQL (4 layers)
@@ -36,8 +36,9 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 |---|---|
 | `pipeline.py` | Main daily pipeline — logs into Revel, fetches all orders + items + modifiers for each location, inserts into PostgreSQL |
 | `aggregate_features.py` | Nightly aggregation — reads raw tables, populates feature tables for ML |
-| `predict_daily.py` | 15-min item prediction — generates per-product, per-slot quantity forecasts for each location; supports backtesting with `--validate` |
-| `run.sh` | Daily cron wrapper — runs `pipeline.py` → `aggregate_features.py` → `predict_daily.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
+| `predict_daily_ml.py` | **LightGBM 15-min prediction** — trains a gradient-boosted model each morning and generates per-product, per-slot quantity forecasts; supports backtesting with `--validate` |
+| `predict_daily.py` | Weighted-average baseline — recency-weighted same-day-of-week average (kept for comparison; cron now uses ML model) |
+| `run.sh` | Daily cron wrapper — runs `pipeline.py` → `aggregate_features.py` → `predict_daily_ml.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
 | `backfill.sh` | Simple date-range backfill — loops day by day, runs pipeline + aggregation for each date |
 | `backfill3m.sh` | Smart 3-month backfill — auto-resume (skips completed dates), rate limiting, failure tracking, `--status` mode |
 | `ingest_to_db.py` | Offline ingestion — reads JSON files produced by `order_fixed.py` and inserts into DB |
@@ -131,17 +132,17 @@ python3 pipeline.py --establishments 32,14
 # Aggregate feature tables (run after pipeline.py)
 python3 aggregate_features.py --date 2026-05-04
 
-# Generate 15-min predictions for today
-python3 predict_daily.py
+# Generate LightGBM 15-min predictions for today
+python3 predict_daily_ml.py
 
 # Generate predictions for a specific date (backtest)
-python3 predict_daily.py --date 2026-05-13
+python3 predict_daily_ml.py --date 2026-05-13
 
 # Backtest + accuracy report vs actual data
-python3 predict_daily.py --date 2026-05-13 --validate
+python3 predict_daily_ml.py --date 2026-05-13 --validate
 
-# Use more historical weeks (default: 8)
-python3 predict_daily.py --lookback 12
+# Weighted-average baseline (for comparison)
+python3 predict_daily.py --date 2026-05-13 --validate
 ```
 
 ### 5. Backfill historical data
@@ -182,24 +183,55 @@ bash /opt/laynes/backfill3m.sh --status
 
 ## 15-Min Item Prediction Model
 
-`predict_daily.py` generates a daily forecast before the business day starts. For each location, product, and 15-minute slot it:
+`predict_daily_ml.py` trains a fresh LightGBM model each morning on all available history and generates 15-minute slot forecasts for every location and product before the business day starts.
 
-1. Looks back at the last 8 same-day-of-week dates (e.g. the last 8 Wednesdays)
-2. Drops any date where that location's total daily volume exceeded mean + 2σ (outlier filter)
-3. Computes a recency-weighted average — the most recent week gets weight `n`, the oldest gets weight `1`
-4. Outputs predicted quantity ± 1 std dev as the confidence interval
+### Algorithm (`lgbm_v3`)
 
-The daily summary printed to the log shows:
-- **All-day prep totals** — top 10 items ranked by predicted daily quantity
-- **Peak period** — the 5-slot window around the busiest 15-min slot with per-item breakdown
+1. **Load slot data** — fetch all positive (est, product, slot, date, qty) observations from DB since Feb 10 2026.
+2. **Compute lag features in Python** using calendar-date offsets (7/14/21/28/35/42/49/56 days ago), not window-function occurrence offsets, so training and prediction features are always computed identically.
+3. **Filter active combos** — a (location, product, slot) combo must appear on ≥3 distinct dates in history and on ≥1 of the last 8 same-day-of-week dates to be included.
+4. **Train LightGBM** (`regression_l1`) on a train/val split (last 14 days = validation), with early stopping.
+5. **Predict** — run model on all active combos for the target date.
+6. **DOW activity scaling** — multiply each raw prediction by `recent_dow_count / 8`, where `recent_dow_count` is how many of the last 8 same-day-of-week dates had sales in that slot. This converts the model's conditional mean (trained only on positive observations) to an unconditional expected value that accounts for zero-sale days — equivalent to what the weighted-average baseline does implicitly.
+7. **Write to DB** — upsert into `predictions_15min` with ± `val_mae` confidence interval.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| `establishment_id` | Location (categorical) |
+| `product_id` | Menu item (categorical) |
+| `slot_index` | 15-min slot 0–95 (0 = midnight) |
+| `day_of_week` | 0=Mon … 6=Sun |
+| `week_of_year` | ISO week number |
+| `month` | Calendar month |
+| `is_weekend` | 1 if Sat/Sun |
+| `lag_7d` / `lag_14d` / `lag_21d` | Qty sold in same slot 1/2/3 weeks ago |
+| `roll_dow_4w` | Mean qty over last 4 same-DOW dates |
+| `roll_dow_8w` | Mean qty over last 8 same-DOW dates |
+| `activity_rate` | Fraction of all history days with sales |
+
+### Output
+
+The daily log summary includes:
+- **All-day prep totals** — top 10 items ranked by predicted daily quantity per location
+- **Peak period** — 5-slot window around busiest slot with per-item breakdown
 - **Shift breakdown** — Morning / Lunch / Afternoon / Dinner totals with top items
 
-**Backtested accuracy (May 13, 2026 — 8 weeks of history):**
-- Mean Absolute Error: 0.67 units/slot
-- 86% of slots within ±1 unit of actual
-- 94% of slots within ±2 units of actual
+### Backtested accuracy (May 13, 2026 — 92 days of history)
+
+| Metric | LightGBM (lgbm_v3) | Weighted avg baseline |
+|---|---|---|
+| Mean Absolute Error | **0.594 units/slot** | 0.670 |
+| Within ±1 unit | **88%** | 86% |
+| Within ±2 units | **94%** | 94% |
+| Total predicted vs actual | 16,760 vs 16,030 | 21,536 vs 15,942 |
 
 Results are stored in `predictions_15min` and can be queried per location, product, or time slot.
+
+### Weighted-average baseline
+
+`predict_daily.py` is kept for comparison. It uses a recency-weighted same-day-of-week average with a mean+2σ outlier filter. No ML training required — runs in seconds. Switch `run.sh` back to it if LightGBM training time becomes a concern.
 
 ---
 
