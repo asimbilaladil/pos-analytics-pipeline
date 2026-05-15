@@ -592,6 +592,10 @@ def main():
             })
 
         log.info("Saving %d prediction rows...", len(predictions))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM predictions_15min WHERE target_date = %s", (target_date,))
+            deleted = cur.rowcount
+        log.info("  Cleared %d old prediction rows for %s", deleted, target_date)
         upsert_predictions(conn, predictions)
         conn.commit()
         log.info("Done.")
