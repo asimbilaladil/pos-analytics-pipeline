@@ -278,12 +278,6 @@ with st.sidebar:
             past_dates,
             format_func=lambda d: d.strftime("%A, %b %d %Y"),
         )
-        locations_for_acc = load_locations()
-        acc_loc_name = st.selectbox(
-            "Location",
-            [l["name"] for l in locations_for_acc],
-        )
-        acc_loc = next(l for l in locations_for_acc if l["name"] == acc_loc_name)
 
     st.markdown("---")
     st.caption("🕐 All times in **Central Time** (Houston, TX)")
@@ -292,15 +286,16 @@ with st.sidebar:
 
 # ── Accuracy Report page ──────────────────────────────────────────────────────
 
-if page == "📊 Accuracy Report":
-    dow_acc = acc_date.strftime("%A")
-    st.title(f"📊 Accuracy Report — {dow_acc}, {acc_date.strftime('%B %d, %Y')}")
-    st.caption(f"Location: **{acc_loc_name}** · All times in Central Time (CT)")
+def _color_diff(val):
+    if pd.isna(val):
+        return "color: #aaa"
+    return "color: #c0392b" if abs(val) > 20 else ("color: #e67e22" if abs(val) > 10 else "color: #27ae60")
 
-    acc_rows = load_accuracy_metrics(acc_date, acc_loc["id"])
+def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
+    acc_rows = load_accuracy_metrics(report_date, loc_id)
     if not acc_rows:
-        st.warning(f"No prediction data for **{acc_loc_name}** on {acc_date}.")
-        st.stop()
+        st.warning(f"No prediction data for **{loc_name}** on {report_date}.")
+        return
 
     df_acc = pd.DataFrame(acc_rows)
     df_acc["predicted_quantity"] = df_acc["predicted_quantity"].astype(float)
@@ -354,7 +349,7 @@ if page == "📊 Accuracy Report":
     hour_ticks_acc = [s for s in all_slots if s.endswith(":00")]
     fig_cmp.update_layout(
         barmode="group",
-        title=dict(text=f"{acc_loc_name} · Predicted vs Actual (15-min slots)", font=dict(size=14)),
+        title=dict(text=f"{loc_name} · Predicted vs Actual (15-min slots)", font=dict(size=14)),
         xaxis_title="Time (CT)",
         yaxis_title="Quantity",
         height=380,
@@ -370,7 +365,7 @@ if page == "📊 Accuracy Report":
         showgrid=True, gridcolor="#eee",
     )
     fig_cmp.update_yaxes(showgrid=True, gridcolor="#eee")
-    st.plotly_chart(fig_cmp, width='stretch', key="acc_chart")
+    st.plotly_chart(fig_cmp, width='stretch', key=f"acc_chart_{tab_key}")
 
     st.markdown("---")
 
@@ -389,17 +384,24 @@ if page == "📊 Accuracy Report":
     item_tbl = item_tbl.sort_values("actual", ascending=False)
     item_tbl.columns = ["Product", "Predicted", "Actual", "Diff", "% Diff"]
 
-    def _color_diff(val):
-        if pd.isna(val):
-            return "color: #aaa"
-        return "color: #c0392b" if abs(val) > 20 else ("color: #e67e22" if abs(val) > 10 else "color: #27ae60")
-
     styled = (
         item_tbl.style
         .format({"Predicted": "{:.1f}", "Actual": "{:.1f}", "Diff": "{:+.1f}", "% Diff": "{:+.1f}%"}, na_rep="—")
         .map(_color_diff, subset=["% Diff"])
     )
     st.dataframe(styled, width='stretch', height=450)
+
+
+if page == "📊 Accuracy Report":
+    dow_acc = acc_date.strftime("%A")
+    st.title(f"📊 Accuracy Report — {dow_acc}, {acc_date.strftime('%B %d, %Y')}")
+    st.caption("All times in Central Time (CT)")
+
+    acc_locations = load_locations()
+    acc_tabs = st.tabs([l["name"] for l in acc_locations])
+    for tab, loc in zip(acc_tabs, acc_locations):
+        with tab:
+            render_accuracy_tab(loc["name"], loc["id"], acc_date, str(loc["id"]))
     st.stop()
 
 # ── Main content ──────────────────────────────────────────────────────────────
