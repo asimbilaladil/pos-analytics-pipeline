@@ -407,6 +407,29 @@ CREATE INDEX idx_fds_date ON features_daily_summary (date);
 -- What the ML model writes. What the dashboard reads.
 -- ============================================================
 
+-- 15-minute item quantity predictions — written by predict_daily_ml.py
+CREATE TABLE predictions_15min (
+    id                      BIGSERIAL PRIMARY KEY,
+    establishment_id        INTEGER NOT NULL REFERENCES establishments(id),
+    product_id              INTEGER REFERENCES products(id),
+    product_name            VARCHAR(200),
+    target_date             DATE NOT NULL,
+    slot_index              SMALLINT NOT NULL,          -- 0-95 (0 = midnight, 36 = 9am, etc.)
+    slot_start              TIME NOT NULL,              -- wall-clock time of slot start
+    predicted_quantity      NUMERIC(10,4),
+    confidence_low          NUMERIC(10,4),
+    confidence_high         NUMERIC(10,4),
+    historical_points       INTEGER,                   -- number of training observations
+    model_version           VARCHAR(50),
+    generated_at            TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE (establishment_id, product_id, target_date, slot_index)
+);
+
+CREATE INDEX idx_p15_est_date ON predictions_15min (establishment_id, target_date);
+CREATE INDEX idx_p15_product_date ON predictions_15min (product_id, target_date);
+
+
 -- Demand predictions — generated nightly for the next 7 days
 CREATE TABLE predictions_hourly_demand (
     id                      BIGSERIAL PRIMARY KEY,
@@ -525,7 +548,7 @@ SELECT
     s.void_rate,
     s.avg_kitchen_seconds,
     s.pct_third_party,
-    s.overall_score
+    h.overall_score
 FROM features_daily_summary s
 JOIN establishments e ON e.id = s.establishment_id
 LEFT JOIN location_health_scores h

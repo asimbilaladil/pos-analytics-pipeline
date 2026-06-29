@@ -35,6 +35,9 @@ import logging
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from playwright.sync_api import sync_playwright
 import psycopg2
 from psycopg2.extras import execute_values
@@ -663,6 +666,10 @@ def main():
         "--establishments", type=str, default=None,
         help="Comma-separated list of establishment IDs to run (default: all 11)"
     )
+    parser.add_argument(
+        "--skip-reference", action="store_true",
+        help="Skip product/modifier re-fetch from Revel (use DB cache). Speeds up backfills."
+    )
     args = parser.parse_args()
 
     target_date = date.fromisoformat(args.date) if args.date else None
@@ -705,8 +712,15 @@ def main():
         page.close()
 
         # Fetch reference data once — products and modifiers shared across all establishments
-        fetch_and_upsert_products(context, conn)
-        modifier_cache = fetch_and_upsert_modifiers(context, conn)
+        if args.skip_reference:
+            log.info("--skip-reference: loading modifier cache from DB (skipping Revel fetch)")
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name FROM modifiers")
+                modifier_cache = {row[0]: row[1] for row in cur.fetchall()}
+            log.info("Modifier cache loaded from DB: %d modifiers", len(modifier_cache))
+        else:
+            fetch_and_upsert_products(context, conn)
+            modifier_cache = fetch_and_upsert_modifiers(context, conn)
 
         # Run each establishment
         for est in establishments:

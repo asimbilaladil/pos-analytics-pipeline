@@ -45,13 +45,29 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 | `order_fixed.py` | Manual/debug tool — fetches from Revel and saves JSON files to disk |
 | `database_design.sql` | Full PostgreSQL schema (run once on a fresh DB) |
 | `setup.sh` | One-command server setup for Ubuntu 22.04 |
+| `seed_establishments.py` | Seeds the `establishments` table from Revel API (run once after schema creation) |
+| `backfill_local.sh` | Local backfill runner — uses project `venv/` instead of `/opt/laynes`; passes `--skip-reference` for fast runs |
 
 ---
 
 ## Database Schema
 
 ### Layer 0 — Reference Tables
-- **`establishments`** — 11 Laynes locations with timezone info
+- **`establishments`** — 11 Laynes locations with timezone info (seed with `seed_establishments.py`)
+
+| Revel ID | Name |
+|---|---|
+| 32 | LCF Airtex |
+| 14 | LCF Beaumont |
+| 48 | LCF Downtown Houston |
+| 7 | LCF Ella |
+| 6 | LCF Katy |
+| 25 | LCF Mission Bend |
+| 36 | LCF Missouri City |
+| 26 | LCF Nederland |
+| 20 | LCF Pasadena |
+| 40 | LCF Rosenberg |
+| 15 | LCF Shepherd |
 - **`products`** — menu item master list from `/resources/Product/`
 - **`modifiers`** — modifier reference table from `/resources/Modifier/` (~347 unique modifiers), refreshed nightly
 - **`dining_channels`** — dining option codes (Drive Through, DoorDash, Uber Eats, etc.)
@@ -98,6 +114,24 @@ chmod +x setup.sh && sudo bash setup.sh
 
 This installs PostgreSQL, Python, Playwright + Chromium, creates the DB, writes `/opt/laynes/.env`, and sets up cron.
 
+**Local / dev setup** (without `setup.sh`):
+
+```bash
+# Create venv and install dependencies
+python3 -m venv venv
+venv/bin/pip install psycopg2-binary python-dotenv lightgbm playwright
+venv/bin/playwright install chromium
+
+# Create DB and apply schema
+sudo -u postgres psql -c "CREATE USER laynes_user WITH PASSWORD 'yourpass';"
+sudo -u postgres psql -c "CREATE DATABASE laynes OWNER laynes_user;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE laynes TO laynes_user;"
+sudo -u postgres psql -d laynes -f database_design.sql
+
+# Seed location names (run once)
+venv/bin/python3 seed_establishments.py
+```
+
 ### 2. Environment variables
 
 ```bash
@@ -121,13 +155,16 @@ psql -d laynes -f database_design.sql
 
 ```bash
 # Fetch yesterday's data and insert into DB
-python3 pipeline.py
+venv/bin/python3 pipeline.py
 
 # Fetch a specific date (for backfilling)
-python3 pipeline.py --date 2026-05-04
+venv/bin/python3 pipeline.py --date 2026-05-04
 
 # Run only specific locations
-python3 pipeline.py --establishments 32,14
+venv/bin/python3 pipeline.py --establishments 32,14
+
+# Skip product/modifier re-fetch (use DB cache) — 7x faster, use for backfills
+venv/bin/python3 pipeline.py --date 2026-05-04 --skip-reference
 
 # Aggregate feature tables (run after pipeline.py)
 python3 aggregate_features.py --date 2026-05-04
@@ -147,13 +184,23 @@ python3 predict_daily.py --date 2026-05-13 --validate
 
 ### 5. Backfill historical data
 
-**Simple backfill** — loops day by day with a 2-second pause between dates:
+**Local backfill** (`backfill_local.sh`) — uses project `venv/`, passes `--skip-reference` for ~2.5 min/day (~7× faster than naive approach):
 
 ```bash
-bash /opt/laynes/backfill.sh 2026-01-01 2026-04-30
+# Feb 10 2026 → yesterday (default)
+nohup bash backfill_local.sh > /var/log/laynes/backfill3m.log 2>&1 &
+
+# Custom date range
+nohup bash backfill_local.sh 2026-01-01 2026-04-30 > /var/log/laynes/backfill3m.log 2>&1 &
+
+# Watch live progress
+tail -f /var/log/laynes/backfill3m.log
+
+# Check status / see incomplete dates
+bash backfill_local.sh --status
 ```
 
-**Smart backfill** — auto-resumes (skips already-completed dates), 30-minute sleep between dates to avoid API rate limits, tracks failures:
+**Server backfill** (`backfill3m.sh`) — for `/opt/laynes` deployments, auto-resumes, tracks failures:
 
 ```bash
 # Last 3 months → yesterday (default)
@@ -161,9 +208,6 @@ nohup bash /opt/laynes/backfill3m.sh > /var/log/laynes/backfill3m.log 2>&1 &
 
 # Custom date range
 nohup bash /opt/laynes/backfill3m.sh 2026-01-01 2026-04-30 > /var/log/laynes/backfill3m.log 2>&1 &
-
-# Watch live progress
-tail -f /var/log/laynes/backfill3m.log
 
 # Check status / see incomplete dates
 bash /opt/laynes/backfill3m.sh --status
@@ -268,11 +312,14 @@ LIMIT 20;
 playwright
 psycopg2-binary
 python-dotenv
+lightgbm
 ```
 
 ```bash
-pip install playwright psycopg2-binary python-dotenv
-playwright install chromium
+venv/bin/pip install playwright psycopg2-binary python-dotenv lightgbm
+venv/bin/playwright install chromium
 ```
 
 PostgreSQL 15+
+
+> All scripts load `.env` automatically via `python-dotenv` — no need to `source` it manually before running.
