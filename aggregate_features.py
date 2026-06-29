@@ -25,6 +25,9 @@ import logging
 import argparse
 from datetime import date, timedelta
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import psycopg2
 
 logging.basicConfig(

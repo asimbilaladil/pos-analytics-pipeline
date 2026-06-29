@@ -37,7 +37,7 @@ import lightgbm as lgb
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-load_dotenv("/opt/laynes/.env")
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
