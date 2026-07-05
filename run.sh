@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/opt/laynes"
+APP_DIR="/root/pos-analytics-pipeline"
 LOG_DIR="/var/log/laynes"
 VENV="$APP_DIR/venv"
 DATE=$(date +%Y-%m-%d)

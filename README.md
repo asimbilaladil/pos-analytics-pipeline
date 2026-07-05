@@ -279,6 +279,40 @@ Results are stored in `predictions_15min` and can be queried per location, produ
 
 ---
 
+## Tender Planning Dashboard (`dashboard.py`)
+
+A separate Streamlit page (🍗 Tender Planning) that tells kitchens how many chicken tenders to prep per 15-min slot, split into **Spicy** and **Regular** tabs. Unlike the ML model above, its per-slot prediction is a simple **median over same-weekday history** — chosen because at 15-min granularity, volumes are low enough that the ML model's conditional mean is less reliable than "what actually happened the last N times this exact slot occurred on this weekday."
+
+### How the prediction is computed
+
+For a given location, weekday, and 15-min slot:
+1. Pull every past same-weekday date since backfill start (Feb 10, 2026) up to (not including) the selected date — this is the full `n_weeks` history, unbounded and growing over time.
+2. Split every order line into regular/spicy tender counts (`get_finger_split`), so each tab only ever sums its own flavor.
+3. **Zero-fill**: any past week with no matching order for that slot is treated as a real 0, not a missing data point — otherwise the median would only be computed over the rare weeks that happened to have an order there, wildly overstating a slot that's barely ever active.
+4. Predicted quantity = median across **all** `n_weeks` (zero-filled) values. If that median is 0, the slot is dropped from the table entirely rather than showing a phantom prep number — see `dashboard.py` around `render_tender_flavor()` (the `pivot`/`fillna(0.0)` block).
+
+### Known limitation: slow to pick up new patterns
+
+Because step 4 uses the median over **all** history (no rolling window, no recency weighting — unlike the ML model's `roll_dow_4w`/`roll_dow_8w` lag features), a slot that has historically been empty will **not** reappear the moment real orders start showing up there. More than half of all recorded same-weekdays need to be non-zero before the median flips positive.
+
+Concretely: if a slot has 19 zero-weeks and 1 non-zero week on record, and orders start appearing there every week going forward, it takes roughly **19 more consecutive weeks** (~4-5 months) before that slot's median turns positive and it reappears in the table — the old zero-weeks keep outnumbering the new ones until they don't.
+
+**If this needs to be more responsive** (e.g. a location extends hours or a new pattern emerges and you want it reflected within a few weeks, not months), the fix is to compute the median over a **rolling recent window** (e.g. last 10-12 same-weekdays) instead of full history, or add recency weighting like `predict_daily_ml.py` already does. Not implemented as of this writing — flagged here so a missing/slow-to-appear slot isn't mistaken for a bug.
+
+### Performance: why date/location switches used to be slow
+
+Switching the date or location dropdown used to take 10+ seconds. Root causes, found via `EXPLAIN (ANALYZE, BUFFERS)`:
+
+1. **Postgres JIT compilation overhead dominated query time** — the same query ran in 4.6s with `jit=on` vs 0.37s with `jit=off` (~12x). JIT is built for huge batch scans; for this dashboard's pattern of many small/medium repeated queries it was pure overhead with no benefit. Fixed at the database level: `ALTER DATABASE laynes SET jit = off;` — a performance-only flag, applies to all new connections, no correctness impact on the pipeline scripts.
+2. **The `order_items JOIN orders` join fanned out across all 12 monthly partitions per row.** Both tables are partitioned by their own `created_date`, but `order_items.created_date` can differ from its parent order's `created_date` by a few seconds — so Postgres had no partition key to prune on and checked every partition per row. Fixed by bounding the join to `o.created_date BETWEEN oi.created_date - INTERVAL '1 day' AND oi.created_date + INTERVAL '1 day'` (all 6 query sites in `dashboard.py`) — the ±1 day window is far wider than the actual few-second gap, so this is a correctness no-op that lets Postgres prune to ~2 partitions instead of 12.
+3. **`load_dow_history` and `load_recent_daily` were cached keyed on the exact selected date**, so every date change was a guaranteed cache miss — even when browsing between two dates of the *same weekday*, the most common workflow. Both now cache on the stable dimension only (location, and weekday for `load_dow_history`) and fetch the full underlying history once; callers filter the date-dependent window in pandas afterward. Browsing dates within an already-cached weekday is now served from cache instead of re-querying Postgres.
+
+Net effect: worst case (a location/weekday never viewed this session) dropped from ~14s (3 sequential ~4.6s queries) to under ~1s; same-weekday date browsing after the first hit is now a cache hit (~0.5s, pure Streamlit rerun, no DB round trip).
+
+**If a future query added here feels slow**, check `EXPLAIN (ANALYZE, BUFFERS)` with `jit` on and off before reaching for an index — on this database, JIT overhead has repeatedly been the bigger factor. Also: any new `@st.cache_data` function parameterized by the currently-selected date will miss cache on every date change — prefer caching on the stable dimension and filtering the date-dependent slice in pandas, as done here.
+
+---
+
 ## Key Design Decisions
 
 **Partitioned tables** — `orders` and `order_items` are partitioned by month (`PARTITION BY RANGE (created_date)`). This keeps queries fast and allows easy archival of old data.
