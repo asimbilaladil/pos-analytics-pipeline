@@ -47,6 +47,10 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 | `setup.sh` | One-command server setup for Ubuntu 22.04 |
 | `seed_establishments.py` | Seeds the `establishments` table from Revel API (run once after schema creation) |
 | `backfill_local.sh` | Local backfill runner — uses project `venv/` instead of `/opt/laynes`; passes `--skip-reference` for fast runs |
+| `dashboard.py` | **Tender Planning** — Streamlit kitchen prep dashboard (see dedicated section below). Deployed live via systemd. |
+| `sales_report.py` | **Sales Intelligence** — Streamlit network-wide weekly performance dashboard (see dedicated section below). Deployed live via systemd. |
+
+> **Note on `setup.sh`:** it predates the LightGBM model and both Streamlit dashboards — it only copies `pipeline.py`, `aggregate_features.py`, `ingest_to_db.py`, and `database_design.sql` to `/opt/laynes`, only installs `playwright`/`psycopg2-binary`/`python-dotenv` (no `lightgbm`/`streamlit`/`pandas`/`plotly`), and its generated cron `run.sh` only runs `pipeline.py` → `aggregate_features.py` — no prediction step. Running it today reproduces the raw ingestion pipeline only, not the full system described in this README. Treat the repo-root `run.sh` (which does include the LightGBM step) as the reference for what a complete nightly job should do, and install/copy the ML + dashboard pieces manually until `setup.sh` is updated to match. The repo-root `run.sh` itself currently has `APP_DIR` hardcoded to this dev box's checkout path rather than `/opt/laynes` — treat it as this environment's local runner, not a portable script.
 
 ---
 
@@ -83,7 +87,7 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 - **`features_daily_summary`** — daily rollup per location including peak hour, channel mix, void rate
 
 ### Layer 3 — Prediction Output
-- **`predictions_15min`** — predicted item quantities per product per 15-min slot per location (96 slots/day); written by `predict_daily.py`
+- **`predictions_15min`** — predicted item quantities per product per 15-min slot per location (96 slots/day); written nightly by `predict_daily_ml.py` (LightGBM, the cron default), or by `predict_daily.py` when run manually for baseline comparison
 - **`predictions_hourly_demand`** — predicted order count and revenue per hour
 - **`predictions_prep_sheet`** — predicted prep quantities per item per shift
 - **`predictions_staffing`** — recommended headcount per shift
@@ -119,7 +123,7 @@ This installs PostgreSQL, Python, Playwright + Chromium, creates the DB, writes 
 ```bash
 # Create venv and install dependencies
 python3 -m venv venv
-venv/bin/pip install psycopg2-binary python-dotenv lightgbm playwright
+venv/bin/pip install psycopg2-binary python-dotenv lightgbm playwright streamlit pandas plotly
 venv/bin/playwright install chromium
 
 # Create DB and apply schema
@@ -283,6 +287,8 @@ Results are stored in `predictions_15min` and can be queried per location, produ
 
 A separate Streamlit page (🍗 Tender Planning) that tells kitchens how many chicken tenders to prep per 15-min slot, split into **Spicy** and **Regular** tabs. Unlike the ML model above, its per-slot prediction is a simple **median over same-weekday history** — chosen because at 15-min granularity, volumes are low enough that the ML model's conditional mean is less reliable than "what actually happened the last N times this exact slot occurred on this weekday."
 
+**Live deployment:** runs as systemd service `laynes-dashboard`, Streamlit on port 8502, proxied by nginx at `https://hr.aygfoods.com/daily-sales-prediction`. Restart with `systemctl restart laynes-dashboard`; logs at `/var/log/laynes-dashboard.log`.
+
 ### How the prediction is computed
 
 For a given location, weekday, and 15-min slot:
@@ -310,6 +316,21 @@ Switching the date or location dropdown used to take 10+ seconds. Root causes, f
 Net effect: worst case (a location/weekday never viewed this session) dropped from ~14s (3 sequential ~4.6s queries) to under ~1s; same-weekday date browsing after the first hit is now a cache hit (~0.5s, pure Streamlit rerun, no DB round trip).
 
 **If a future query added here feels slow**, check `EXPLAIN (ANALYZE, BUFFERS)` with `jit` on and off before reaching for an index — on this database, JIT overhead has repeatedly been the bigger factor. Also: any new `@st.cache_data` function parameterized by the currently-selected date will miss cache on every date change — prefer caching on the stable dimension and filtering the date-dependent slice in pandas, as done here.
+
+---
+
+## Sales Intelligence Dashboard (`sales_report.py`)
+
+A separate, network-wide Streamlit page ("Laynes | Sales Intelligence") for weekly performance across all 11 locations — a manager-facing view, distinct from the kitchen-facing Tender Planning dashboard above. Reads from `features_daily_summary` (Layer 2), not raw order data, so it's fast regardless of history size.
+
+**Sections:**
+- **Sidebar week selector** — pick any past week (Mon–Sun) from all weeks with data.
+- **KPI header** — network totals for the selected week vs. the prior week (WoW deltas).
+- **Leaderboard** — all 11 locations ranked for the selected week.
+- **8-Week Trend** — Grouped / Stacked / Table tabs comparing locations over the last 8 weeks.
+- **Day-of-week heatmap** — which weekdays run hottest, per location.
+
+**Live deployment:** runs as systemd service `laynes-sales-report`, Streamlit on port 8503, proxied by nginx at `https://hr.aygfoods.com/sales-report`. Restart with `systemctl restart laynes-sales-report`; logs at `/var/log/laynes-sales-report.log`.
 
 ---
 
@@ -347,13 +368,18 @@ playwright
 psycopg2-binary
 python-dotenv
 lightgbm
+streamlit
+pandas
+plotly
 ```
 
 ```bash
-venv/bin/pip install playwright psycopg2-binary python-dotenv lightgbm
+venv/bin/pip install playwright psycopg2-binary python-dotenv lightgbm streamlit pandas plotly
 venv/bin/playwright install chromium
 ```
 
-PostgreSQL 15+
+`playwright`/`psycopg2-binary`/`python-dotenv`/`lightgbm` are needed for the pipeline + ML prediction scripts. `streamlit`/`pandas`/`plotly` are needed only for the two dashboards (`dashboard.py`, `sales_report.py`) — skip them if you're only running the nightly pipeline.
+
+PostgreSQL 16 tested (15+ should work)
 
 > All scripts load `.env` automatically via `python-dotenv` — no need to `source` it manually before running.
