@@ -26,8 +26,9 @@ import sys
 import glob
 import argparse
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -89,6 +90,8 @@ def extract_id(uri_or_int) -> Optional[int]:
     return None
 
 
+_REVEL_TZ = ZoneInfo("America/Chicago")
+
 def parse_dt(s) -> Optional[datetime]:
     """
     Parse Revel datetime strings. Handles:
@@ -96,10 +99,13 @@ def parse_dt(s) -> Optional[datetime]:
       - "2026-05-04T15:32:11+00:00"
       - None / ""
     Returns a timezone-aware UTC datetime or None.
+
+    Revel's naive strings are America/Chicago local time, not UTC (confirmed
+    against Revel's own UI and real store hours) — localize as Chicago before
+    converting to UTC for storage. An explicit offset (rare) is trusted as-is.
     """
     if not s:
         return None
-    # Revel sends UTC timestamps without Z suffix sometimes
     for fmt in (
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M:%S.%f",
@@ -108,11 +114,9 @@ def parse_dt(s) -> Optional[datetime]:
     ):
         try:
             dt = datetime.strptime(s, fmt)
-            # Make timezone-aware if not already (Revel times are UTC)
             if dt.tzinfo is None:
-                from datetime import timezone
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+                dt = dt.replace(tzinfo=_REVEL_TZ)
+            return dt.astimezone(timezone.utc)
         except ValueError:
             continue
     log.warning("Could not parse datetime: %s", s)
@@ -352,7 +356,7 @@ def process_file(filepath: str, conn, ingestion_date: date,
             for mod in item.get("modifieritems", []):
                 if not mod.get("id"):
                     continue
-                item_date = (item_row["created_date"].date()
+                item_date = (item_row["created_date"].astimezone(_REVEL_TZ).date()
                              if item_row["created_date"] else ingestion_date)
                 mod_row = parse_modifier(
                     mod,
