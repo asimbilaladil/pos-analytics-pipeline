@@ -525,11 +525,18 @@ SHIFTS = [
 
 def slot_label(idx: int) -> str:
     h, frac = divmod(idx, 4)
-    return f"{h:02d}:{frac * 15:02d}"
+    minute = frac * 15
+    period = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12}:{minute:02d} {period}"
+
+def _is_on_hour(label: str) -> bool:
+    """True for on-the-hour slot labels, e.g. '5:00 AM' (not '5:15 AM')."""
+    return label.endswith(":00 AM") or label.endswith(":00 PM")
 
 def slot_range_label(idx: int) -> str:
-    """15-min window label, e.g. 28 → '07:00–07:15'."""
-    return f"{slot_label(idx)}–{slot_label(idx + 1)}"
+    """15-min window label, e.g. 28 → '7:00 AM – 7:15 AM'."""
+    return f"{slot_label(idx)} – {slot_label(idx + 1)}"
 
 def gap_label(gp) -> str:
     """Colored-dot + signed percent, e.g. '🟢 +5%'. Used by predicted-vs-actual tables."""
@@ -613,7 +620,7 @@ def build_chart(df: pd.DataFrame, top8: list, title: str, df_actual=None) -> go.
         paper_bgcolor="white",
     )
     # Show every-hour tick
-    hour_ticks = [s for s in pivot.index if s.endswith(":00")]
+    hour_ticks = [s for s in pivot.index if _is_on_hour(s)]
     fig.update_xaxes(
         tickangle=-45,
         tickmode="array",
@@ -643,7 +650,7 @@ def build_pred_actual_chart(slotly, has_actual):
             line=dict(color="#14b8a6", width=2.5, shape="spline", smoothing=0.6),
             hovertemplate="%{x}<br>Actual %{y:.0f}<extra></extra>",
         ))
-    hour_ticks = [s for s in x if s.endswith(":00")]
+    hour_ticks = [s for s in x if _is_on_hour(s)]
     fig.update_layout(
         height=300, margin=dict(l=8, r=8, t=10, b=8),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
@@ -858,7 +865,7 @@ def build_tender_chart(df: pd.DataFrame, title: str) -> go.Figure:
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
-    hour_ticks = [s for s in pivot.index if s.endswith(":00")]
+    hour_ticks = [s for s in pivot.index if _is_on_hour(s)]
     fig.update_xaxes(
         tickangle=-45, tickmode="array",
         tickvals=hour_ticks, ticktext=hour_ticks,
@@ -980,7 +987,7 @@ def render_accuracy_tab(loc_name: str, loc_id: int, report_date, tab_key: str):
         marker=dict(size=4),
         hovertemplate="%{y:.0f} actual<extra>Actual</extra>",
     ))
-    hour_ticks_acc = [s for s in all_slots if s.endswith(":00")]
+    hour_ticks_acc = [s for s in all_slots if _is_on_hour(s)]
     fig_cmp.update_layout(
         barmode="group",
         title=dict(text=f"{loc_name} · Predicted vs Actual (15-min slots)", font=dict(size=14)),

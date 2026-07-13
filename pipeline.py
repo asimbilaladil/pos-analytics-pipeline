@@ -34,6 +34,7 @@ import time
 import logging
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -89,8 +90,16 @@ def extract_id(val) -> Optional[int]:
     return None
 
 
+_REVEL_TZ = ZoneInfo("America/Chicago")
+
 def parse_dt(s) -> Optional[datetime]:
-    """Parse Revel datetime string into UTC-aware datetime."""
+    """Parse Revel datetime string into UTC-aware datetime.
+
+    Revel's API returns naive local timestamps (America/Chicago), not UTC —
+    confirmed against Revel's own UI and this establishment's real open/close
+    hours. Naive strings are localized as Chicago time and converted to UTC;
+    an explicit offset (rare) is trusted as-is.
+    """
     if not s:
         return None
     for fmt in (
@@ -102,8 +111,8 @@ def parse_dt(s) -> Optional[datetime]:
         try:
             dt = datetime.strptime(s, fmt)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+                dt = dt.replace(tzinfo=_REVEL_TZ)
+            return dt.astimezone(timezone.utc)
         except ValueError:
             continue
     return None
@@ -492,7 +501,8 @@ def insert_establishment_data(
 
             # The created_date is the 16th element (index 15) in item_tuple
             item_created_dt = item_tuple[15]
-            item_date = item_created_dt.date() if item_created_dt else ingestion_date
+            item_date = (item_created_dt.astimezone(_REVEL_TZ).date()
+                         if item_created_dt else ingestion_date)
 
             for mod in item.get("modifieritems", []):
                 if not mod.get("id"):

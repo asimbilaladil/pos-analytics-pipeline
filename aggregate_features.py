@@ -387,15 +387,20 @@ def main():
 
     from datetime import datetime, timezone
     from datetime import date as date_type
+    from zoneinfo import ZoneInfo
 
     if args.date:
         target_date = date_type.fromisoformat(args.date)
     else:
         target_date = date_type.today() - timedelta(days=1)
 
-    # Boundaries in UTC — Revel stores in UTC
-    day_start = f"{target_date}T00:00:00+00:00"
-    day_end   = f"{target_date + timedelta(days=1)}T00:00:00+00:00"
+    # Boundaries in America/Chicago (the business day), converted to UTC for
+    # the raw-table filter. created_date is stored as true UTC; a naive UTC
+    # midnight-to-midnight window here would miss the last ~5-6 hours of the
+    # Central business day and bleed into the neighboring day's row.
+    _CT = ZoneInfo("America/Chicago")
+    day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=_CT).isoformat()
+    day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time(), tzinfo=_CT).isoformat()
 
     params = {"day_start": day_start, "day_end": day_end}
 
