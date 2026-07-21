@@ -1,6 +1,8 @@
 # POS Analytics Pipeline
 
-A production-grade data pipeline for **Laynes Chicken Fingers** that pulls daily order data from the Revel POS API across 11 locations, stores it in PostgreSQL, builds pre-aggregated feature tables, and generates 15-minute interval item quantity predictions for each location.
+A production-grade data pipeline for **Laynes Chicken Fingers** that pulls daily order data from the Revel POS API across 11 locations, stores it in PostgreSQL, builds pre-aggregated feature tables, and powers two Streamlit dashboards: a kitchen-facing **Tender Planning** prep dashboard and a manager-facing **Sales Intelligence** dashboard.
+
+> **Note (2026-07):** this project previously included a LightGBM 15-minute prediction model (`predict_daily_ml.py`) and a weighted-average baseline (`predict_daily.py`). Both were removed — nothing consumed their output anymore. The Tender Planning dashboard computes its own forecasts directly from same-weekday order history (see that section below). The old prediction output tables (`predictions_15min`, etc.) are no longer in the schema; if a database still has them from before, they can be dropped safely.
 
 ---
 
@@ -16,16 +18,16 @@ pipeline.py              ← fetch yesterday's orders + items + modifiers, inser
 aggregate_features.py    ← compute hourly/daily feature tables from raw data
      │
      ▼
-predict_daily_ml.py      ← LightGBM 15-min item predictions for today (all 11 locations)
-     │
-     ▼
-PostgreSQL (4 layers)
+PostgreSQL (3 layers)
   ├── Layer 0: Reference tables  (establishments, products, modifiers, dining_channels)
   ├── Layer 1: Raw ingestion     (orders, order_items, modifier_items)  ← append-only, partitioned by month
-  ├── Layer 2: Feature tables    (features_hourly, features_product_daily, features_daily_summary)
-  └── Layer 3: Prediction output (predictions_15min, predictions_hourly_demand, predictions_prep_sheet, predictions_staffing)
+  └── Layer 2: Feature tables    (features_hourly, features_product_daily, features_daily_summary)
 
-All three scripts run sequentially at 2:00 AM via run.sh.
+Both scripts run sequentially each morning via run.sh (cron).
+
+Dashboards read from Postgres directly:
+  • dashboard.py     (Tender Planning)     ← reads raw order_items for same-weekday medians
+  • sales_report.py  (Sales Intelligence)  ← reads features_daily_summary (Layer 2)
 ```
 
 ---
@@ -35,10 +37,8 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 | Script | Purpose |
 |---|---|
 | `pipeline.py` | Main daily pipeline — logs into Revel, fetches all orders + items + modifiers for each location, inserts into PostgreSQL |
-| `aggregate_features.py` | Nightly aggregation — reads raw tables, populates feature tables for ML |
-| `predict_daily_ml.py` | **LightGBM 15-min prediction** — trains a gradient-boosted model each morning and generates per-product, per-slot quantity forecasts; supports backtesting with `--validate` |
-| `predict_daily.py` | Weighted-average baseline — recency-weighted same-day-of-week average (kept for comparison; cron now uses ML model) |
-| `run.sh` | Daily cron wrapper — runs `pipeline.py` → `aggregate_features.py` → `predict_daily_ml.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
+| `aggregate_features.py` | Nightly aggregation — reads raw tables, populates the Layer 2 feature tables (feeds the Sales Intelligence dashboard) |
+| `run.sh` | Daily cron wrapper — runs `pipeline.py` → `aggregate_features.py`, logs to `/var/log/laynes/run_YYYY-MM-DD.log`, rotates logs after 30 days |
 | `backfill.sh` | Simple date-range backfill — loops day by day, runs pipeline + aggregation for each date |
 | `backfill3m.sh` | Smart 3-month backfill — auto-resume (skips completed dates), rate limiting, failure tracking, `--status` mode |
 | `ingest_to_db.py` | Offline ingestion — reads JSON files produced by `order_fixed.py` and inserts into DB |
@@ -50,7 +50,7 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 | `dashboard.py` | **Tender Planning** — Streamlit kitchen prep dashboard (see dedicated section below). Deployed live via systemd. |
 | `sales_report.py` | **Sales Intelligence** — Streamlit network-wide weekly performance dashboard (see dedicated section below). Deployed live via systemd. |
 
-> **Note on `setup.sh`:** it predates the LightGBM model and both Streamlit dashboards — it only copies `pipeline.py`, `aggregate_features.py`, `ingest_to_db.py`, and `database_design.sql` to `/opt/laynes`, only installs `playwright`/`psycopg2-binary`/`python-dotenv` (no `lightgbm`/`streamlit`/`pandas`/`plotly`), and its generated cron `run.sh` only runs `pipeline.py` → `aggregate_features.py` — no prediction step. Running it today reproduces the raw ingestion pipeline only, not the full system described in this README. Treat the repo-root `run.sh` (which does include the LightGBM step) as the reference for what a complete nightly job should do, and install/copy the ML + dashboard pieces manually until `setup.sh` is updated to match. The repo-root `run.sh` itself currently has `APP_DIR` hardcoded to this dev box's checkout path rather than `/opt/laynes` — treat it as this environment's local runner, not a portable script.
+> **Note on `setup.sh`:** it copies `pipeline.py`, `aggregate_features.py`, `ingest_to_db.py`, and `database_design.sql` to `/opt/laynes`, installs `playwright`/`psycopg2-binary`/`python-dotenv`, and generates a cron `run.sh` that runs `pipeline.py` → `aggregate_features.py`. That matches the current nightly pipeline. It does **not** install or deploy the two Streamlit dashboards (`dashboard.py`, `sales_report.py`) or their `streamlit`/`pandas`/`plotly` dependencies — deploy those manually (see the dashboard sections). The repo-root `run.sh` currently has `APP_DIR` hardcoded to this dev box's checkout path rather than `/opt/laynes` — treat it as this environment's local runner, not a portable script.
 
 ---
 
@@ -81,17 +81,13 @@ All three scripts run sequentially at 2:00 AM via run.sh.
 - **`order_items`** — one row per item line (~4,600/day), includes kitchen timing (`start_time`, `kitchen_completed`, `kitchen_seconds`)
 - **`modifier_items`** — sauces and customizations (~1,050/day)
 
-### Layer 2 — Feature Tables (pre-aggregated for ML)
+### Layer 2 — Feature Tables (pre-aggregated summaries)
 - **`features_hourly`** — order count, revenue, channel breakdown, avg kitchen time per location per hour
 - **`features_product_daily`** — quantity sold, revenue, kitchen performance, void rate per product per location per day
-- **`features_daily_summary`** — daily rollup per location including peak hour, channel mix, void rate
+- **`features_daily_summary`** — daily rollup per location including peak hour, channel mix, void rate (read by the Sales Intelligence dashboard)
 
-### Layer 3 — Prediction Output
-- **`predictions_15min`** — predicted item quantities per product per 15-min slot per location (96 slots/day); written nightly by `predict_daily_ml.py` (LightGBM, the cron default), or by `predict_daily.py` when run manually for baseline comparison
-- **`predictions_hourly_demand`** — predicted order count and revenue per hour
-- **`predictions_prep_sheet`** — predicted prep quantities per item per shift
-- **`predictions_staffing`** — recommended headcount per shift
-- **`location_health_scores`** — composite daily score per location (0–100)
+### Layer 3 — Scoring Output
+- **`location_health_scores`** — composite daily score per location (0–100), surfaced by the `v_network_today` view
 
 ---
 
@@ -123,7 +119,7 @@ This installs PostgreSQL, Python, Playwright + Chromium, creates the DB, writes 
 ```bash
 # Create venv and install dependencies
 python3 -m venv venv
-venv/bin/pip install psycopg2-binary python-dotenv lightgbm playwright streamlit pandas plotly
+venv/bin/pip install psycopg2-binary python-dotenv playwright streamlit pandas plotly
 venv/bin/playwright install chromium
 
 # Create DB and apply schema
@@ -171,19 +167,7 @@ venv/bin/python3 pipeline.py --establishments 32,14
 venv/bin/python3 pipeline.py --date 2026-05-04 --skip-reference
 
 # Aggregate feature tables (run after pipeline.py)
-python3 aggregate_features.py --date 2026-05-04
-
-# Generate LightGBM 15-min predictions for today
-python3 predict_daily_ml.py
-
-# Generate predictions for a specific date (backtest)
-python3 predict_daily_ml.py --date 2026-05-13
-
-# Backtest + accuracy report vs actual data
-python3 predict_daily_ml.py --date 2026-05-13 --validate
-
-# Weighted-average baseline (for comparison)
-python3 predict_daily.py --date 2026-05-13 --validate
+venv/bin/python3 aggregate_features.py --date 2026-05-04
 ```
 
 ### 5. Backfill historical data
@@ -222,70 +206,17 @@ bash /opt/laynes/backfill3m.sh --status
 ## Cron Schedule
 
 ```
-0 2 * * *   /opt/laynes/run.sh   # 2:00 AM — fetch + insert + aggregate + predict
+TZ=America/Chicago
+0 9 * * *   /root/pos-analytics-pipeline/run.sh   # 9:00 AM Central — fetch + insert + aggregate
 ```
 
-`run.sh` runs all three scripts in sequence and logs everything to `/var/log/laynes/run_YYYY-MM-DD.log`. Logs are retained for 30 days.
-
----
-
-## 15-Min Item Prediction Model
-
-`predict_daily_ml.py` trains a fresh LightGBM model each morning on all available history and generates 15-minute slot forecasts for every location and product before the business day starts.
-
-### Algorithm (`lgbm_v3`)
-
-1. **Load slot data** — fetch all positive (est, product, slot, date, qty) observations from DB since Feb 10 2026.
-2. **Compute lag features in Python** using calendar-date offsets (7/14/21/28/35/42/49/56 days ago), not window-function occurrence offsets, so training and prediction features are always computed identically.
-3. **Filter active combos** — a (location, product, slot) combo must appear on ≥3 distinct dates in history and on ≥1 of the last 8 same-day-of-week dates to be included.
-4. **Train LightGBM** (`regression_l1`) on a train/val split (last 14 days = validation), with early stopping.
-5. **Predict** — run model on all active combos for the target date.
-6. **DOW activity scaling** — multiply each raw prediction by `recent_dow_count / 8`, where `recent_dow_count` is how many of the last 8 same-day-of-week dates had sales in that slot. This converts the model's conditional mean (trained only on positive observations) to an unconditional expected value that accounts for zero-sale days — equivalent to what the weighted-average baseline does implicitly.
-7. **Write to DB** — upsert into `predictions_15min` with ± `val_mae` confidence interval.
-
-### Features
-
-| Feature | Description |
-|---|---|
-| `establishment_id` | Location (categorical) |
-| `product_id` | Menu item (categorical) |
-| `slot_index` | 15-min slot 0–95 (0 = midnight) |
-| `day_of_week` | 0=Mon … 6=Sun |
-| `week_of_year` | ISO week number |
-| `month` | Calendar month |
-| `is_weekend` | 1 if Sat/Sun |
-| `lag_7d` / `lag_14d` / `lag_21d` | Qty sold in same slot 1/2/3 weeks ago |
-| `roll_dow_4w` | Mean qty over last 4 same-DOW dates |
-| `roll_dow_8w` | Mean qty over last 8 same-DOW dates |
-| `activity_rate` | Fraction of all history days with sales |
-
-### Output
-
-The daily log summary includes:
-- **All-day prep totals** — top 10 items ranked by predicted daily quantity per location
-- **Peak period** — 5-slot window around busiest slot with per-item breakdown
-- **Shift breakdown** — Morning / Lunch / Afternoon / Dinner totals with top items
-
-### Backtested accuracy (May 13, 2026 — 92 days of history)
-
-| Metric | LightGBM (lgbm_v3) | Weighted avg baseline |
-|---|---|---|
-| Mean Absolute Error | **0.594 units/slot** | 0.670 |
-| Within ±1 unit | **88%** | 86% |
-| Within ±2 units | **94%** | 94% |
-| Total predicted vs actual | 16,760 vs 16,030 | 21,536 vs 15,942 |
-
-Results are stored in `predictions_15min` and can be queried per location, product, or time slot.
-
-### Weighted-average baseline
-
-`predict_daily.py` is kept for comparison. It uses a recency-weighted same-day-of-week average with a mean+2σ outlier filter. No ML training required — runs in seconds. Switch `run.sh` back to it if LightGBM training time becomes a concern.
+`run.sh` runs `pipeline.py` → `aggregate_features.py` in sequence and logs everything to `/var/log/laynes/run_YYYY-MM-DD.log`. Logs are retained for 30 days.
 
 ---
 
 ## Tender Planning Dashboard (`dashboard.py`)
 
-A separate Streamlit page (🍗 Tender Planning) that tells kitchens how many chicken tenders to prep per 15-min slot, split into **Spicy** and **Regular** tabs. Unlike the ML model above, its per-slot prediction is a simple **median over same-weekday history** — chosen because at 15-min granularity, volumes are low enough that the ML model's conditional mean is less reliable than "what actually happened the last N times this exact slot occurred on this weekday."
+A Streamlit page (🍗 Tender Planning) that tells kitchens how many chicken tenders to prep per 15-min slot, split into **Spicy** and **Regular** tabs. Its per-slot forecast is a simple **median over same-weekday history** — chosen because at 15-min granularity, volumes are low enough that "what actually happened the last N times this exact slot occurred on this weekday" is more useful to a kitchen than any trained model. This is the only forecasting in the project today.
 
 **Live deployment:** runs as systemd service `laynes-dashboard`, Streamlit on port 8502, proxied by nginx at `https://hr.aygfoods.com/daily-sales-prediction`. Restart with `systemctl restart laynes-dashboard`; logs at `/var/log/laynes-dashboard.log`.
 
@@ -299,18 +230,18 @@ For a given location, weekday, and 15-min slot:
 
 ### Known limitation: slow to pick up new patterns
 
-Because step 4 uses the median over **all** history (no rolling window, no recency weighting — unlike the ML model's `roll_dow_4w`/`roll_dow_8w` lag features), a slot that has historically been empty will **not** reappear the moment real orders start showing up there. More than half of all recorded same-weekdays need to be non-zero before the median flips positive.
+Because step 4 uses the median over **all** history (no rolling window, no recency weighting), a slot that has historically been empty will **not** reappear the moment real orders start showing up there. More than half of all recorded same-weekdays need to be non-zero before the median flips positive.
 
 Concretely: if a slot has 19 zero-weeks and 1 non-zero week on record, and orders start appearing there every week going forward, it takes roughly **19 more consecutive weeks** (~4-5 months) before that slot's median turns positive and it reappears in the table — the old zero-weeks keep outnumbering the new ones until they don't.
 
-**If this needs to be more responsive** (e.g. a location extends hours or a new pattern emerges and you want it reflected within a few weeks, not months), the fix is to compute the median over a **rolling recent window** (e.g. last 10-12 same-weekdays) instead of full history, or add recency weighting like `predict_daily_ml.py` already does. Not implemented as of this writing — flagged here so a missing/slow-to-appear slot isn't mistaken for a bug.
+**If this needs to be more responsive** (e.g. a location extends hours or a new pattern emerges and you want it reflected within a few weeks, not months), the fix is to compute the median over a **rolling recent window** (e.g. last 10-12 same-weekdays) instead of full history, or add recency weighting. Not implemented as of this writing — flagged here so a missing/slow-to-appear slot isn't mistaken for a bug.
 
 ### Performance: why date/location switches used to be slow
 
 Switching the date or location dropdown used to take 10+ seconds. Root causes, found via `EXPLAIN (ANALYZE, BUFFERS)`:
 
 1. **Postgres JIT compilation overhead dominated query time** — the same query ran in 4.6s with `jit=on` vs 0.37s with `jit=off` (~12x). JIT is built for huge batch scans; for this dashboard's pattern of many small/medium repeated queries it was pure overhead with no benefit. Fixed at the database level: `ALTER DATABASE laynes SET jit = off;` — a performance-only flag, applies to all new connections, no correctness impact on the pipeline scripts.
-2. **The `order_items JOIN orders` join fanned out across all 12 monthly partitions per row.** Both tables are partitioned by their own `created_date`, but `order_items.created_date` can differ from its parent order's `created_date` by a few seconds — so Postgres had no partition key to prune on and checked every partition per row. Fixed by bounding the join to `o.created_date BETWEEN oi.created_date - INTERVAL '1 day' AND oi.created_date + INTERVAL '1 day'` (all 6 query sites in `dashboard.py`) — the ±1 day window is far wider than the actual few-second gap, so this is a correctness no-op that lets Postgres prune to ~2 partitions instead of 12.
+2. **The `order_items JOIN orders` join fanned out across all 12 monthly partitions per row.** Both tables are partitioned by their own `created_date`, but `order_items.created_date` can differ from its parent order's `created_date` by a few seconds — so Postgres had no partition key to prune on and checked every partition per row. Fixed by bounding the join to `o.created_date BETWEEN oi.created_date - INTERVAL '1 day' AND oi.created_date + INTERVAL '1 day'` (all query sites in `dashboard.py`) — the ±1 day window is far wider than the actual few-second gap, so this is a correctness no-op that lets Postgres prune to ~2 partitions instead of 12.
 3. **`load_dow_history` and `load_recent_daily` were cached keyed on the exact selected date**, so every date change was a guaranteed cache miss — even when browsing between two dates of the *same weekday*, the most common workflow. Both now cache on the stable dimension only (location, and weekday for `load_dow_history`) and fetch the full underlying history once; callers filter the date-dependent window in pandas afterward. Browsing dates within an already-cached weekday is now served from cache instead of re-querying Postgres.
 
 Net effect: worst case (a location/weekday never viewed this session) dropped from ~14s (3 sequential ~4.6s queries) to under ~1s; same-weekday date browsing after the first hit is now a cache hit (~0.5s, pure Streamlit rerun, no DB round trip).
@@ -344,7 +275,7 @@ A separate, network-wide Streamlit page ("Laynes | Sales Intelligence") for week
 
 **Batched item fetching** — the `OrderItem` establishment filter is broken in Revel's API (silently returns all locations). Items are fetched using `order__in=id1,id2,...` in batches of 200, which is the only reliable way to get per-location items.
 
-**Feature separation** — raw tables are append-only and never updated. Feature tables are computed nightly by `aggregate_features.py` and are the only tables the ML model reads.
+**Feature separation** — raw tables are append-only and never updated. Feature tables are computed nightly by `aggregate_features.py` and are what the Sales Intelligence dashboard reads (never the raw tables).
 
 ---
 
@@ -367,18 +298,17 @@ LIMIT 20;
 playwright
 psycopg2-binary
 python-dotenv
-lightgbm
 streamlit
 pandas
 plotly
 ```
 
 ```bash
-venv/bin/pip install playwright psycopg2-binary python-dotenv lightgbm streamlit pandas plotly
+venv/bin/pip install playwright psycopg2-binary python-dotenv streamlit pandas plotly
 venv/bin/playwright install chromium
 ```
 
-`playwright`/`psycopg2-binary`/`python-dotenv`/`lightgbm` are needed for the pipeline + ML prediction scripts. `streamlit`/`pandas`/`plotly` are needed only for the two dashboards (`dashboard.py`, `sales_report.py`) — skip them if you're only running the nightly pipeline.
+`playwright`/`psycopg2-binary`/`python-dotenv` are needed for the pipeline scripts. `streamlit`/`pandas`/`plotly` are needed only for the two dashboards (`dashboard.py`, `sales_report.py`) — skip them if you're only running the nightly pipeline.
 
 PostgreSQL 16 tested (15+ should work)
 
