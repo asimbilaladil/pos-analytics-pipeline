@@ -1,6 +1,6 @@
 -- ============================================================
--- LAYNES CHICKEN FINGERS — PREDICTION PLATFORM
--- Database Design v1.0
+-- LAYNES CHICKEN FINGERS — POS ANALYTICS PLATFORM
+-- Database Design v1.1  (prediction/ML output tables removed)
 -- PostgreSQL 15+
 -- ============================================================
 -- SCALE: 11 locations, ~580 orders/day/location
@@ -253,9 +253,9 @@ CREATE INDEX idx_modifiers_modifier_id ON modifier_items (modifier_id, created_d
 
 
 -- ============================================================
--- LAYER 2 — FEATURE TABLES (Pre-aggregated for ML)
--- Computed nightly by aggregation job. TINY vs raw tables.
--- This is what the ML model reads — never the raw tables.
+-- LAYER 2 — FEATURE TABLES (Pre-aggregated summaries)
+-- Computed nightly by aggregate_features.py. TINY vs raw tables.
+-- Read by the Sales Intelligence dashboard (sales_report.py).
 -- ============================================================
 
 -- Hourly demand features — one row per location per hour per day
@@ -403,81 +403,8 @@ CREATE INDEX idx_fds_date ON features_daily_summary (date);
 
 
 -- ============================================================
--- LAYER 3 — PREDICTION OUTPUT TABLES
--- What the ML model writes. What the dashboard reads.
+-- LAYER 3 — SCORING OUTPUT TABLES
 -- ============================================================
-
--- 15-minute item quantity predictions — written by predict_daily_ml.py
-CREATE TABLE predictions_15min (
-    id                      BIGSERIAL PRIMARY KEY,
-    establishment_id        INTEGER NOT NULL REFERENCES establishments(id),
-    product_id              INTEGER REFERENCES products(id),
-    product_name            VARCHAR(200),
-    target_date             DATE NOT NULL,
-    slot_index              SMALLINT NOT NULL,          -- 0-95 (0 = midnight, 36 = 9am, etc.)
-    slot_start              TIME NOT NULL,              -- wall-clock time of slot start
-    predicted_quantity      NUMERIC(10,4),
-    confidence_low          NUMERIC(10,4),
-    confidence_high         NUMERIC(10,4),
-    historical_points       INTEGER,                   -- number of training observations
-    model_version           VARCHAR(50),
-    generated_at            TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE (establishment_id, product_id, target_date, slot_index)
-);
-
-CREATE INDEX idx_p15_est_date ON predictions_15min (establishment_id, target_date);
-CREATE INDEX idx_p15_product_date ON predictions_15min (product_id, target_date);
-
-
--- Demand predictions — generated nightly for the next 7 days
-CREATE TABLE predictions_hourly_demand (
-    id                      BIGSERIAL PRIMARY KEY,
-    establishment_id        INTEGER NOT NULL REFERENCES establishments(id),
-    target_date             DATE NOT NULL,              -- the day being predicted
-    target_hour             SMALLINT NOT NULL,          -- 0-23
-    predicted_orders        INTEGER,                    -- predicted transaction count
-    predicted_revenue       NUMERIC(10,2),              -- predicted revenue
-    confidence_low          INTEGER,                    -- lower bound (80% CI)
-    confidence_high         INTEGER,                    -- upper bound (80% CI)
-    model_version           VARCHAR(50),
-    generated_at            TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE (establishment_id, target_date, target_hour)
-);
-
--- Prep sheet predictions — what to prep per item per shift
-CREATE TABLE predictions_prep_sheet (
-    id                      BIGSERIAL PRIMARY KEY,
-    establishment_id        INTEGER NOT NULL REFERENCES establishments(id),
-    product_id              INTEGER NOT NULL REFERENCES products(id),
-    product_name            VARCHAR(200),
-    target_date             DATE NOT NULL,
-    shift                   VARCHAR(20) NOT NULL,       -- 'morning', 'lunch', 'dinner', 'all_day'
-    predicted_quantity      NUMERIC(10,2),              -- units to prep
-    confidence_low          NUMERIC(10,2),
-    confidence_high         NUMERIC(10,2),
-    model_version           VARCHAR(50),
-    generated_at            TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE (establishment_id, product_id, target_date, shift)
-);
-
--- Staffing recommendations
-CREATE TABLE predictions_staffing (
-    id                      BIGSERIAL PRIMARY KEY,
-    establishment_id        INTEGER NOT NULL REFERENCES establishments(id),
-    target_date             DATE NOT NULL,
-    shift                   VARCHAR(20) NOT NULL,       -- 'morning', 'lunch', 'dinner'
-    shift_start_hour        SMALLINT,
-    shift_end_hour          SMALLINT,
-    recommended_staff       SMALLINT,                   -- headcount recommendation
-    predicted_orders        INTEGER,                    -- basis for recommendation
-    model_version           VARCHAR(50),
-    generated_at            TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE (establishment_id, target_date, shift)
-);
 
 -- Location health scores — daily composite score per location
 CREATE TABLE location_health_scores (
@@ -586,7 +513,7 @@ GROUP BY p.name, f.establishment_id, e.name;
 -- features_hourly:      ~96K rows/year   ~15 MB/year
 -- features_product_daily: ~480K rows/year ~80 MB/year
 -- features_daily_summary: ~4K rows/year  ~1 MB/year
--- prediction tables:    ~500K rows/year  ~50 MB/year
+-- location_health_scores: ~4K rows/year  ~1 MB/year
 -- -------------------------------------------------------
 -- TOTAL year 1:         ~3.5 GB (with indexes)
 -- TOTAL year 3:         ~10.5 GB
