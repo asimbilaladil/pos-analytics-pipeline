@@ -57,9 +57,67 @@ Small, but they double-count revenue. Summary queries must dedupe.
 
 ---
 
+## API reference — which endpoint gives us what
+
+Base URL `https://laynes.revelup.com`. All calls go through the existing Playwright session
+(`/tmp/revel_session.json`) and the `fetch_all_pages()` limit/offset helper in `pipeline.py`.
+
+### Endpoints we already use
+
+| Endpoint | Volume | Fields we take | What it powers |
+|---|---|---|---|
+| `/resources/Order/` | 15.9M all-time | `final_total`, `subtotal`, `tax`, `gratuity`, `discount_total_amount`, `dining_option`, `created_date`, `closed`, `is_unpaid`, `deleted`, `number_of_people`, `web_order`, `pos_mode`, `customer` | Revenue, order counts, AOV, channel mix, discount rate |
+| `/resources/OrderItem/` | fetched per order via `order__in` batches of 200 | `product`, `product_name_override`, `quantity`, `price`, `pure_sales`, `tax_amount`, `modifier_amount`, `start_time`, `kitchen_completed`, `is_voided`/`voided_*`, `combo_uuid`, `dining_option`, **`modifieritems` (embedded)** | Product mix, tender counts, kitchen speed, voids. `modifieritems` is embedded here — that's where `modifier_items` rows come from, resolved against the Modifier cache |
+| `/resources/Product/` | 35,381 | `name`, `productclass`, `is_combo`, `price`, `active` | Product master |
+| `/resources/Modifier/` | 114 distinct names in use | `name`, `price`, `active` | Resolves modifier IDs to names — **carries the Spicy/Regular heat signal** |
+| `/resources/Establishment/{id}/` | 12 | `name`, timezone | Location master (`seed_establishments.py`) |
+
+`Order` exposes 117 fields and `OrderItem` 113; we ingest roughly 20 and 25 respectively. The rest
+are available without any new endpoint if a summary needs them later.
+
+### Endpoints to add for this work
+
+| Endpoint | Volume | Fields | What it powers | Priority |
+|---|---|---|---|---|
+| `/resources/TimeSheetEntry/` | 487,591 | `clock_in`, `clock_out`, `role_name`, `role_wage`, `department_name`, `break_length`, `break_type`, `is_auto_clock_out`, `exempt_salaried`, `employee`, `establishment` | **All labor**: hours, cost, labor % of sales, SPLH, cost per order, role/department split | Required |
+| `/resources/Employee/` | 6,100 | `first_name`, `last_name`, `active`, `employee_start`, `employee_end`, `weekly_wage`, `pin` | Employee names for labor reporting | Required |
+| `/resources/Role/` | 23 | `name`, `department`, `rank` | Role reference (GM, AGM, Shift Manager, Cook, Cashier, Porter, Trainer…) | Optional — `role_name` is already denormalized onto TimeSheetEntry |
+| `/products/ProductClass/` | 11 | `name` | Coarse spine: `1. Food`, `2. Beverage`, `3. Merchandise`, `Sides`, `Meals`, `4. Other Sales` | Optional — useful as a cross-check, see below |
+
+`TimeSheetEntry` filters on `establishment` and `clock_in` (`clock_in__gte` / `clock_in__lte`),
+which is exactly the access pattern the nightly run needs.
+
+### Evaluated and rejected
+
+| Endpoint | Why not |
+|---|---|
+| `/products/ProductCategory/` | 2,595 rows, but only coarse per-establishment buckets — `Main Menu`, `Food`, `Catering Food`, `Merch`. Sandwiches, fries, sauce and lemonade all share one category ID |
+| `/resources/ProductGroup/` | 1,780 rows. Does contain `3 Fingers` / `4 Fingers` / `5 Fingers` / `Kid Fingers`, but duplicated per establishment and polluted with `active items` and `Untaxed Group`. Usable as a validation signal at best |
+
+**Do not exist on this account** (probed, all 404 — don't re-probe): `AttendanceEntry`,
+`EmployeeSchedule`, `TimeSheet`, `Timesheet`, `TimesheetEntry`, `Timecard`, `Shift`,
+`EmployeeShift`, `ScheduledShift`, `PayrollEntry`, `Payroll`, `LaborSchedule`, `TimeClock`,
+`PaySchedule`, `Schedule`, `ShiftSchedule`, `Attendance`, `AttendanceLog`, `EmployeeHours`,
+`LaborHours`, `Punch`, `Break`, `TimeEntry`, `EmployeeJob`, `JobRole`, `enterprise/Employee`.
+There is also no `/resources/` index endpoint — resources must be probed by name.
+
+---
+
 ## Approach
 
 ### 1. Product taxonomy layer
+
+**First, a one-word bug to fix.** `products.product_class` is NULL for all 35,381 rows because
+`pipeline.py:265` reads `p.get("product_class")` — but Revel's field is spelled **`productclass`**
+(no underscore), and it *is* populated (37 of 40 sampled products). Fixing that line and re-running
+the product refresh gives us Revel's own classification for free.
+
+That classification is **too coarse to be the answer, but worth having as a spine**:
+`/products/ProductClass/` has 11 values — `1. Food`, `2. Beverage`, `3. Merchandise`, `Sides`,
+`Meals`, `4. Other Sales`, `Donation`, `Gift`. It separates food from drinks from sides, but it
+cannot distinguish spicy from regular, or a Small Oreo Shake from a Large Vanilla Shake.
+**So name-parsing is still required** — we use `productclass` as a cross-check and as a tripwire
+for newly added SKUs that the name rules haven't seen.
 
 New module `product_taxonomy.py`, modelled directly on the existing
 `weather_analysis/tender_counting.py` — a dependency-free, rule-ordered name classifier.
