@@ -10,6 +10,10 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 import requests
+try:
+    import holidays as _holidays_lib          # US holiday calendar (optional)
+except Exception:                             # pragma: no cover
+    _holidays_lib = None
 import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
@@ -20,9 +24,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 st.set_page_config(
-    page_title="Laynes Predictions",
+    page_title="Laynes · Tender Planning",
+    page_icon="🍗",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Styling ───────────────────────────────────────────────────────────────────
@@ -31,170 +36,152 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-:root {
-  --brand:#6366F1; --brand-2:#8B5CF6; --ink:#1a1c23; --muted:#6b7280;
-  --bg:#f6f7fb; --card:#ffffff; --line:#eceef3;
+:root{
+  --brand:#6366f1; --brand-2:#8b5cf6; --brand-ink:#4f46e5;
+  --ink:#0f172a; --muted:#64748b; --faint:#94a3b8;
+  --bg:#f4f6fc; --card:#ffffff; --line:#e7eaf5; --line-2:#f1f3fb;
+  --teal:#0d9488; --amber:#f59e0b;
+  --r:18px; --r-sm:12px;
+  --sh-sm:0 1px 3px rgba(15,23,42,.05), 0 6px 16px -10px rgba(15,23,42,.16);
+  --sh:0 14px 38px -16px rgba(49,46,129,.30);
+  --sh-brand:0 14px 34px -14px rgba(99,102,241,.5);
 }
 
-html, body, [class*="css"], .stApp, button, input, textarea, select {
+*{ -webkit-font-smoothing:antialiased; }
+html, body, [class*="css"], .stApp, button, input, textarea, select{
   font-family:'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
 }
-.stApp { background:var(--bg); }
-#MainMenu, footer, header [data-testid="stToolbar"] { visibility:hidden; }
-.block-container { padding-top:1.4rem; padding-bottom:3rem; max-width:1500px; }
 
-/* Hero header */
-.hero {
-  background:linear-gradient(120deg, var(--brand) 0%, var(--brand-2) 100%);
-  border-radius:20px; padding:22px 28px; margin-bottom:18px; color:#fff;
-  box-shadow:0 12px 30px -10px rgba(99,102,241,.5);
-  display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;
+/* App canvas — soft brand-tinted light */
+.stApp{
+  background:
+    radial-gradient(1100px 440px at 10% -8%, rgba(139,92,246,.10), transparent 60%),
+    radial-gradient(1000px 420px at 98% -14%, rgba(99,102,241,.13), transparent 62%),
+    var(--bg);
 }
-.hero h1 { font-size:1.7rem; font-weight:800; margin:0; line-height:1.15; letter-spacing:-.02em; }
-.hero .sub { opacity:.92; font-size:.92rem; font-weight:500; margin-top:4px; }
-.hero .badge {
-  background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.35);
-  padding:8px 16px; border-radius:999px; font-weight:700; font-size:.95rem; white-space:nowrap;
+.block-container{ padding-top:1.5rem; padding-bottom:3.2rem; max-width:1520px; }
+
+/* Hide Streamlit chrome + any sidebar remnant */
+#MainMenu, footer, header[data-testid="stHeader"]{ display:none !important; }
+[data-testid="stToolbar"]{ display:none !important; }
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"]{ display:none !important; }
+
+/* Brand / top bar */
+.brand{ display:flex; align-items:center; gap:14px; }
+.brand-logo{
+  width:52px; height:52px; border-radius:16px; flex:0 0 auto;
+  background:linear-gradient(135deg, var(--brand), var(--brand-2));
+  display:flex; align-items:center; justify-content:center; font-size:1.7rem;
+  box-shadow:var(--sh-brand);
 }
+.brand-title{ font-size:1.55rem; font-weight:800; color:var(--ink); letter-spacing:-.025em; line-height:1.05; }
+.brand-sub{ font-size:.86rem; color:var(--muted); font-weight:500; margin-top:2px; }
+
+/* Context chips */
+.chips{ display:flex; flex-wrap:wrap; gap:8px; margin:16px 0 4px; }
+.chip{
+  display:inline-flex; align-items:center; gap:6px; padding:6px 13px; border-radius:999px;
+  background:var(--card); border:1px solid var(--line); box-shadow:var(--sh-sm);
+  font-size:.82rem; font-weight:600; color:var(--muted);
+}
+.chip-brand{ background:linear-gradient(135deg, var(--brand), var(--brand-2)); border:none; color:#fff; box-shadow:var(--sh-brand); }
+.chip-warn{ background:#fff7ed; border-color:#fed7aa; color:#c2410c; }
+
+/* Holiday notification bar */
+.holibar{
+  display:flex; align-items:center; gap:13px; padding:14px 22px; border-radius:16px;
+  margin:0 0 16px; color:#fff; font-weight:600; font-size:.95rem;
+  background:linear-gradient(120deg,#fb923c 0%, #f472b6 55%, #a855f7 100%);
+  box-shadow:0 14px 34px -14px rgba(244,114,182,.6);
+  animation:fadeInUp .4s ease;
+}
+.holibar-ic{ font-size:1.55rem; line-height:1; flex:0 0 auto;
+  filter:drop-shadow(0 2px 4px rgba(0,0,0,.18)); }
+.holibar b{ font-weight:800; }
+.holibar .sub{ opacity:.94; font-weight:600; }
+
+/* Controls (selectbox + date input) */
+[data-testid="stWidgetLabel"] p{ font-size:.72rem !important; font-weight:700 !important;
+  text-transform:uppercase; letter-spacing:.06em; color:var(--faint) !important; }
+[data-baseweb="select"] > div, [data-baseweb="input"]{
+  border-radius:var(--r-sm) !important; border-color:var(--line) !important;
+  box-shadow:var(--sh-sm); font-weight:600; background:var(--card) !important;
+}
+[data-baseweb="select"] > div:hover, [data-baseweb="input"]:hover{ border-color:var(--brand) !important; }
 
 /* KPI cards */
-.kpi-row { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:6px; }
-.kpi {
-  flex:1; min-width:150px; background:var(--card); border:1px solid var(--line);
-  border-radius:16px; padding:16px 18px; box-shadow:0 4px 14px -8px rgba(20,22,40,.18);
+.kpi-row{ display:flex; gap:14px; flex-wrap:wrap; margin:6px 0 4px; }
+.kpi{
+  flex:1; min-width:158px; background:var(--card); border:1px solid var(--line);
+  border-radius:var(--r); padding:17px 19px; box-shadow:var(--sh-sm);
+  transition:transform .18s ease, box-shadow .18s ease; position:relative; overflow:hidden;
 }
-.kpi .label { color:var(--muted); font-size:.78rem; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
-.kpi .value { color:var(--ink); font-size:1.7rem; font-weight:800; line-height:1.1; margin-top:3px; }
-.kpi .foot { font-size:.8rem; font-weight:600; margin-top:2px; }
-.kpi.accent { border-top:3px solid var(--brand); }
-.kpi { transition: transform .18s ease, box-shadow .18s ease; }
-.kpi:hover { transform:translateY(-3px); box-shadow:0 10px 22px -10px rgba(99,102,241,.4); }
-
-/* Tabs as pills */
-.stTabs [data-baseweb="tab-list"] { gap:6px; flex-wrap:wrap; border-bottom:none; }
-.stTabs [data-baseweb="tab"] {
-  background:#fff; border:1px solid var(--line); border-radius:999px;
-  padding:6px 16px; font-weight:600; font-size:.85rem; color:var(--muted);
-}
-.stTabs [aria-selected="true"] {
-  background:var(--brand) !important; color:#fff !important; border-color:var(--brand) !important;
-}
-.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display:none; }
-
-/* Location picker (Tender Planning) — st.selectbox */
-[data-baseweb="select"] > div {
-  border-radius:12px; border-color:var(--line); box-shadow:0 2px 8px -6px rgba(20,22,40,.15);
-  font-weight:600;
-}
-[data-baseweb="select"] > div:hover { border-color:var(--brand); }
+.kpi:hover{ transform:translateY(-3px); box-shadow:var(--sh); }
+.kpi .label{ color:var(--faint); font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }
+.kpi .value{ color:var(--ink); font-size:1.85rem; font-weight:800; line-height:1.05; margin-top:5px; letter-spacing:-.02em; }
+.kpi .foot{ font-size:.8rem; font-weight:600; margin-top:3px; color:var(--muted); }
+.kpi.accent{ padding-left:20px; }
+.kpi.accent::before{ content:""; position:absolute; left:0; top:0; bottom:0; width:4px;
+  background:linear-gradient(180deg, var(--brand), var(--brand-2)); }
 
 /* Section titles */
-.sec { font-weight:800; font-size:1.05rem; color:var(--ink); margin:14px 0 2px; letter-spacing:-.01em; }
-.sec-sub { color:var(--muted); font-size:.86rem; margin-bottom:8px; }
+.sec{ font-weight:800; font-size:1.08rem; color:var(--ink); margin:22px 0 2px; letter-spacing:-.015em;
+  display:flex; align-items:center; gap:9px; }
+.sec::before{ content:""; width:4px; height:18px; border-radius:3px; display:inline-block;
+  background:linear-gradient(180deg, var(--brand), var(--brand-2)); }
+.sec-sub{ color:var(--muted); font-size:.85rem; margin:2px 0 10px 13px; }
+
+/* Tabs as pills */
+.stTabs [data-baseweb="tab-list"]{ gap:8px; flex-wrap:wrap; border-bottom:none; margin-top:6px; }
+.stTabs [data-baseweb="tab"]{
+  background:var(--card); border:1px solid var(--line); border-radius:999px;
+  padding:9px 20px; font-weight:700; font-size:.9rem; color:var(--muted); box-shadow:var(--sh-sm);
+}
+.stTabs [data-baseweb="tab"]:hover{ color:var(--brand-ink); border-color:#c7d2fe; }
+.stTabs [aria-selected="true"]{
+  background:linear-gradient(135deg, var(--brand), var(--brand-2)) !important; color:#fff !important;
+  border-color:transparent !important; box-shadow:var(--sh-brand);
+}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{ display:none; }
+
+/* Metric (st.metric) as cards */
+[data-testid="stMetric"]{
+  background:var(--card); border:1px solid var(--line); border-radius:var(--r-sm);
+  padding:14px 16px; box-shadow:var(--sh-sm);
+}
+[data-testid="stMetricLabel"] p{ color:var(--faint) !important; font-weight:700; font-size:.72rem;
+  text-transform:uppercase; letter-spacing:.05em; }
+[data-testid="stMetricValue"]{ font-weight:800; letter-spacing:-.02em; color:var(--ink); }
 
 /* Dataframe polish */
-[data-testid="stDataFrame"] {
-  border-radius:14px; overflow:hidden; border:1px solid var(--line);
-  box-shadow:0 4px 14px -10px rgba(20,22,40,.2);
-  animation: fadeInUp .35s ease;
+[data-testid="stDataFrame"]{
+  border-radius:var(--r-sm); overflow:hidden; border:1px solid var(--line);
+  box-shadow:var(--sh-sm); animation:fadeInUp .35s ease;
 }
-@keyframes fadeInUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+@keyframes fadeInUp{ from{ opacity:0; transform:translateY(8px);} to{ opacity:1; transform:translateY(0);} }
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-  background:linear-gradient(180deg,#0f172a 0%, #1e293b 100%);
-  border-right:none;
-}
-[data-testid="stSidebar"] * { color:#e9eaf0; }
-[data-testid="stSidebar"] .block-container { padding-top:1.2rem; }
-
-.sb-brand { display:flex; align-items:center; gap:12px; margin-bottom:4px; }
-.sb-logo {
-  width:46px; height:46px; border-radius:14px; flex:0 0 auto;
-  background:linear-gradient(135deg, var(--brand), var(--brand-2));
-  display:flex; align-items:center; justify-content:center; font-size:1.5rem;
-  box-shadow:0 6px 16px -6px rgba(99,102,241,.7);
-}
-.sb-name { font-weight:800; font-size:1.05rem; line-height:1.1; color:#fff; }
-.sb-tag { font-size:.74rem; color:#9aa0b3; font-weight:500; }
-.sb-div { height:1px; background:rgba(255,255,255,.08); margin:16px 0; }
-.sb-nav-item {
-  display:flex; align-items:center; gap:11px; padding:11px 13px; border-radius:12px;
-  font-weight:600; font-size:.92rem; margin-bottom:6px;
-  background:linear-gradient(135deg, rgba(99,102,241,.95), rgba(139,92,246,.95));
-  box-shadow:0 6px 16px -8px rgba(99,102,241,.7); color:#fff;
-}
-.sb-nav-item.ghost { background:transparent; box-shadow:none; color:#aeb3c6; }
-.sb-label { font-size:.72rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
-  color:#7c8197; margin:4px 0 6px; }
-.sb-foot { font-size:.76rem; color:#8b90a3; line-height:1.5; }
-.sb-foot b { color:#c9cdda; }
-
-/* Modern loading overlay */
-.loadwrap { display:flex; justify-content:center; padding:54px 0 44px; }
-.loadcard {
-  background:var(--card); border:1px solid var(--line); border-radius:22px;
-  padding:34px 46px; text-align:center; min-width:340px;
-  box-shadow:0 16px 40px -18px rgba(99,102,241,.35);
-}
-.spin-ring {
-  width:46px; height:46px; border-radius:50%; margin:0 auto 18px;
-  border:4px solid #eef0fe; border-top-color:var(--brand);
-  border-right-color:var(--brand-2);
-  animation: dspin .8s cubic-bezier(.5,0,.5,1) infinite;
-}
-@keyframes dspin { to { transform:rotate(360deg); } }
-.load-title { font-weight:800; font-size:1.05rem; color:var(--ink); letter-spacing:-.01em; }
-.load-sub { font-size:.82rem; color:var(--muted); margin-top:3px; margin-bottom:20px; }
-.skel-row { height:10px; border-radius:6px; background:#eef0f4; margin:9px auto; overflow:hidden; }
-.skel-bar {
-  height:100%; border-radius:6px; width:100%;
-  background:linear-gradient(90deg, #eef0f4 25%, #dcdffa 50%, #eef0f4 75%);
-  background-size:300% 100%; animation:shimmer 1.4s ease-in-out infinite;
-}
-@keyframes shimmer { 0% { background-position:200% 0; } 100% { background-position:-200% 0; } }
-
-/* Sidebar date input → dark field */
-[data-testid="stSidebar"] [data-baseweb="input"],
-[data-testid="stSidebar"] input {
-  background:rgba(255,255,255,.06) !important; border-radius:10px !important;
-  border:1px solid rgba(255,255,255,.12) !important; color:#fff !important;
-}
-[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color:#9aa0b3 !important; font-weight:600; }
+/* Bordered containers (chart cards) */
+[data-testid="stVerticalBlockBorderWrapper"]{ border-radius:var(--r) !important; }
 
 /* Alerts rounded */
-[data-testid="stAlert"] { border-radius:14px; }
+[data-testid="stAlert"]{ border-radius:var(--r-sm); }
 
-/* Panel wrapper */
-.panel { background:var(--card); border:1px solid var(--line); border-radius:18px;
-  padding:16px 18px; box-shadow:0 6px 20px -12px rgba(20,22,40,.22); margin-bottom:14px; }
-
-/* Custom data table */
-.tw { max-height:560px; overflow:auto; border-radius:14px; border:1px solid var(--line); }
-.tw::-webkit-scrollbar { width:8px; height:8px; }
-.tw::-webkit-scrollbar-thumb { background:#d7dae2; border-radius:8px; }
-table.dt { width:100%; border-collapse:separate; border-spacing:0; font-size:.85rem; }
-table.dt th { position:sticky; top:0; z-index:1; background:#fbfbfd; color:var(--muted);
-  font-weight:700; font-size:.7rem; text-transform:uppercase; letter-spacing:.05em;
-  text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); }
-table.dt th.num, table.dt td.num { text-align:right; }
-table.dt td { padding:9px 14px; border-bottom:1px solid #f3f4f8; color:var(--ink); font-weight:600; }
-table.dt tr:last-child td { border-bottom:none; }
-table.dt tbody tr:hover td { background:#fafaff; }
-.bnum { font-variant-numeric:tabular-nums; }
-.track { display:inline-block; width:90px; height:8px; background:#eef0f4;
-  border-radius:6px; overflow:hidden; vertical-align:middle; margin-left:9px; }
-.track > i { display:block; height:100%; border-radius:6px; }
-.fp { background:linear-gradient(90deg,#c4b5fd,#6366F1); }
-.fa { background:linear-gradient(90deg,#99f6e4,#14b8a6); }
-.pill { padding:3px 11px; border-radius:999px; font-weight:700; font-size:.76rem;
-  display:inline-block; min-width:64px; text-align:center; }
-.muted { color:#aeb3c0; font-weight:600; }
-
-/* KPI icon */
-.kpi .top { display:flex; align-items:center; gap:8px; }
-.kpi .ic { width:30px; height:30px; border-radius:9px; display:flex; align-items:center;
-  justify-content:center; font-size:1rem; background:#eef0fe; }
+/* Modern loading overlay */
+.loadwrap{ display:flex; justify-content:center; padding:54px 0 44px; }
+.loadcard{ background:var(--card); border:1px solid var(--line); border-radius:22px;
+  padding:34px 46px; text-align:center; min-width:340px; box-shadow:var(--sh); }
+.spin-ring{ width:46px; height:46px; border-radius:50%; margin:0 auto 18px;
+  border:4px solid #eef0fe; border-top-color:var(--brand); border-right-color:var(--brand-2);
+  animation:dspin .8s cubic-bezier(.5,0,.5,1) infinite; }
+@keyframes dspin{ to{ transform:rotate(360deg);} }
+.load-title{ font-weight:800; font-size:1.05rem; color:var(--ink); letter-spacing:-.01em; }
+.load-sub{ font-size:.82rem; color:var(--muted); margin-top:3px; margin-bottom:20px; }
+.skel-row{ height:10px; border-radius:6px; background:#eef0f4; margin:9px auto; overflow:hidden; }
+.skel-bar{ height:100%; border-radius:6px; width:100%;
+  background:linear-gradient(90deg, #eef0f4 25%, #dcdffa 50%, #eef0f4 75%);
+  background-size:300% 100%; animation:shimmer 1.4s ease-in-out infinite; }
+@keyframes shimmer{ 0%{ background-position:200% 0;} 100%{ background-position:-200% 0;} }
 </style>
 """, unsafe_allow_html=True)
 
@@ -439,6 +426,34 @@ def load_target_weather(establishment_id, city, target_date):
         return None
 
 
+@st.cache_data(ttl=86400)
+def holiday_name_for(d):
+    """US holiday name for a date (observed names included), or None. Returns None
+    if the optional `holidays` package isn't installed so the page never breaks."""
+    if _holidays_lib is None:
+        return None
+    try:
+        return _holidays_lib.US(years=[d.year]).get(d)
+    except Exception:
+        return None
+
+
+_HOLIDAY_EMOJI = [
+    ("independence", "🎆"), ("thanksgiving", "🦃"), ("christmas", "🎄"),
+    ("new year", "🎉"), ("juneteenth", "✊🏾"), ("martin luther", "✊🏾"),
+    ("memorial", "🇺🇸"), ("veterans", "🇺🇸"), ("labor", "🇺🇸"),
+    ("washington", "🇺🇸"), ("columbus", "🧭"),
+]
+
+
+def holiday_emoji(name):
+    n = (name or "").lower()
+    for key, emo in _HOLIDAY_EMOJI:
+        if key in n:
+            return emo
+    return "🎉"
+
+
 def weather_adjusted_slot_prediction(hist_wx: pd.DataFrame, target_temp_f, target_rain_mm):
     """A weather-informed prediction for one 15-min slot.
 
@@ -606,7 +621,7 @@ def build_pred_actual_chart(slotly, has_actual):
     if has_actual:
         fig.add_trace(go.Scatter(
             name="Actual", x=x, y=slotly["actual"], mode="lines",
-            line=dict(color="#14b8a6", width=2.5, shape="spline", smoothing=0.6),
+            line=dict(color="#0d9488", width=2.5, shape="spline", smoothing=0.6),
             hovertemplate="%{x}<br>Actual %{y:.0f}<extra></extra>",
         ))
     hour_ticks = [s for s in x if _is_on_hour(s)]
@@ -628,12 +643,14 @@ def build_day_total_compare_chart(bt: pd.DataFrame):
     """Grouped bars comparing day totals — actual vs weather forecast vs median
     forecast — over recent same-weekdays."""
     x = [d.strftime("%b %d") for d in bt["date"]]
+    _bar = dict(marker_cornerradius=5, marker_line_width=1.5, marker_line_color="#fcfcfb",
+                hovertemplate="%{x} · %{fullData.name}<br>%{y:.0f} tenders<extra></extra>")
     fig = go.Figure()
-    fig.add_bar(name="Actual", x=x, y=bt["actual"], marker_color="#14b8a6")
-    fig.add_bar(name="Weather forecast", x=x, y=bt["weather_pred"], marker_color="#f59e0b")
-    fig.add_bar(name="Median forecast", x=x, y=bt["median_pred"], marker_color="#6366F1")
+    fig.add_bar(name="Actual", x=x, y=bt["actual"], marker_color="#0d9488", **_bar)
+    fig.add_bar(name="Weather forecast", x=x, y=bt["weather_pred"], marker_color="#f59e0b", **_bar)
+    fig.add_bar(name="Median forecast", x=x, y=bt["median_pred"], marker_color="#6366F1", **_bar)
     fig.update_layout(
-        barmode="group", bargap=0.25, bargroupgap=0.08,
+        barmode="group", bargap=0.28, bargroupgap=0.06,
         height=300, margin=dict(l=8, r=8, t=10, b=8),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Plus Jakarta Sans", size=12, color="#6b7280"),
@@ -797,79 +814,74 @@ def get_finger_split(product_name: str, flavor_mods: str | None = None) -> tuple
     return (0.0, 0.0, float(fc))
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Page setup ────────────────────────────────────────────────────────────────
 
-with st.sidebar:
-    st.markdown(
-        '<div class="sb-brand"><div class="sb-logo">🍗</div>'
-        '<div><div class="sb-name">Laynes Chicken</div>'
-        '<div class="sb-tag">Tender Planning Dashboard</div></div></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="sb-div"></div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="sb-nav-item">🍗 Tender Planning</div>',
-        unsafe_allow_html=True,
-    )
+page = "🍗 Tender Planning"
 
-    page = "🍗 Tender Planning"
-
-    _dmin, _dmax = load_order_date_range()
-    if _dmin is None:
-        st.error("No order data found.")
-        st.stop()
-    _today = date.today()
-    st.markdown('<div class="sb-label">📅 Choose a day</div>', unsafe_allow_html=True)
-    # Predictions are history-based, so any date works — allow today + planning ahead.
-    # Actuals only exist up to the last ingested order date (_dmax).
-    selected_date = st.date_input(
-        "Date", value=_today, min_value=_dmin,
-        max_value=_today + timedelta(days=14),
-        format="YYYY-MM-DD", label_visibility="collapsed",
-    )
-    if selected_date > _dmax:
-        st.markdown(
-            f'<div class="sb-foot">ℹ️ <b>Predicted only</b> — actuals available through '
-            f'{_dmax.strftime("%b %d")}.</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown('<div class="sb-div"></div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="sb-foot">🕐 All times in <b>Central Time</b> (Houston, TX)<br><br>'
-        'Predictions built from past same-weekday order history, per location.</div>',
-        unsafe_allow_html=True,
-    )
-
-
-
-
-
+_dmin, _dmax = load_order_date_range()
+if _dmin is None:
+    st.error("No order data found.")
+    st.stop()
+_today = date.today()
 
 
 # ── Tender Planning page ──────────────────────────────────────────────────────
 
 if page == "🍗 Tender Planning":
-    dow_t = selected_date.strftime("%A")
-    st.markdown(f"""
-    <div class="hero">
-      <div>
-        <h1>🍗 Tender Planning</h1>
-        <div class="sub">Chicken tenders needed per 15-min slot · built from past same-weekday orders</div>
-      </div>
-      <div class="badge">📅 {dow_t}, {selected_date.strftime('%b %d, %Y')}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Reserved at the very top so the holiday bar (if any) sits above everything,
+    # even though it needs the selected date that the top bar below defines.
+    holiday_ph = st.empty()
 
     t_locations = load_locations()
     loc_names = [l["name"] for l in t_locations]
 
-    st.markdown('<div class="sec">📍 Location</div>', unsafe_allow_html=True)
-    selected_loc_name = st.selectbox(
-        "Location", loc_names, index=0,
-        label_visibility="collapsed", key="tender_loc_nav",
-    )
+    # Top bar: brand on the left, controls on the right (replaces the old sidebar).
+    _tb = st.columns([2.4, 1.15, 1.05], gap="medium", vertical_alignment="center")
+    with _tb[0]:
+        st.markdown(
+            '<div class="brand"><div class="brand-logo">🍗</div>'
+            '<div><div class="brand-title">Tender Planning</div>'
+            '<div class="brand-sub">Laynes Chicken Fingers · prep needed per 15-min slot</div>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+    with _tb[1]:
+        selected_loc_name = st.selectbox(
+            "📍 Location", loc_names, index=0, key="tender_loc_nav",
+        )
+    with _tb[2]:
+        # History-based predictions work for any date → allow today + planning ahead.
+        # Actuals only exist through the last ingested order date (_dmax).
+        selected_date = st.date_input(
+            "📅 Day", value=_today, min_value=_dmin,
+            max_value=_today + timedelta(days=14), format="YYYY-MM-DD",
+        )
     loc = next(l for l in t_locations if l["name"] == selected_loc_name)
+    dow_t = selected_date.strftime("%A")
+
+    # Context chips
+    _chips = [
+        f'<span class="chip chip-brand">📅 {dow_t}, {selected_date.strftime("%b %d, %Y")}</span>',
+        f'<span class="chip">📍 {loc["name"]}</span>',
+        '<span class="chip">🕐 Central Time · Houston, TX</span>',
+    ]
+    if selected_date > _dmax:
+        _chips.append(
+            f'<span class="chip chip-warn">🔮 Predicted only · actuals through {_dmax.strftime("%b %d")}</span>'
+        )
+    st.markdown(f'<div class="chips">{"".join(_chips)}</div>', unsafe_allow_html=True)
+
+    # Holiday notification bar (US) — rendered into the slot reserved at the top.
+    _hol = holiday_name_for(selected_date)
+    if _hol:
+        _when = "Today is" if selected_date == _today else f'{selected_date.strftime("%A, %b %d")} is'
+        holiday_ph.markdown(
+            f'<div class="holibar"><span class="holibar-ic">{holiday_emoji(_hol)}</span>'
+            f'<span><b>{_when} {_hol}</b> '
+            f'<span class="sub">· a US holiday — demand often differs from a typical '
+            f'{dow_t}, so plan prep accordingly.</span></span></div>',
+            unsafe_allow_html=True,
+        )
 
     # Only the selected location's history/actuals are queried per rerun (vs.
     # the old st.tabs layout, which computed all 11 tabs on every rerun).
