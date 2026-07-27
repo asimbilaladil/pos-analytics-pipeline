@@ -6,6 +6,7 @@ Streamlit app serving 15-min item forecasts for all 11 locations.
 import os
 import re
 from datetime import date, timedelta
+from html import escape as esc          # for values interpolated into raw HTML
 
 import numpy as np
 import pandas as pd
@@ -145,14 +146,53 @@ html, body, [class*="css"], .stApp, button, input, textarea, select{
 }
 .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{ display:none; }
 
-/* Metric (st.metric) as cards */
-[data-testid="stMetric"]{
-  background:var(--card); border:1px solid var(--line); border-radius:var(--r-sm);
-  padding:14px 16px; box-shadow:var(--sh-sm);
+/* Metric (st.metric) as cards.
+   Only some metrics carry a `delta`, which would otherwise make those cards
+   taller than their neighbours. The chain below stretches every wrapper
+   between the column and the card so all cards in a row share the tallest
+   height, and the delta is pinned to the bottom (margin-top:auto) so values
+   stay on one line across the row. */
+[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]){ align-items:stretch; }
+[data-testid="stColumn"]:has([data-testid="stMetric"]),
+[data-testid="stColumn"]:has([data-testid="stMetric"]) > div,
+[data-testid="stColumn"]:has([data-testid="stMetric"]) [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has([data-testid="stMetric"]) [data-testid="stElementContainer"]{
+  display:flex; flex-direction:column; flex:1 1 auto;
 }
-[data-testid="stMetricLabel"] p{ color:var(--faint) !important; font-weight:700; font-size:.72rem;
-  text-transform:uppercase; letter-spacing:.05em; }
-[data-testid="stMetricValue"]{ font-weight:800; letter-spacing:-.02em; color:var(--ink); }
+[data-testid="stMetric"]{
+  display:flex; flex-direction:column; height:100%; min-height:112px;
+  position:relative; overflow:hidden; isolation:isolate;
+  background:linear-gradient(168deg, #fff 0%, #fbfbff 58%, #f7f8ff 100%);
+  border:1px solid var(--line); border-radius:14px;
+  padding:15px 17px 14px; box-shadow:var(--sh-sm);
+  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+/* Hairline top accent, revealed on hover */
+[data-testid="stMetric"]::before{
+  content:""; position:absolute; inset:0 0 auto 0; height:3px;
+  background:linear-gradient(90deg, var(--brand), var(--brand-2));
+  opacity:0; transition:opacity .18s ease;
+}
+[data-testid="stMetric"]:hover{
+  transform:translateY(-3px); box-shadow:var(--sh); border-color:#dfe3f7;
+}
+[data-testid="stMetric"]:hover::before{ opacity:1; }
+
+[data-testid="stMetricLabel"] p{ color:var(--faint) !important; font-weight:700; font-size:.7rem;
+  text-transform:uppercase; letter-spacing:.07em; }
+[data-testid="stMetricValue"]{
+  font-weight:800; letter-spacing:-.03em; color:var(--ink);
+  font-size:1.9rem; line-height:1.1; margin-top:4px;
+  font-variant-numeric:tabular-nums; font-feature-settings:"tnum" 1;
+}
+/* Delta as a subtle chip, pinned to the card's bottom edge */
+[data-testid="stMetricDelta"]{
+  margin-top:auto; padding:5px 10px 4px 6px; align-self:flex-start;
+  border-radius:999px; background:var(--line-2); border:1px solid var(--line);
+  font-size:.74rem !important; font-weight:700; color:var(--muted) !important;
+  line-height:1.15; white-space:nowrap;
+}
+[data-testid="stMetricDelta"] svg{ width:15px; height:15px; }
 
 /* Dataframe polish */
 [data-testid="stDataFrame"]{
@@ -166,6 +206,69 @@ html, body, [class*="css"], .stApp, button, input, textarea, select{
 
 /* Alerts rounded */
 [data-testid="stAlert"]{ border-radius:var(--r-sm); }
+
+/* ── Modal (st.dialog) ──────────────────────────────────────────────────
+   Structure in Streamlit 1.58 is: [data-testid=stDialog] > div (the scrim)
+   > [role=dialog] (the surface), whose children are header / body /
+   close-button. Emotion class hashes change between releases, so everything
+   below is addressed structurally. The close button MUST be matched with the
+   direct-child combinator — the dataframe toolbar puts other buttons inside
+   the dialog subtree. */
+[data-testid="stDialog"] > div{
+  background:rgba(19,22,52,.52) !important;
+  backdrop-filter:blur(7px) saturate(115%);
+  -webkit-backdrop-filter:blur(7px) saturate(115%);
+  padding-top:46px !important;
+}
+[data-testid="stDialog"] [role="dialog"]{
+  border-radius:22px !important; overflow:hidden;
+  border:1px solid rgba(255,255,255,.65) !important;
+  background:linear-gradient(180deg,#fff 0%,#fdfdff 45%,#f9faff 100%) !important;
+  box-shadow:0 44px 96px -34px rgba(15,23,42,.55), 0 0 0 1px rgba(99,102,241,.07);
+  animation:dlgIn .26s cubic-bezier(.22,1,.36,1);
+}
+@keyframes dlgIn{ from{ opacity:0; transform:translateY(14px) scale(.985);} to{ opacity:1; transform:none;} }
+
+/* Header — brand wash, accent bar on the title, hairline divider */
+[data-testid="stDialog"] [role="dialog"] > div:first-child{
+  padding:19px 26px 15px !important;
+  background:linear-gradient(115deg, rgba(99,102,241,.075), rgba(139,92,246,.05) 58%, transparent);
+  border-bottom:1px solid var(--line);
+}
+[data-testid="stDialog"] [role="dialog"] > div:first-child p{
+  font-size:1.1rem !important; font-weight:800 !important; color:var(--ink) !important;
+  letter-spacing:-.02em; display:flex; align-items:center; gap:10px;
+}
+[data-testid="stDialog"] [role="dialog"] > div:first-child p::before{
+  content:""; width:4px; height:19px; border-radius:3px; flex:0 0 auto;
+  background:linear-gradient(180deg, var(--brand), var(--brand-2));
+}
+[data-testid="stDialog"] [role="dialog"] > div:nth-child(2){ padding:17px 26px 22px !important; }
+
+/* Close button — circular ghost; kills the default red focus ring */
+[data-testid="stDialog"] [role="dialog"] > button{
+  width:34px !important; height:34px !important; border-radius:50% !important;
+  top:19px !important; right:20px !important;
+  display:flex; align-items:center; justify-content:center;
+  color:var(--muted) !important; background:transparent !important;
+  border:1px solid transparent !important;
+  transition:background .16s ease, color .16s ease, transform .16s ease;
+}
+[data-testid="stDialog"] [role="dialog"] > button:hover{
+  background:#eef0fb !important; color:var(--brand-ink) !important; transform:rotate(90deg);
+}
+/* Streamlit moves focus to the close button when the dialog opens (correct
+   dialog behaviour), and Chromium counts that as :focus-visible — so the
+   indicator is on screen every time. Keep it, but as a soft tint rather than
+   a loud glow, so an opened dialog doesn't look like it has an error on it. */
+[data-testid="stDialog"] [role="dialog"] > button:focus,
+[data-testid="stDialog"] [role="dialog"] > button:active{
+  outline:none !important; border-color:transparent !important; box-shadow:none !important;
+}
+[data-testid="stDialog"] [role="dialog"] > button:focus-visible{
+  outline:none !important; background:#f1f2fc !important; color:var(--brand-ink) !important;
+  box-shadow:0 0 0 2px rgba(99,102,241,.16) !important;
+}
 
 /* Modern loading overlay */
 .loadwrap{ display:flex; justify-content:center; padding:54px 0 44px; }
@@ -671,8 +774,6 @@ def show_slot_history_dialog(loc_name: str, dow_name: str, time_label: str,
     weather-adjusted prediction: we pair each past day's tenders with that day's
     weather, then predict from the past days whose weather resembles the target
     day (see weather_adjusted_slot_prediction)."""
-    st.markdown(f"**{loc_name} · every past {dow_name} · {time_label}**")
-
     # Pair each past day with its weather (feeds the model; not shown as columns).
     hist_wx = hist_df.copy()
     hist_wx["sale_date"] = pd.to_datetime(hist_wx["sale_date"]).dt.date
@@ -683,6 +784,20 @@ def show_slot_history_dialog(loc_name: str, dow_name: str, time_label: str,
 
     target_wx = load_target_weather(establishment_id, city, target_date)
     wx_pred = weather_adjusted_slot_prediction(hist_wx, *(target_wx or (None, None)))
+
+    # Context as chips rather than one run-on bold line. The weather chip only
+    # appears when we actually have the target day's forecast/archive row —
+    # it's the same input the Weather-adj card below is built from.
+    chips = [
+        f'<span class="chip chip-brand">📍 {esc(loc_name)}</span>',
+        f'<span class="chip">🗓 Every past {esc(dow_name)}</span>',
+        f'<span class="chip">🕐 {esc(time_label)}</span>',
+    ]
+    if target_wx:
+        rain = f" · {target_wx[1]:.1f} mm rain" if target_wx[1] else " · dry"
+        chips.append(f'<span class="chip">🌤 {target_wx[0]:.0f}°F high{rain}</span>')
+    st.markdown(f'<div class="chips" style="margin:0 0 14px">{"".join(chips)}</div>',
+                unsafe_allow_html=True)
 
     # ── Stats: tenders + one weather-adjusted number after Max ───────────
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -710,7 +825,12 @@ def show_slot_history_dialog(loc_name: str, dow_name: str, time_label: str,
 
     st.dataframe(
         disp, hide_index=True, width="stretch", height=min(430, 42 + 35 * len(disp)),
-        column_config={"Tenders sold": st.column_config.NumberColumn(format="%.0f")},
+        column_config={
+            # Without explicit widths the two columns split 50/50 and the
+            # right-aligned counts end up stranded far from their dates.
+            "Date": st.column_config.TextColumn(width="large"),
+            "Tenders sold": st.column_config.NumberColumn(format="%.0f", width="small"),
+        },
     )
 
 def _norm_pname(name: str) -> str:
