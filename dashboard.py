@@ -7,7 +7,9 @@ import os
 import re
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
@@ -235,7 +237,7 @@ def _connect():
 def load_locations():
     conn = _connect()
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute("SELECT id, name FROM establishments ORDER BY name")
+        cur.execute("SELECT id, name, city FROM establishments ORDER BY name")
         rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
@@ -361,6 +363,185 @@ def load_recent_daily(establishment_id):
     return rows
 
 
+@st.cache_data(ttl=600)
+def load_weather_daily(establishment_id):
+    """Daily weather for a location across all history, keyed by date.
+
+    Feeds the slot-history drilldown so each past same-weekday shows the weather
+    that day (and an avg/median/max summary). Temps are converted C→F here since
+    the stores are in Texas and staff read Fahrenheit. Sourced from weather_daily
+    (Open-Meteo archive); dates with no row simply show blank in the drilldown.
+    """
+    conn = _connect()
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            SELECT observed_on,
+                   temp_max_c  * 9.0 / 5.0 + 32 AS temp_max_f,
+                   temp_mean_c * 9.0 / 5.0 + 32 AS temp_mean_f,
+                   rain_mm,
+                   precipitation_hours
+            FROM weather_daily
+            WHERE establishment_id = %s
+        """, (establishment_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+@st.cache_data(ttl=1800)
+def load_target_weather(establishment_id, city, target_date):
+    """Weather for the ONE day we're predicting (daily high °F, rain mm).
+
+    The weather-adjusted slot number is the past same-weekdays whose weather most
+    resembled *this* day, so we need this day's weather. Prefer the stored archive
+    (weather_daily); it lags ~5 days, so for recent/future dates fall back to the
+    Open-Meteo forecast API (covers ~92 days back to 16 days out). Returns
+    (temp_max_f, rain_mm) or None when neither source can supply it.
+    """
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT temp_max_c * 9.0 / 5.0 + 32, rain_mm
+            FROM weather_daily
+            WHERE establishment_id = %s AND observed_on = %s
+        """, (establishment_id, target_date))
+        row = cur.fetchone()
+    conn.close()
+    if row and row[0] is not None:
+        return (float(row[0]), float(row[1]) if row[1] is not None else 0.0)
+
+    # Not in the archive yet → try the forecast endpoint for this city's coords.
+    try:
+        from weather_analysis.config import CoordinateCatalogue
+        geo = CoordinateCatalogue().for_city(city)
+    except Exception:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": geo.latitude, "longitude": geo.longitude,
+                "daily": "temperature_2m_max,rain_sum",
+                "timezone": "America/Chicago",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        daily = resp.json().get("daily", {})
+        tmax = (daily.get("temperature_2m_max") or [None])[0]
+        rain = (daily.get("rain_sum") or [None])[0]
+        if tmax is None:
+            return None
+        return (float(tmax) * 9.0 / 5.0 + 32, float(rain or 0.0))
+    except Exception:
+        return None
+
+
+def weather_adjusted_slot_prediction(hist_wx: pd.DataFrame, target_temp_f, target_rain_mm):
+    """A weather-informed prediction for one 15-min slot.
+
+    Pairs every past same-weekday at this slot (its tender count + that day's
+    weather) with the target day's weather, then returns a *weather-weighted
+    median*: each past day is weighted by how closely its weather matches the
+    target day (a Gaussian kernel over standardised temp-high and rain), and we
+    take the weighted median of the tender counts.
+
+    Weighted median (not mean) so a freak high-volume day — a promo, a bad data
+    day — can't drag the number the way an average would; weighting (not a hard
+    k-nearest cut) so the estimate slides smoothly with the weather instead of
+    snapping between neighbours. It naturally reduces to the plain median when
+    weather carries no signal. Returns a float, or None when there isn't enough
+    weathered history / no target weather (caller then shows the plain median).
+    """
+    if target_temp_f is None:
+        return None
+    d = hist_wx.copy()
+    d["temp_max_f"] = pd.to_numeric(d.get("temp_max_f"), errors="coerce")
+    d["rain_mm"] = pd.to_numeric(d.get("rain_mm"), errors="coerce").fillna(0.0)
+    d = d.dropna(subset=["temp_max_f"])
+    if len(d) < 6:
+        return None
+    weights = _weather_weights(
+        d["temp_max_f"].to_numpy(float), d["rain_mm"].to_numpy(float),
+        target_temp_f, target_rain_mm,
+    )
+    return _weighted_median(d["tenders"].to_numpy(float), weights)
+
+
+def _weather_weights(temp, rain, target_temp, target_rain):
+    """Gaussian-kernel weights (bandwidth 1 in z-space) measuring how closely each
+    day's weather matches the target. Each axis is standardised by its own spread
+    so temp (°F) and rain (mm) contribute on a comparable scale."""
+    s_t = np.nanstd(temp) or 1.0
+    s_r = np.nanstd(rain) or 1.0
+    dist2 = ((temp - target_temp) / s_t) ** 2 + ((np.nan_to_num(rain) - target_rain) / s_r) ** 2
+    return np.exp(-0.5 * dist2)
+
+
+def _weighted_median(values, weights):
+    """Weighted median of ``values`` — the value where cumulative weight crosses
+    half. Robust to outliers (unlike a weighted mean). Falls back to the plain
+    median if all weights are zero."""
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    order = values.argsort()
+    values, weights = values[order], weights[order]
+    cum = np.cumsum(weights)
+    if cum[-1] <= 0:
+        return float(np.median(values))
+    idx = int(np.searchsorted(cum, cum[-1] / 2.0))
+    return float(values[min(idx, len(values) - 1)])
+
+
+def weather_day_totals(pivot, slot_cols, temp_map, rain_map, selected_target,
+                       recent_n=6, min_history=6):
+    """Weather-adjusted day totals for the same-weekday matrix ``pivot``.
+
+    ``pivot`` is (past same-weekday date × 15-min slot) tender counts, zero-filled.
+    For a day's weather we predict each operating slot with the weather-weighted
+    median of the *other* same-weekdays (leave-one-out for a fair backtest), then
+    sum across slots to a day total. Returns:
+      • ``selected_total`` — weather forecast for the day being viewed (uses all
+        history and the selected day's target weather; None if unavailable), and
+      • ``backtest`` — DataFrame over the most recent ``recent_n`` same-weekdays
+        with columns date / actual / weather_pred / median_pred, so the weather
+        forecast can be compared against what actually sold.
+    """
+    dates = list(pivot.index)
+    mat = pivot[list(slot_cols)].to_numpy(float)                 # (D, S)
+    temp = np.array([temp_map.get(d, np.nan) for d in dates], dtype=float)
+    rain = np.array([rain_map.get(d, np.nan) for d in dates], dtype=float)
+    have = ~np.isnan(temp)
+
+    def pred_total(t_temp, t_rain, exclude_i=None):
+        mask = have.copy()
+        if exclude_i is not None:
+            mask[exclude_i] = False
+        if mask.sum() < min_history:
+            return None
+        w = _weather_weights(temp[mask], rain[mask], t_temp, t_rain)
+        sub = mat[mask]
+        return float(sum(_weighted_median(sub[:, c], w) for c in range(sub.shape[1])))
+
+    selected_total = None
+    if selected_target is not None:
+        selected_total = pred_total(selected_target[0], selected_target[1])
+
+    rows = []
+    for i in [j for j in range(len(dates)) if have[j]][-recent_n:]:
+        maskm = np.ones(len(dates), bool)
+        maskm[i] = False
+        rows.append((
+            dates[i],
+            float(mat[i].sum()),                                 # actual
+            pred_total(temp[i], rain[i], exclude_i=i),           # weather (LOO)
+            float(np.median(mat[maskm], axis=0).sum()),          # median (LOO)
+        ))
+    backtest = pd.DataFrame(rows, columns=["date", "actual", "weather_pred", "median_pred"])
+    return selected_total, backtest
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -443,19 +624,72 @@ def build_pred_actual_chart(slotly, has_actual):
     return fig
 
 
-@st.dialog("Slot history", width="large")
-def show_slot_history_dialog(loc_name: str, dow_name: str, time_label: str, hist_df: pd.DataFrame):
-    """All past same-weekday values (with dates) for one 15-min slot."""
-    st.markdown(f"**{loc_name} · every past {dow_name} · {time_label}**")
-    disp = hist_df.sort_values("sale_date", ascending=False).copy()
-    disp["Date"] = pd.to_datetime(disp["sale_date"]).dt.strftime("%a, %b %d, %Y")
-    disp = disp.rename(columns={"tenders": "Tenders sold"})[["Date", "Tenders sold"]]
+def build_day_total_compare_chart(bt: pd.DataFrame):
+    """Grouped bars comparing day totals — actual vs weather forecast vs median
+    forecast — over recent same-weekdays."""
+    x = [d.strftime("%b %d") for d in bt["date"]]
+    fig = go.Figure()
+    fig.add_bar(name="Actual", x=x, y=bt["actual"], marker_color="#14b8a6")
+    fig.add_bar(name="Weather forecast", x=x, y=bt["weather_pred"], marker_color="#f59e0b")
+    fig.add_bar(name="Median forecast", x=x, y=bt["median_pred"], marker_color="#6366F1")
+    fig.update_layout(
+        barmode="group", bargap=0.25, bargroupgap=0.08,
+        height=300, margin=dict(l=8, r=8, t=10, b=8),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Plus Jakarta Sans", size=12, color="#6b7280"),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1,
+                    font=dict(size=12)),
+    )
+    fig.update_xaxes(showgrid=False, linecolor="#e5e7eb")
+    fig.update_yaxes(showgrid=True, gridcolor="#f0f1f5", zeroline=False, rangemode="tozero")
+    return fig
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Records", f"{len(disp)}")
+
+@st.dialog("Slot history", width="large")
+def show_slot_history_dialog(loc_name: str, dow_name: str, time_label: str,
+                             hist_df: pd.DataFrame, establishment_id: int,
+                             city, target_date):
+    """All past same-weekday values (with dates) for one 15-min slot, plus a
+    weather-adjusted prediction: we pair each past day's tenders with that day's
+    weather, then predict from the past days whose weather resembles the target
+    day (see weather_adjusted_slot_prediction)."""
+    st.markdown(f"**{loc_name} · every past {dow_name} · {time_label}**")
+
+    # Pair each past day with its weather (feeds the model; not shown as columns).
+    hist_wx = hist_df.copy()
+    hist_wx["sale_date"] = pd.to_datetime(hist_wx["sale_date"]).dt.date
+    wx = pd.DataFrame(load_weather_daily(establishment_id))
+    if not wx.empty:
+        wx["observed_on"] = pd.to_datetime(wx["observed_on"]).dt.date
+        hist_wx = hist_wx.merge(wx, left_on="sale_date", right_on="observed_on", how="left")
+
+    target_wx = load_target_weather(establishment_id, city, target_date)
+    wx_pred = weather_adjusted_slot_prediction(hist_wx, *(target_wx or (None, None)))
+
+    # ── Stats: tenders + one weather-adjusted number after Max ───────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Records", f"{len(hist_df)}")
     c2.metric("Average", f"{hist_df['tenders'].mean():.0f}")
     c3.metric("Median", f"{hist_df['tenders'].median():.0f}")
     c4.metric("Max", f"{hist_df['tenders'].max():.0f}")
+    if wx_pred is not None:
+        base = hist_df["tenders"].median()
+        delta = wx_pred - base
+        c5.metric(
+            "Weather-adj", f"{wx_pred:.0f}",
+            delta=f"{delta:+.0f} vs median" if abs(delta) >= 0.5 else "≈ median",
+            delta_color="off",
+            help=(f"Target day: {target_wx[0]:.0f}°F high, {target_wx[1]:.1f} mm rain. "
+                  "Median of the past same-weekdays whose weather most resembled it."),
+        )
+    else:
+        c5.metric("Weather-adj", "—",
+                  help="Needs ≥6 past days with weather and this day's weather (archive/forecast).")
+
+    disp = hist_df.sort_values("sale_date", ascending=False).copy()
+    disp["Date"] = pd.to_datetime(disp["sale_date"]).dt.strftime("%a, %b %d, %Y")
+    disp = disp.rename(columns={"tenders": "Tenders sold"})[["Date", "Tenders sold"]]
 
     st.dataframe(
         disp, hide_index=True, width="stretch", height=min(430, 42 + 35 * len(disp)),
@@ -823,7 +1057,80 @@ if page == "🍗 Tender Planning":
                 sel_row = table_df.loc[sel_rows[0]]
                 sel_hist = pivot[[int(sel_row["slot_index"])]].reset_index()
                 sel_hist.columns = ["sale_date", "tenders"]
-                show_slot_history_dialog(loc["name"], dow_name, sel_row["Time"], sel_hist)
+                show_slot_history_dialog(loc["name"], dow_name, sel_row["Time"], sel_hist,
+                                         loc["id"], loc.get("city"), selected_date)
+
+            # ── Weather forecast vs actual — day total ───────────────────────
+            st.markdown('<div class="sec">🌦️ Weather forecast vs actual — day total</div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="sec-sub">Weather forecast = each slot predicted from the past '
+                f'{dow_name}s with the most similar weather, summed for the day · shown next to '
+                f'the plain median forecast and what actually sold</div>',
+                unsafe_allow_html=True,
+            )
+            _wx_all = pd.DataFrame(load_weather_daily(loc["id"]))
+            if not _wx_all.empty:
+                _wx_all["observed_on"] = pd.to_datetime(_wx_all["observed_on"]).dt.date
+                _temp_map = dict(zip(_wx_all["observed_on"],
+                                     pd.to_numeric(_wx_all["temp_max_f"], errors="coerce")))
+                _rain_map = dict(zip(_wx_all["observed_on"],
+                                     pd.to_numeric(_wx_all["rain_mm"], errors="coerce").fillna(0.0)))
+            else:
+                _temp_map, _rain_map = {}, {}
+
+            _target_wx = load_target_weather(loc["id"], loc.get("city"), selected_date)
+            _sel_wx_total, _bt = weather_day_totals(
+                pivot, slotly["slot_index"].tolist(), _temp_map, _rain_map, _target_wx)
+
+            _med_total = float(pred_total)                       # sum of per-slot medians
+            _act_total = float(slotly["actual"].sum(skipna=True)) if has_actual else None
+
+            wc1, wc2, wc3 = st.columns(3)
+            wc1.metric("Median forecast", f"{_med_total:,.0f}", help="Sum of the per-slot medians.")
+            if _sel_wx_total is not None:
+                _wd = _sel_wx_total - _med_total
+                wc2.metric(
+                    "Weather forecast", f"{_sel_wx_total:,.0f}",
+                    delta=f"{_wd:+.0f} vs median" if abs(_wd) >= 0.5 else "≈ median",
+                    delta_color="off",
+                    help=(f"Target day: {_target_wx[0]:.0f}°F high, {_target_wx[1]:.1f} mm rain."
+                          if _target_wx else None),
+                )
+            else:
+                wc2.metric("Weather forecast", "—",
+                           help="Needs this day's weather (archive/forecast) and ≥6 weathered same-weekdays.")
+            if _act_total is not None:
+                _ag = (_act_total - _med_total) / _med_total * 100 if _med_total else 0
+                wc3.metric("Actual sold", f"{_act_total:,.0f}",
+                           delta=f"{_ag:+.0f}% vs median", delta_color="off")
+            else:
+                wc3.metric("Actual sold", "—")
+
+            _btw = _bt.dropna(subset=["weather_pred"]) if not _bt.empty else _bt
+            if _btw is not None and not _btw.empty:
+                with st.container(border=True):
+                    st.plotly_chart(
+                        build_day_total_compare_chart(_btw),
+                        width="stretch", key=f"wxcmp_{loc['id']}_{flavor_col}",
+                        config={"displayModeBar": False},
+                    )
+                _wmae = (_btw["weather_pred"] - _btw["actual"]).abs().mean()
+                _mmae = (_btw["median_pred"] - _btw["actual"]).abs().mean()
+                if _wmae < _mmae:
+                    st.success(
+                        f"Over the last {len(_btw)} {dow_name}s, the **weather forecast** tracked actual "
+                        f"day totals more closely — avg miss {_wmae:.0f} vs {_mmae:.0f} tenders for the median."
+                    )
+                elif _wmae > _mmae:
+                    st.info(
+                        f"Over the last {len(_btw)} {dow_name}s, the plain **median** was closer "
+                        f"(avg miss {_mmae:.0f} vs {_wmae:.0f} for weather) — weather added little here."
+                    )
+                else:
+                    st.info(f"Over the last {len(_btw)} {dow_name}s, weather and median were about equally close.")
+            else:
+                st.caption("Not enough weathered same-weekday history yet to compare day totals.")
 
         # ── Intraday pace ────────────────────────────────────────────────────
         if actual_rows and not slotly.empty:

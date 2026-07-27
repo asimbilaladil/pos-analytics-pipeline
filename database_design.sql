@@ -402,6 +402,23 @@ CREATE INDEX idx_fds_est_date ON features_daily_summary (establishment_id, date)
 CREATE INDEX idx_fds_date ON features_daily_summary (date);
 
 
+-- Daily weather per location (external signal, from Open-Meteo archive/forecast)
+-- Populated by the weather_analysis package; used to test/model weather effects.
+CREATE TABLE weather_daily (
+    establishment_id    INTEGER NOT NULL REFERENCES establishments(id),
+    observed_on         DATE    NOT NULL,
+    temp_max_c          NUMERIC(5,2),
+    temp_min_c          NUMERIC(5,2),
+    temp_mean_c         NUMERIC(5,2),
+    precipitation_mm    NUMERIC(6,2),
+    rain_mm             NUMERIC(6,2),
+    precipitation_hours NUMERIC(5,2),
+    wind_max_kmh        NUMERIC(6,2),
+    weather_code        SMALLINT,
+    PRIMARY KEY (establishment_id, observed_on)
+);
+
+
 -- ============================================================
 -- LAYER 3 — SCORING OUTPUT TABLES
 -- ============================================================
