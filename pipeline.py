@@ -125,6 +125,19 @@ def to_float(val, default=0.0) -> float:
         return default
 
 
+def with_retries(fn, attempts=3, delay=5, label="operation"):
+    """Retry fn() on any exception, with a fixed delay between attempts."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            log.warning("  %s failed (attempt %d/%d): %s — retrying in %ds",
+                        label, attempt, attempts, exc, delay)
+            time.sleep(delay)
+
+
 # ─── Revel API Helpers ────────────────────────────────────────────────────────
 def login_and_save(context, page):
     """Login to Revel and save browser session."""
@@ -137,7 +150,10 @@ def login_and_save(context, page):
     page.wait_for_selector('input[name="password"]', timeout=60000)
     page.fill('input[name="password"]', REVEL_PASS)
     page.click('button[type="submit"]')
-    page.wait_for_load_state("networkidle")
+    # networkidle can stall past 30s on Revel's dashboard (background polling
+    # keeps the network non-idle) — give it real headroom to avoid spurious
+    # timeouts that abort the whole run before any establishment is fetched.
+    page.wait_for_load_state("networkidle", timeout=60000)
     context.storage_state(path=STATE_FILE)
     log.info("Logged in and session saved")
 
@@ -153,14 +169,20 @@ def fetch_all_pages(context, endpoint: str, params: dict, label="records") -> li
 
     while True:
         paged = {**params, "limit": 1000, "offset": offset, "format": "json"}
-        resp = context.request.get(endpoint, params=paged)
 
-        if resp.status != 200:
-            log.error("  %s — HTTP %d at offset %d: %s",
-                      endpoint, resp.status, offset, resp.text()[:200])
+        def _get_page():
+            r = context.request.get(endpoint, params=paged)
+            if r.status != 200:
+                raise RuntimeError(f"HTTP {r.status} at offset {offset}: {r.text()[:200]}")
+            return r.json()  # raises JSONDecodeError on empty/malformed body — retry catches it
+
+        try:
+            data = with_retries(_get_page, attempts=3, delay=5,
+                                 label=f"{endpoint} offset {offset}")
+        except Exception as exc:
+            log.error("  %s — giving up at offset %d: %s", endpoint, offset, exc)
             break
 
-        data = resp.json()
         records = data.get("objects", [])
         total = data.get("meta", {}).get("total_count", 0)
 
@@ -710,12 +732,12 @@ def main():
 
         # Validate / refresh session
         if not os.path.exists(STATE_FILE):
-            login_and_save(context, page)
+            with_retries(lambda: login_and_save(context, page), attempts=2, delay=10, label="login")
         else:
             page.goto(BASE_URL)
             if "login" in page.url or "authentication" in page.url:
                 log.info("Session expired — re-logging in")
-                login_and_save(context, page)
+                with_retries(lambda: login_and_save(context, page), attempts=2, delay=10, label="login")
             else:
                 log.info("Session valid")
 
@@ -729,8 +751,10 @@ def main():
                 modifier_cache = {row[0]: row[1] for row in cur.fetchall()}
             log.info("Modifier cache loaded from DB: %d modifiers", len(modifier_cache))
         else:
-            fetch_and_upsert_products(context, conn)
-            modifier_cache = fetch_and_upsert_modifiers(context, conn)
+            with_retries(lambda: fetch_and_upsert_products(context, conn), attempts=2, delay=10,
+                         label="fetch_and_upsert_products")
+            modifier_cache = with_retries(lambda: fetch_and_upsert_modifiers(context, conn), attempts=2, delay=10,
+                                           label="fetch_and_upsert_modifiers")
 
         # Run each establishment
         for est in establishments:
