@@ -1,0 +1,20 @@
+[server]
+# Default is 200MB — absurd for a chat-export JSON file and shows up
+# verbatim in the uploader's "Limit 200MB per file" caption. 2MB is ample
+# (dashboard.py / sales_report.py don't use file_uploader, so this is
+# scoped to admin_chat.py in practice even though the config is shared).
+maxUploadSize = 2
+
+[client]
+# Suppress Streamlit's built-in multipage nav server-side so it's never sent
+# to the browser (a CSS-only hide still lets it flash for a moment before the
+# app's own <style> mounts). Safe globally: dashboard.py and sales_report.py
+# hide the whole sidebar anyway; admin_chat.py builds its own custom sidebar.
+showSidebarNavigation = false
+
+[theme]
+primaryColor = "#6366F1"
+backgroundColor = "#f6f7fb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1a1c23"
+font = "sans serif"

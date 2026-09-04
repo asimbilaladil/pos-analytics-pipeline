@@ -1,0 +1,56 @@
+Subject: Nederland — June 2026 raw data export (test package ready)
+
+Hi Masroor,
+
+The Nederland June 2026 raw data test pull is complete. Summary below, full files attached/available.
+
+WHAT'S INCLUDED
+- File A — Orders: 6,741 rows, one row per raw Revel order, no filtering (voided/unpaid/$0
+  orders all included).
+- File B — Order Items: 28,767 rows, one row per raw Revel order line item.
+- A separate modifiers file (5,688 rows) — Revel nests modifiers inside each order item rather
+  than treating them as separate order items; this file unpacks that nesting for anyone who
+  wants modifier-level detail, without changing what's in File B.
+- field_mapping.csv/.md — every field you asked for, mapped to its exact Revel source, or marked
+  clearly if Revel doesn't provide it (a few don't — see caveats below).
+- ~200-row samples of each file (sample_orders_200.csv, sample_order_items_200.csv) for a quick
+  look before opening the full Parquet files.
+- Full files in both Parquet (recommended) and .csv.gz.
+
+TIMEZONE
+Revel's raw timestamps have no timezone marker on them, but they represent Nederland's local
+America/Chicago time, not UTC (confirmed against Revel's own request/response data, not
+assumed). Every exported file keeps the original raw timestamp untouched AND adds a normalized
+America/Chicago column alongside it, so nothing is silently converted. June selection itself is
+based on the America/Chicago columns, with the midnight boundary specifically checked.
+
+PAYMENTS / SPLIT TENDERS
+An order can have more than one payment on it — about 1% of June orders (71 of 6,741) were split
+tender, up to 4 payments on a single order. We didn't collapse these into one value; each order
+row carries a payment count, the payment type if there was exactly one, and a complete list of
+every payment on that order if there was more than one, so no payment data is lost.
+
+A FEW THINGS REVEL DOESN'T GIVE US DIRECTLY (documented in field_mapping)
+- No closed timestamp on an order (only a closed yes/no flag).
+- No distinct "comp" amount separate from a general discount — comps aren't broken out as their
+  own field in this data.
+- No human-readable payment type name, only Revel's internal numeric code.
+- No product category on the order item itself — category is resolved by product ID lookup.
+
+EXTRACTION TIME
+Pulling this exact June window from Revel originally took about 30 seconds for Orders, under 3
+minutes for Order Items, and about 30 seconds for Payments. Regenerating this package just now
+from our saved copy of that data took about 11 seconds — that's a local rebuild, not a fresh
+Revel pull.
+
+RATE LIMIT
+Revel doesn't publish an exact numeric rate limit anywhere we have documentation for. In past
+testing we've run 80 requests back to back with no delay and never hit a 429 or seen any
+rate-limit headers, so there doesn't appear to be an aggressive limit in practice, but we can't
+give you an exact number because Revel doesn't state one.
+
+Full details, all counts, and every caveat are in README.md in the package. Happy to pull
+additional months or the other stores the same way if useful.
+
+Best,
+Asim
