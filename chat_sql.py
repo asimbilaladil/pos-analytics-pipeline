@@ -119,13 +119,52 @@ VIEW v_orders_classified  -- orders_v2 + transaction classification (migration 2
                         COMP  = $0 WITH items                   (employee meal / de-facto void)
                         DELETED = deleted flag set
   business_date date (America/Chicago), item_count int, combo_count int,
-  combo_sales numeric, standalone_sales numeric, identity_captured bool
+  combo_sales numeric, standalone_sales numeric, identity_captured bool,
+  entree_count numeric        -- maintained entrée count (see ENTRÉES below)
+  unresolved_item_count int   -- lines whose product is not yet classified
+  entree_fully_resolved bool  -- FALSE when entree_count may be understated
   USE THIS for any per-transaction figure (counts, AOV, per-check anything).
   Default to txn_class = 'REAL' and say so in the answer.
 
-VIEW v_order_items_classified  -- order_items_v2 + combo structure
+VIEW v_order_items_classified  -- order_items_v2 + combo structure + entrées
   every order_items_v2 column, plus in_combo bool, combo_group_id uuid,
-  combo_seq int, business_date date. Excludes deleted rows.
+  combo_seq int, business_date date, and:
+  is_entree bool                    -- from the maintained classification
+  product_form text                 -- combo_component | single_line_combo
+                                    -- | standalone | unknown
+  classification_confidence text    -- high | medium | unknown
+  Excludes deleted rows.
+
+VIEW v_orders_payment_classified  -- v_orders_classified + safe payment context
+  every v_orders_classified column, plus:
+  payment_record_count int, has_payment bool,
+  payment_type_codes int[]      -- RAW Revel codes, no name mapping exists
+  payment_type_single int       -- the code when the order has only one
+  is_split_tender bool          -- more than one payment RECORD on the order
+  refunded_payment_count int, has_refund bool,
+  payment_amount_total numeric, tip_total numeric, gratuity_total numeric
+  USE THIS for anything about payments, refunds, tenders or tips.
+  has_payment = FALSE is normal for EMPTY and COMP orders, not lost revenue.
+  NOTE: this view is slower than v_orders_classified, so prefer the latter when
+  the question does not involve payments.
+
+VIEW v_order_payment_summary  -- one row per order that HAS a payment
+  order_id, establishment_id, payment_record_count, has_payment,
+  payment_type_codes, payment_type_single, is_split_tender,
+  refunded_payment_count, has_refund, payment_amount_total, tip_total,
+  gratuity_total. An order absent from this view has no payment record.
+
+VIEW v_entree_coverage  -- per store/day entrée classification completeness
+  establishment_id, business_date, real_orders, fully_resolved_orders,
+  pct_orders_resolved, entrees, unresolved_items
+
+VIEW v_entree_review_queue  -- products awaiting human entrée classification
+  product_id, product_name_snapshot, confidence, classification_source,
+  line_items_90d, quantity_90d, revenue_90d, avg_price, reviewer_hint
+
+VIEW v_payments_daily_v2  -- per store/day payment totals (reconciliation)
+  establishment_id, business_date, payment_count, paid_order_count,
+  payment_amount, tip_amount, refunded_count
 
 VIEW v_store_cohort  -- store age, for cross-store comparison
   establishment_id, store_name, open_date, open_date_source, weeks_since_open_int,
@@ -284,9 +323,51 @@ ITEMS PER ORDER — never lead with it:
   * Never say entrée classification is unavailable. It exists and is maintained.
 """
 
+PAYMENT_RULES = """\
+PAYMENTS — safe context only, and the type codes have no names:
+
+  * Order-level payment context is on v_orders_payment_classified (all of
+    v_orders_classified plus payment fields) and v_order_payment_summary.
+    Raw payments_v2 is not readable and never will be: it carries transaction
+    ids, card brands and processor data.
+  * payment_type is a RAW REVEL INTEGER with no verified mapping. Say "payment
+    type code 2", never "card", "cash", "credit" or "gift card". No mapping
+    source exists -- Revel's PaymentType resource is empty, the API schema
+    declares the field as a plain integer, and other_payment_type is NULL on
+    every row. If asked what payment methods were used, give the codes and
+    volumes and say plainly that the code-to-name mapping is not available.
+  * has_payment = FALSE is NOT lost revenue. EMPTY tickets and COMP orders
+    legitimately have no payment record. Quantify by txn_class before drawing
+    any conclusion about missing money.
+  * is_split_tender means more than one payment RECORD on the order, not
+    necessarily two different tender types.
+  * DEFAULT EVERY PAYMENT FIGURE TO txn_class = 'REAL' and say so, exactly as
+    you would for sales. Counting all raw transaction classes mixes EMPTY POS
+    artefacts and COMP tickets into a payment statistic. If you report an
+    all-classes number at all, label it "all raw transaction classes" next to
+    the REAL figure -- never present it as the answer on its own.
+  * REFUNDS ARE UNVALIDATED. No refunded = true row has ever been observed in
+    payments_v2, so has_refund has never been true and the refund-positive path
+    has never run on real data. When asked about refunds: give the observed
+    count, say plainly that no positive refund sample exists yet so the
+    detection path is not empirically validated, and do NOT describe it as high
+    confidence. Do NOT say refunds are impossible or that the store had none --
+    say none were observed. check_data reports refund_path_validated and
+    refund_caveat; if refund_path_validated is true, a real refund has since
+    been seen and this caveat no longer applies.
+  * Never present a payment figure as a customer or card identity: no
+    cardholder, last4 or receipt data exists in anything you can read.
+"""
+
 RECONCILIATION_GATE = """\
 DATA TRUST GATE — enforced by the server, not by you:
 
+  * PERCENTAGES ARE ALREADY PERCENTAGES. delta_pct, coverage_pct,
+    payment_capture_rate and tolerance_pct are in percentage points, not
+    fractions. delta_pct = 0.0293 means 0.0293% -- roughly three hundredths of
+    one percent. It is NOT 2.93% and NOT 2.9%. Never multiply a *_pct value by
+    100. When quoting a reconciliation delta, use delta_pct_display or
+    delta_pct_rounded_display verbatim instead of reformatting it yourself.
   * Any run_sql that reads orders, order items, features or payments MUST also
     pass establishment_id (or null for all stores), period_start and
     period_end_exclusive as YYYY-MM-DD. The server reconciles that exact scope
@@ -455,6 +536,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {UNAVAILABLE_METRICS}
 {GUARDRAILS}
 {ENTREE_RULES}
+{PAYMENT_RULES}
 {RECONCILIATION_GATE}
 {FEW_SHOT}"""
 
@@ -522,6 +604,10 @@ _ALLOWED_RELATIONS = frozenset({
     # granted -- the assistant reads the classification through the analysis
     # views and can never write it.
     "v_entree_coverage", "v_entree_review_queue",
+    # A10 (migrations 27-28). Safe payment context only: no transaction ids,
+    # card brands, processor status or operator ids. payments_v2 itself stays
+    # unreadable.
+    "v_order_payment_summary", "v_orders_payment_classified",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -695,6 +781,8 @@ CHECK_DATA_TOOL = {
         "duplicate/orphan/join-integrity checks, data freshness, which metrics "
         "are unavailable, mapping confidence, and a reconciliation of computed "
         "sales against an independent payments total.\n\n"
+        "All *_pct values in the result are already percentages: delta_pct = "
+        "0.0293 means 0.0293%, not 2.93%. Quote delta_pct_display verbatim.\n\n"
         "If reconciliation status is FAIL the data is not safe to analyse: stop, "
         "report the blocking reasons to the user, and do NOT run analysis SQL or "
         "state business conclusions. Further run_sql calls will be refused.\n\n"
@@ -855,13 +943,75 @@ orph AS (
     WHERE i.created_date >= %(ts_start)s AND i.created_date < %(ts_end)s
       AND (%(est)s::int IS NULL OR i.establishment_id = %(est)s::int)
       AND NOT EXISTS (SELECT 1 FROM orders_v2 x WHERE x.id = i.order_id)
+),
+-- A10 payment linkage. Kept in the deep query rather than the core one so a
+-- very wide scope skips it along with the other line-item scans; the gate must
+-- not get slower for metadata most questions never read.
+real_scope AS (
+    SELECT o.id FROM v_orders_classified o
+    WHERE o.txn_class = 'REAL'
+      AND o.business_date >= %(start)s AND o.business_date < %(end)s
+      AND (%(est)s::int IS NULL OR o.establishment_id = %(est)s::int)
+),
+-- Reads the safe summary view, never payments_v2 -- meta_extract runs as the
+-- read-only role, which has no privilege on the raw table. Carrying the
+-- establishment predicate lets it push into the view's GROUP BY instead of
+-- grouping all 882k payment rows first.
+pay_rows AS (
+    SELECT ps.order_id,
+           ps.payment_record_count   AS n,
+           ps.refunded_payment_count AS refunded
+    FROM v_order_payment_summary ps
+    JOIN real_scope rs ON rs.id = ps.order_id
+    WHERE (%(est)s::int IS NULL OR ps.establishment_id = %(est)s::int)
+),
+pay AS (
+    SELECT (SELECT COUNT(*) FROM pay_rows)                        AS orders_with_payment,
+           (SELECT COUNT(*) FROM real_scope)
+             - (SELECT COUNT(*) FROM pay_rows)                    AS orders_without_payment,
+           (SELECT COUNT(*) FROM pay_rows WHERE n > 1)            AS split_tender_count,
+           (SELECT COALESCE(SUM(refunded), 0) FROM pay_rows)      AS refunded_payment_count
 )
-SELECT * FROM i_agg, orph
+SELECT * FROM i_agg, orph, pay
 """
 
 
 def _pct(delta, base):
     return None if not base else round(float(delta) / float(base) * 100.0, 4)
+
+
+
+# Whether the refund-detection path has ever been exercised by real data.
+# refunded is FALSE on every payments_v2 row observed so far, so has_refund has
+# never once been true. A count of zero refunds is therefore an OBSERVATION on
+# an unvalidated path, not a verified measurement, and the assistant must say so
+# rather than claiming high confidence. Computed from data rather than hardcoded
+# so the claim retires itself the moment a real refund arrives; cached because
+# the answer changes at most once per nightly sync and costs ~0.7s.
+_REFUND_OBS_TTL_SECONDS = 3600
+_refund_obs_cache: dict = {"value": None, "checked_at": 0.0}
+
+
+def _refund_observations_all_time() -> int | None:
+    now = time.time()
+    if (_refund_obs_cache["value"] is not None
+            and now - _refund_obs_cache["checked_at"] < _REFUND_OBS_TTL_SECONDS):
+        return _refund_obs_cache["value"]
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute("SELECT COALESCE(SUM(refunded_count), 0) "
+                        "FROM v_payments_daily_v2")
+            value = int(cur.fetchone()[0])
+    except psycopg2.Error:
+        return None            # unknown beats a wrong reassurance
+    finally:
+        conn.rollback()
+        conn.close()
+    _refund_obs_cache.update({"value": value, "checked_at": now})
+    return value
 
 
 def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
@@ -889,7 +1039,9 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             r = dict(cur.fetchone())
 
             deep = {"order_item_rows": None, "duplicate_order_item_ids": None,
-                    "orphan_order_items": None}
+                    "orphan_order_items": None, "orders_with_payment": None,
+                    "orders_without_payment": None, "split_tender_count": None,
+                    "refunded_payment_count": None}
             deep_evaluated = int(r["order_rows"] or 0) <= _DEEP_SCOPE_ROW_LIMIT
             if deep_evaluated:
                 cur.execute(_DEEP_SQL, params)
@@ -906,6 +1058,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
         conn.rollback()
         conn.close()
 
+    _refund_obs = _refund_observations_all_time()
     computed = float(r["computed_total"] or 0)
     reference = float(r["reference_total"] or 0)
     delta = round(computed - reference, 2)
@@ -973,6 +1126,16 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "reference_total": round(reference, 2),
             "delta_dollars": delta,
             "delta_pct": delta_pct,
+            # delta_pct is ALREADY in percentage points: 0.0293 means 0.0293%,
+            # not 2.93%. A model once read it as "2.9%", a hundredfold error on
+            # a number used to judge whether the data can be trusted at all, so
+            # the units are stated and a ready-to-quote string is supplied.
+            "delta_pct_units": ("percentage points; 0.0293 means 0.0293%, "
+                                "NOT 2.93% -- do not multiply by 100"),
+            "delta_pct_display": (None if delta_pct is None
+                                  else f"{delta_pct:+.4f}%"),
+            "delta_pct_rounded_display": (None if delta_pct is None
+                                          else f"{delta_pct:+.2f}%"),
             "tolerance_pct": RECON_TOLERANCE_PCT,
             "status": None,      # filled by _reconcile
         },
@@ -1002,6 +1165,47 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "source": "product_analysis_classification (maintained); products "
                       "without a verified classification never count as entrées, "
                       "so entree_count is a floor, not an estimate",
+        },
+        "payment_linkage": {
+            "orders_with_payment": (None if deep["orders_with_payment"] is None
+                                    else int(deep["orders_with_payment"])),
+            "orders_without_payment": (None if deep["orders_without_payment"] is None
+                                       else int(deep["orders_without_payment"])),
+            "payment_capture_rate": (
+                round(deep["orders_with_payment"] / real * 100.0, 2)
+                if deep["orders_with_payment"] is not None and real else None),
+            "split_tender_count": (None if deep["split_tender_count"] is None
+                                   else int(deep["split_tender_count"])),
+            "refunded_payment_count": (None if deep["refunded_payment_count"] is None
+                                       else int(deep["refunded_payment_count"])),
+            "refund_observations_all_time": _refund_obs,
+            "refund_path_validated": (None if _refund_obs is None
+                                      else _refund_obs > 0),
+            "refund_caveat": (
+                None if _refund_obs is None or _refund_obs > 0 else
+                "No refunded = true record has ever been observed anywhere in "
+                "payments_v2, so the refund-positive path is NOT empirically "
+                "validated. Report the observed count, state that no positive "
+                "refund sample exists yet, and do NOT call refund detection "
+                "high confidence. This does not mean refunds are impossible."),
+            "evaluated": deep_evaluated,
+            "payment_type_mapping_status": "unavailable",
+            "payment_type_mapping_confidence": "none",
+            "payment_type_mapping": {
+                "version": "none",
+                "status": "unavailable",
+                "confidence": "none",
+                "reason": "no verified code-to-name mapping exists: Revel's "
+                          "PaymentType resource returns zero rows, the Payment "
+                          "schema declares payment_type as a plain integer with "
+                          "no enum, and other_payment_type is NULL on every row. "
+                          "Circumstantial behaviour (code 2 always carries a "
+                          "card_type, code 1 accounts for all cash change) is "
+                          "NOT sufficient to assign names. Report codes as "
+                          "'payment type code N' -- never infer cash or card.",
+            },
+            "note": "REAL orders are expected to have a payment. EMPTY and COMP "
+                    "orders legitimately have none -- absence is not lost revenue.",
         },
         "identity_capture_rate": float(r["identity_capture_rate"] or 0),
         "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,

@@ -107,7 +107,11 @@ COMMENT ON VIEW v_entree_coverage IS
     'Per store and day: how much of the entrée classification is resolved. '
     'Below the coverage floor an entrée metric must be qualified or refused.';
 
-GRANT SELECT ON v_entree_coverage, v_entree_review_queue TO laynes_ro;
+-- Recreating a view drops its grants, so they are restated here rather than
+-- relying on migration 21 having run. Without this the assistant fails with
+-- "permission denied for view v_orders_classified" after a replay.
+GRANT SELECT ON v_orders_classified, v_order_items_classified,
+                v_entree_coverage, v_entree_review_queue TO laynes_ro;
 
 -- Rollback: re-run migration 21 for the two view definitions, then
 --   DROP VIEW IF EXISTS v_entree_coverage;
