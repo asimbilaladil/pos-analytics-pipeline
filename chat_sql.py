@@ -22,10 +22,12 @@ import decimal
 import json
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import anthropic
 import psycopg2
+import re
 import psycopg2.extras
 from pglast import ast, parse_sql
 from pglast.parser import ParseError
@@ -233,6 +235,46 @@ substitute a proxy or derive an estimate:
       and Downtown Houston have INFERRED dates only.
 """
 
+# Machine-readable mirror of UNAVAILABLE_METRICS, for the meta_extract payload.
+# The prose above tells the model how to refuse; this list tells it what is
+# missing in a form it can check against a request. Keep the two in step.
+UNAVAILABLE_METRIC_KEYS = [
+    "order_duration_or_service_time",
+    "drive_thru_timing",
+    "comp_vs_discount_separation",
+    "entrees_per_check",
+    "product_category_mix",
+    "weeks_since_open_for_10_of_12_stores",
+]
+
+
+RECONCILIATION_GATE = """\
+DATA TRUST GATE — enforced by the server, not by you:
+
+  * Any run_sql that reads orders, order items, features or payments MUST also
+    pass establishment_id (or null for all stores), period_start and
+    period_end_exclusive as YYYY-MM-DD. The server reconciles that exact scope
+    against an independent payments total BEFORE running your SQL. You cannot
+    skip this by omitting the scope — the query is rejected instead.
+  * Your SQL must use explicit date literals matching that scope. Do NOT use
+    current_date, now() or relative arithmetic in a business query: the server
+    cannot verify those sit inside the reconciled window, so it rejects them.
+    Today's date is given above — write the literal dates yourself.
+  * The declared scope must contain the query. A store scope needs an
+    establishment_id filter; dates outside the declared window are rejected.
+  * If the scope fails reconciliation the query never runs. Stop, tell the user
+    which checks failed and what that means, and do not analyse that period,
+    fall back to partial data, or shop for a different period to get an answer.
+  * Lookups against establishments, products, weather_daily and v_store_cohort
+    need no scope — "how many stores are there" is a plain question, answer it
+    plainly.
+  * check_data is available if you want the full profile before writing SQL,
+    but it is optional: the gate runs either way.
+  * Keep this metadata to yourself unless it changes how the answer reads.
+    Mention coverage when it is material — an incomplete period, a stale store,
+    a reconciliation warning, or a metric in unavailable_metrics.
+"""
+
 GUARDRAILS = """\
 ANALYTICAL GUARDRAILS — these override the user's framing when they conflict:
 
@@ -376,6 +418,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
 {GUARDRAILS}
+{RECONCILIATION_GATE}
 {FEW_SHOT}"""
 
 
@@ -395,6 +438,22 @@ RUN_SQL_TOOL = {
         "type": "object",
         "properties": {
             "sql": {"type": "string", "description": "A single PostgreSQL SELECT statement."},
+            "establishment_id": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Store id this query analyses, or null for all stores. "
+                    "Required whenever the query reads orders, items, features "
+                    "or payments. The scope is reconciled before the query runs "
+                    "and the query is rejected if the data does not pass."),
+            },
+            "period_start": {
+                "type": ["string", "null"],
+                "description": "First business date analysed, inclusive, YYYY-MM-DD.",
+            },
+            "period_end_exclusive": {
+                "type": ["string", "null"],
+                "description": "End business date, EXCLUSIVE, YYYY-MM-DD.",
+            },
         },
         "required": ["sql"],
         "additionalProperties": False,
@@ -417,6 +476,10 @@ _ALLOWED_RELATIONS = frozenset({
     "features_daily_summary_v2", "features_hourly_v2", "features_product_daily_v2",
     "orders_v2", "order_items_v2",
     "establishments", "products", "weather_daily",
+    # Aggregate payment totals only (migration 23) -- the reference side of the
+    # A12 reconciliation gate. payments_v2 itself stays unreadable: this view
+    # exposes no transaction ids, card types, processor flags or user ids.
+    "v_payments_daily_v2",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -580,17 +643,60 @@ def _jsonable(v):
     return v
 
 
-def run_sql(sql: str) -> dict:
-    """Execute a validated read-only query. Returns {columns, rows, row_count}."""
-    safe = _validate(sql)
-    capped = f"SELECT * FROM (\n{safe}\n) AS _capped LIMIT {MAX_ROWS}"
-    conn = psycopg2.connect(
+CHECK_DATA_TOOL = {
+    "name": "check_data",
+    "description": (
+        "Completeness and trust profile for one store and period. CALL THIS "
+        "FIRST, before any run_sql, whenever the question asks you to explain, "
+        "compare, diagnose or draw a conclusion about a store's performance "
+        "over a period. It returns row counts, transaction classification, "
+        "duplicate/orphan/join-integrity checks, data freshness, which metrics "
+        "are unavailable, mapping confidence, and a reconciliation of computed "
+        "sales against an independent payments total.\n\n"
+        "If reconciliation status is FAIL the data is not safe to analyse: stop, "
+        "report the blocking reasons to the user, and do NOT run analysis SQL or "
+        "state business conclusions. Further run_sql calls will be refused.\n\n"
+        "You do not need this for a simple lookup (one number, a list, a "
+        "definition) or for a question with no store/period scope."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "establishment_id": {
+                "type": ["integer", "null"],
+                "description": "Store id, or null for all stores combined.",
+            },
+            "period_start": {
+                "type": "string",
+                "description": "First business date, inclusive, YYYY-MM-DD.",
+            },
+            "period_end": {
+                "type": "string",
+                "description": "End business date, EXCLUSIVE, YYYY-MM-DD.",
+            },
+        },
+        "required": ["establishment_id", "period_start", "period_end"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _ro_conn():
+    """Connection as the read-only analytics role. Never the read-write role."""
+    return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", 5432),
         dbname=os.getenv("DB_NAME", "laynes"),
         user=os.environ["DB_RO_USER"],
         password=os.environ["DB_RO_PASS"],
     )
+
+
+def run_sql(sql: str) -> dict:
+    """Execute a validated read-only query. Returns {columns, rows, row_count}."""
+    safe = _validate(sql)
+    capped = f"SELECT * FROM (\n{safe}\n) AS _capped LIMIT {MAX_ROWS}"
+    conn = _ro_conn()
     try:
         conn.set_session(readonly=True, autocommit=False)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -603,6 +709,470 @@ def run_sql(sql: str) -> dict:
     finally:
         conn.rollback()
         conn.close()
+
+
+
+# ── A12: reconciliation gate + meta_extract ────────────────────────────────
+# The assistant must know whether a store/period is complete and trustworthy
+# BEFORE it reasons about it, so a partial sync cannot be reported as a sales
+# decline. meta_extract() produces that as a structured dict, not prose.
+
+RECON_TOLERANCE_PCT = 0.5      # |delta| at or under this passes
+RECON_WARN_PCT = 0.2           # above this but within tolerance is worth saying
+FRESHNESS_MAX_LAG_HOURS = 36   # nightly sync; beyond this a run was missed
+
+# The reference total is payments_v2 (via the aggregate view from migration
+# 23), NOT features_daily_summary_v2 -- the latter is computed from orders_v2,
+# so it agrees to the cent by construction and cannot detect a partial sync.
+# This is a cross-resource check, not an independent ledger: both sides come
+# from the same Revel account through the same pipeline, so it catches dropped
+# pages, interrupted backfills and order/payment drift, but not Revel itself
+# being wrong. Stated in the payload so the model does not over-trust it.
+_RECON_BASIS = ("payments_v2 daily aggregate (separate Revel resource and sync "
+                "watermark); cross-resource check, not an independent ledger")
+
+_META_SQL = """
+-- One pass per source rather than a subquery per metric: the scope was being
+-- re-scanned about ten times, which timed out for an all-stores month.
+-- Timestamp bounds are passed as timestamptz so the created_date indexes are
+-- usable; an AT TIME ZONE cast in the predicate would force a sequential scan.
+WITH scope AS (
+    SELECT id, txn_class, final_total, item_count, business_date, identity_captured
+    FROM v_orders_classified
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+),
+o_agg AS (
+    SELECT COUNT(*)                                                  AS order_rows,
+           COUNT(*) FILTER (WHERE txn_class = 'REAL')                AS real_count,
+           COUNT(*) FILTER (WHERE txn_class = 'EMPTY')               AS empty_count,
+           COUNT(*) FILTER (WHERE txn_class = 'COMP')                AS comp_count,
+           COUNT(*) FILTER (WHERE txn_class = 'DELETED')             AS deleted_count,
+           COUNT(*) - COUNT(DISTINCT id)                             AS duplicate_order_ids,
+           COUNT(*) FILTER (WHERE txn_class = 'REAL' AND item_count = 0)
+                                                                     AS real_orders_without_items,
+           ROUND(SUM(final_total) FILTER (WHERE txn_class = 'REAL'), 2)
+                                                                     AS computed_total,
+           COUNT(DISTINCT business_date)                             AS days_with_data,
+           ROUND(AVG(CASE WHEN identity_captured THEN 1 ELSE 0 END)
+                 FILTER (WHERE txn_class = 'REAL')::numeric, 4)      AS identity_capture_rate
+    FROM scope
+),
+pay AS (
+    SELECT ROUND(COALESCE(SUM(payment_amount), 0), 2) AS reference_total,
+           COALESCE(SUM(payment_count), 0)            AS payment_rows
+    FROM v_payments_daily_v2
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+),
+src AS (
+    SELECT MAX(ingested_at) AS latest_ingested_at, MAX(created_date) AS latest_source_ts
+    FROM orders_v2
+    WHERE (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+),
+prod AS (
+    SELECT COUNT(*) AS product_count, COUNT(category_id) AS product_with_category
+    FROM products
+)
+SELECT * FROM o_agg, pay, src, prod
+"""
+
+
+# The two line-item scans below are the expensive half of the profile: over all
+# stores for eight months they take ~22s together, against ~1s for everything
+# else. They are run as a separate statement and skipped for very wide scopes,
+# so the gate stays usable on a network-wide question. Join integrity itself is
+# NOT skipped -- it comes from the orders side (real_orders_without_items) and
+# is cheap at any scope; only the items-side cross-checks are deferred.
+_DEEP_SCOPE_ROW_LIMIT = 250_000
+
+_DEEP_SQL = """
+WITH i_agg AS (
+    SELECT COUNT(*)                        AS order_item_rows,
+           COUNT(*) - COUNT(DISTINCT i.id) AS duplicate_order_item_ids
+    FROM order_items_v2 i
+    JOIN v_orders_classified o ON o.id = i.order_id
+    WHERE o.business_date >= %(start)s AND o.business_date < %(end)s
+      AND (%(est)s::int IS NULL OR o.establishment_id = %(est)s::int)
+),
+orph AS (
+    SELECT COUNT(DISTINCT i.order_id) AS orphan_order_items
+    FROM order_items_v2 i
+    WHERE i.created_date >= %(ts_start)s AND i.created_date < %(ts_end)s
+      AND (%(est)s::int IS NULL OR i.establishment_id = %(est)s::int)
+      AND NOT EXISTS (SELECT 1 FROM orders_v2 x WHERE x.id = i.order_id)
+)
+SELECT * FROM i_agg, orph
+"""
+
+
+def _pct(delta, base):
+    return None if not base else round(float(delta) / float(base) * 100.0, 4)
+
+
+def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
+    """Structured completeness/trust profile for one analysis scope.
+
+    period_end is exclusive. establishment_id None means all stores.
+    Reads only allowlisted analytics relations as the read-only role.
+    """
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            tz = ZoneInfo("America/Chicago")
+            params = {
+                "est": establishment_id,
+                "start": period_start,
+                "end": period_end,
+                "ts_start": datetime.combine(date.fromisoformat(period_start),
+                                             datetime.min.time(), tzinfo=tz),
+                "ts_end": datetime.combine(date.fromisoformat(period_end),
+                                           datetime.min.time(), tzinfo=tz),
+            }
+            cur.execute(_META_SQL, params)
+            r = dict(cur.fetchone())
+
+            deep = {"order_item_rows": None, "duplicate_order_item_ids": None,
+                    "orphan_order_items": None}
+            deep_evaluated = int(r["order_rows"] or 0) <= _DEEP_SCOPE_ROW_LIMIT
+            if deep_evaluated:
+                cur.execute(_DEEP_SQL, params)
+                deep = dict(cur.fetchone())
+
+            if establishment_id is None:
+                store = "ALL STORES"
+            else:
+                cur.execute("SELECT name FROM establishments WHERE id = %s",
+                            (establishment_id,))
+                row = cur.fetchone()
+                store = row["name"] if row else f"unknown ({establishment_id})"
+    finally:
+        conn.rollback()
+        conn.close()
+
+    computed = float(r["computed_total"] or 0)
+    reference = float(r["reference_total"] or 0)
+    delta = round(computed - reference, 2)
+    delta_pct = _pct(delta, reference)
+
+    # Only days that have actually happened can be expected to hold orders.
+    # Without this clamp, any question about the current month fails the gate
+    # for "missing" days that are simply in the future.
+    chicago_today = datetime.now(ZoneInfo("America/Chicago")).date()
+    end_effective = min(date.fromisoformat(period_end), chicago_today + timedelta(days=1))
+    start_d = date.fromisoformat(period_start)
+    expected_days = max(0, (end_effective - start_d).days)
+    missing_days = max(0, expected_days - int(r["days_with_data"] or 0))
+
+    latest = r["latest_source_ts"]
+    lag_h = None
+    if latest is not None:
+        lag_h = round((datetime.now(latest.tzinfo) - latest).total_seconds() / 3600.0, 1)
+
+    real_no_items = int(r["real_orders_without_items"] or 0)
+    real = int(r["real_count"] or 0)
+    join_integrity_pct = round((real - real_no_items) / real * 100.0, 3) if real else None
+
+    meta = {
+        "scope": {
+            "establishment_id": establishment_id,
+            "store_name": store,
+            "period_start": period_start,
+            "period_end_exclusive": period_end,
+            "period_end_effective": end_effective.isoformat(),
+            "period_in_progress": end_effective < date.fromisoformat(period_end),
+            "source_timezone": "America/Chicago",
+            "business_day_definition": (
+                "calendar day in America/Chicago, derived from orders_v2.created_date; "
+                "late-night orders after midnight belong to the following calendar day"),
+        },
+        "volumes": {
+            "order_rows": int(r["order_rows"] or 0),
+            "real_count": real,
+            "empty_count": int(r["empty_count"] or 0),
+            "comp_count": int(r["comp_count"] or 0),
+            "deleted_count": int(r["deleted_count"] or 0),
+            "order_item_rows": deep["order_item_rows"],
+            "payment_rows": int(r["payment_rows"] or 0),
+        },
+        "integrity": {
+            "duplicate_order_ids": int(r["duplicate_order_ids"] or 0),
+            "duplicate_order_item_ids": deep["duplicate_order_item_ids"],
+            "orphan_order_items": deep["orphan_order_items"],
+            "item_side_checks_evaluated": deep_evaluated,
+            "real_orders_without_items": real_no_items,
+            "order_to_item_join_integrity_pct": join_integrity_pct,
+        },
+        "freshness": {
+            "latest_source_timestamp": _jsonable(r["latest_source_ts"]),
+            "latest_ingested_at": _jsonable(r["latest_ingested_at"]),
+            "source_lag_hours": lag_h,
+            "expected_days_in_period": expected_days,
+            "days_with_data": int(r["days_with_data"] or 0),
+            "missing_business_days": missing_days,
+        },
+        "reconciliation": {
+            "basis": _RECON_BASIS,
+            "computed_total": round(computed, 2),
+            "reference_total": round(reference, 2),
+            "delta_dollars": delta,
+            "delta_pct": delta_pct,
+            "tolerance_pct": RECON_TOLERANCE_PCT,
+            "status": None,      # filled by _reconcile
+        },
+        "mappings": {
+            "product_category_mapping": {
+                "version": "none",
+                "status": ("unavailable: 0 of %d products carry a category_id"
+                           % int(r["product_count"] or 0))
+                          if not int(r["product_with_category"] or 0) else "partial",
+                "confidence": "none" if not int(r["product_with_category"] or 0) else "low",
+            },
+            "channel_mapping": {
+                "version": "dining_option_v1",
+                "status": "available: orders_v2.dining_option -> drive-through / in-store / third-party",
+                "confidence": "high",
+            },
+        },
+        "identity_capture_rate": float(r["identity_capture_rate"] or 0),
+        "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,
+        "warnings": [],
+    }
+    return _reconcile(meta)
+
+
+def _reconcile(meta: dict) -> dict:
+    """Apply the gate. Sets reconciliation.status and appends warnings.
+
+    FAIL stops analysis. WARN is reserved for conditions that are real but do
+    not compromise the requested figures -- it never means "probably fine".
+    """
+    rec = meta["reconciliation"]
+    vol, integ, fresh = meta["volumes"], meta["integrity"], meta["freshness"]
+    fails: list[str] = []       # FAIL: analysis must not proceed
+    warns: list[str] = []       # WARN: real, scope-specific, non-material
+    notes: list[str] = []       # advisories: permanent dataset traits, not status
+
+    if vol["order_rows"] == 0:
+        fails.append("no orders exist for this store and period")
+
+    d = rec["delta_pct"]
+    if rec["reference_total"] == 0 and rec["computed_total"] > 0:
+        fails.append("no payment records exist for this period, so the sales "
+                     "total cannot be reconciled against any reference")
+    elif d is not None and abs(d) > RECON_TOLERANCE_PCT:
+        fails.append(
+            f"sales reconciliation is off by {d:+.2f}% "
+            f"(${rec['delta_dollars']:+,.2f}); tolerance is "
+            f"±{RECON_TOLERANCE_PCT}%. Orders and payments disagree by more "
+            "than rounding, which usually means a partial or interrupted sync")
+    elif d is not None and abs(d) > RECON_WARN_PCT:
+        warns.append(f"reconciliation delta {d:+.2f}% is within tolerance but "
+                     "larger than typical; treat totals as approximate")
+
+    if fresh["missing_business_days"] > 0:
+        fails.append(
+            f"{fresh['missing_business_days']} of "
+            f"{fresh['expected_days_in_period']} business days have no orders "
+            "at all; the period is incomplete")
+
+    lag = fresh["source_lag_hours"]
+    if lag is not None and lag > FRESHNESS_MAX_LAG_HOURS:
+        fails.append(
+            f"newest order in this store's data is {lag:.0f}h old, beyond the "
+            f"{FRESHNESS_MAX_LAG_HOURS}h nightly-sync limit; a sync run was "
+            "missed and recent activity is absent")
+
+    if not integ.get("item_side_checks_evaluated", True):
+        warns.append(
+            "scope too large to cross-check line items; duplicate and orphan "
+            "item scans were skipped. Order-level figures are still reconciled "
+            "and join integrity is still measured -- narrow to one store or a "
+            "shorter period for the full item-level check")
+
+    if integ["duplicate_order_ids"]:
+        fails.append(f"{integ['duplicate_order_ids']} duplicate order ids -- "
+                     "every count and total would be inflated")
+    if integ["duplicate_order_item_ids"]:
+        fails.append(f"{integ['duplicate_order_item_ids']} duplicate order-item "
+                     "ids -- item counts and product mix would be inflated")
+    if integ["orphan_order_items"]:
+        fails.append(f"{integ['orphan_order_items']} order-items reference "
+                     "orders that are not present; item-level analysis would "
+                     "silently under-count")
+
+    ji = integ["order_to_item_join_integrity_pct"]
+    if ji is not None and ji < 99.0:
+        fails.append(f"only {ji:.2f}% of REAL orders have line items; "
+                     "basket and product analysis is not safe")
+
+    # The two below are properties of this dataset in every period, not defects
+    # in this scope. They belong in the payload so the model reasons correctly,
+    # but they must not move the gate -- if they did, every scope would be WARN
+    # and the status would stop meaning anything.
+    if meta["identity_capture_rate"] < 0.25:
+        notes.append(
+            f"identity captured on only "
+            f"{meta['identity_capture_rate'] * 100:.1f}% of REAL transactions -- "
+            "customer-level conclusions are selection-biased, not representative")
+
+    empty_share = vol["empty_count"] / vol["order_rows"] if vol["order_rows"] else 0
+    if empty_share > 0.10:
+        notes.append(
+            f"{empty_share * 100:.0f}% of raw order rows are EMPTY tickets "
+            "(POS artifacts). Counts must use txn_class='REAL' or they overstate "
+            "transactions")
+
+    rec["status"] = "FAIL" if fails else ("WARN" if warns else "PASS")
+    meta["blocking_reasons"] = fails
+    meta["warnings"] = warns
+    meta["advisories"] = notes
+    meta["analysis_permitted"] = not fails
+    return meta
+
+
+# ── A12 hard enforcement ───────────────────────────────────────────────────
+# The gate cannot depend on the model choosing to call check_data first: a
+# model that skips it would analyse ungated. So every run_sql that touches
+# business data must declare its scope, and the server reconciles that scope
+# itself before the SQL reaches the database. check_data remains available for
+# inspection but is no longer the trust boundary.
+
+# Relations that carry no transactional history: store list, product catalogue,
+# store cohort metadata, external weather. Reading these cannot produce a
+# business conclusion about a period, so they need no reconciliation. This is a
+# named list, never a category or a prefix rule -- a new fact table must be
+# added deliberately, and defaults to gated.
+_REFERENCE_RELATIONS = frozenset({
+    "establishments", "products", "weather_daily", "v_store_cohort",
+})
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _scope_facts(stmt) -> dict:
+    """Date literals, establishment_id literals and relative-date use in a query."""
+    dates: set[str] = set()
+    ests: set[int] = set()
+    relative = False
+
+    def const_int(node):
+        v = getattr(node, "val", None)
+        return v.ival if isinstance(v, ast.Integer) else None
+
+    def walk(n):
+        nonlocal relative
+        if isinstance(n, (list, tuple)):
+            for x in n:
+                walk(x)
+            return
+        if not isinstance(n, ast.Node):
+            return
+        if isinstance(n, ast.A_Const):
+            v = getattr(n, "val", None)
+            if isinstance(v, ast.String) and _DATE_RE.match(v.sval or ""):
+                dates.add(v.sval)
+        elif isinstance(n, ast.SQLValueFunction):
+            relative = True          # current_date / current_timestamp
+        elif isinstance(n, ast.FuncCall):
+            if _fn_name(n) in ("now", "current_date", "current_timestamp", "localtimestamp"):
+                relative = True
+        elif isinstance(n, ast.A_Expr):
+            lex = n.lexpr
+            if (isinstance(lex, ast.ColumnRef) and lex.fields
+                    and isinstance(lex.fields[-1], ast.String)
+                    and lex.fields[-1].sval == "establishment_id"):
+                for cand in (n.rexpr if isinstance(n.rexpr, (list, tuple)) else [n.rexpr]):
+                    if isinstance(cand, ast.A_Const):
+                        iv = const_int(cand)
+                        if iv is not None:
+                            ests.add(iv)
+        for f in n:
+            walk(getattr(n, f, None))
+
+    walk(stmt)
+    return {"dates": dates, "establishment_ids": ests, "relative_dates": relative}
+
+
+class ScopeError(SqlError):
+    """SQL rejected because its scope is unproven or its data failed the gate."""
+
+
+def enforce_scope(sql: str, establishment_id, period_start, period_end,
+                  cache: dict | None = None) -> dict | None:
+    """Reconcile before execution. Returns the meta payload, or None if ungated.
+
+    Raises ScopeError -- so nothing reaches the database -- when the query
+    touches business data and either its scope cannot be proven to sit inside
+    the declared scope, or that scope fails reconciliation.
+    """
+    stmt = _parse_one(sql.strip().rstrip(";").strip())
+    relations = set()
+    _walk(stmt, frozenset(), relations)
+    business = relations - _REFERENCE_RELATIONS
+    if not business:
+        return None                      # reference-only lookup, no gate
+
+    if not period_start or not period_end:
+        raise ScopeError(
+            "this query reads business data (" + ", ".join(sorted(business)) +
+            ") so it must declare period_start and period_end_exclusive "
+            "(YYYY-MM-DD), and establishment_id or null for all stores. The "
+            "scope is reconciled before the query runs.")
+
+    facts = _scope_facts(stmt)
+
+    # Relative dates cannot be checked against the declared window, so a query
+    # using them is not provably inside it.
+    if facts["relative_dates"]:
+        raise ScopeError(
+            "business queries must use explicit date literals, not current_date "
+            f"or now(). Rewrite the bounds as '{period_start}' and "
+            f"'{period_end}' so the scope can be verified.")
+
+    if not facts["dates"]:
+        raise ScopeError(
+            "business queries must carry explicit date bounds matching the "
+            f"declared scope ('{period_start}' to '{period_end}'), otherwise "
+            "the query could read outside the period that was reconciled.")
+
+    outside = sorted(d for d in facts["dates"]
+                     if not (period_start <= d <= period_end))
+    if outside:
+        raise ScopeError(
+            f"query references date(s) {', '.join(outside)} outside the declared "
+            f"scope {period_start}..{period_end}. Declare the scope you actually "
+            "intend to analyse so it can be reconciled first.")
+
+    if establishment_id is not None:
+        wrong = sorted(e for e in facts["establishment_ids"] if e != establishment_id)
+        if wrong:
+            raise ScopeError(
+                f"query filters establishment_id {wrong} but the declared scope "
+                f"is store {establishment_id}. Declare the store you intend to "
+                "analyse.")
+        if not facts["establishment_ids"]:
+            raise ScopeError(
+                f"declared scope is store {establishment_id}, but the query has "
+                "no establishment_id filter, so it would read every store. Add "
+                "the filter, or declare establishment_id null for a network query.")
+
+    key = (establishment_id, period_start, period_end)
+    if cache is not None and key in cache:
+        meta = cache[key]
+    else:
+        meta = meta_extract(establishment_id, period_start, period_end)
+        if cache is not None:
+            cache[key] = meta
+
+    if not meta["analysis_permitted"]:
+        raise ScopeError(
+            "the data for this scope did not pass the reconciliation gate, so "
+            "the query was not run: " + "; ".join(meta["blocking_reasons"]) +
+            ". Report this to the user and stop -- do not analyse this period.")
+    return meta
 
 
 class ChatResult:
@@ -626,6 +1196,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
     steps: list[dict] = []
     final_text = ""
+    scope_cache: dict = {}                  # one meta_extract per scope per turn
+    last_meta: list[dict] = []              # first gated scope, for the answer
 
     system = [
         {"type": "text", "text": _system_static(),
@@ -637,7 +1209,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
             model=model,
             max_tokens=4096,
             system=system,
-            tools=[RUN_SQL_TOOL],
+            tools=[CHECK_DATA_TOOL, RUN_SQL_TOOL],
             messages=messages,
         )
 
@@ -648,11 +1220,53 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         messages.append({"role": "assistant", "content": resp.content})
         tool_results = []
         for block in resp.content:
-            if block.type != "tool_use" or block.name != "run_sql":
+            if block.type != "tool_use":
                 continue
+
+            if block.name == "check_data":
+                step = {"sql": None, "row_count": None, "error": None,
+                        "check": dict(block.input)}
+                try:
+                    ck = (block.input.get("establishment_id"),
+                          block.input["period_start"], block.input["period_end"])
+                    meta = scope_cache.get(ck) or meta_extract(*ck)
+                    scope_cache[ck] = meta
+                    step["meta"] = meta
+                    step["status"] = meta["reconciliation"]["status"]
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": json.dumps(meta, default=str,
+                                              separators=(",", ":")),
+                    })
+                except (psycopg2.Error, KeyError, ValueError) as e:
+                    step["error"] = str(e).strip()
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": f"ERROR: {step['error']}", "is_error": True,
+                    })
+                steps.append(step)
+                continue
+
+            if block.name != "run_sql":
+                continue
+
             sql = block.input.get("sql", "")
             step = {"sql": sql, "row_count": None, "error": None}
             try:
+                # A12: the server reconciles the declared scope itself, before
+                # the SQL reaches the database. This does not depend on the
+                # model having called check_data.
+                gate_meta = enforce_scope(
+                    sql,
+                    block.input.get("establishment_id"),
+                    block.input.get("period_start"),
+                    block.input.get("period_end_exclusive"),
+                    cache=scope_cache,
+                )
+                if gate_meta is not None:
+                    step["gate"] = gate_meta["reconciliation"]["status"]
+                    if not last_meta:
+                        last_meta.append(gate_meta)
                 out = run_sql(sql)
                 step["row_count"] = out["row_count"]
                 payload = json.dumps(out, separators=(",", ":"))
@@ -666,6 +1280,20 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 tool_results.append({
                     "type": "tool_result", "tool_use_id": block.id, "content": payload,
                 })
+            except ScopeError as e:
+                # Per-scope, not turn-wide: a failed scope stays failed (the
+                # result is cached), but a DIFFERENT scope is free to be
+                # reconciled on its own merits. Pivoting from a broken period to
+                # a sound one is legitimate; it cannot skip the gate, because
+                # enforce_scope runs again for the new scope.
+                step["error"] = str(e).strip()
+                tool_results.append({
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": f"REJECTED BEFORE EXECUTION: {step['error']}",
+                    "is_error": True,
+                })
+                steps.append(step)
+                continue
             except (SqlError, psycopg2.Error) as e:
                 step["error"] = str(e).strip()
                 tool_results.append({
