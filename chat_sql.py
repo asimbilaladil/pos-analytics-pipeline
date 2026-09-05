@@ -154,6 +154,19 @@ VIEW v_order_payment_summary  -- one row per order that HAS a payment
   refunded_payment_count, has_refund, payment_amount_total, tip_total,
   gratuity_total. An order absent from this view has no payment record.
 
+VIEW v_orders_time_context  -- the time contract (migration 29)
+  order_id, establishment_id,
+  transaction_timestamp_local   -- created_date as America/Chicago wall-clock
+  local_calendar_date, local_hour (0-23),
+  local_weekday_iso             -- ISO-8601: Monday=1 .. Sunday=7
+  local_weekday_name            -- 'Monday' ... 'Sunday'
+  business_date                 -- currently EQUALS local_calendar_date
+  business_date_method          -- 'local_calendar_date'
+  business_date_confidence      -- 'limited' (no verified rollover rule exists)
+  transaction_timestamp_source  -- 'created_date'
+  USE local_weekday_iso for weekday questions. features_*_v2.day_of_week uses a
+  DIFFERENT convention (Monday=0..Sunday=6) and EXTRACT(dow) a third (Sunday=0).
+
 VIEW v_entree_coverage  -- per store/day entrée classification completeness
   establishment_id, business_date, real_orders, fully_resolved_orders,
   pct_orders_resolved, entrees, unresolved_items
@@ -321,6 +334,47 @@ ITEMS PER ORDER — never lead with it:
     line density, and label it exactly: "raw Revel line items per REAL order —
     not products purchased and not order size."
   * Never say entrée classification is unavailable. It exists and is maintained.
+"""
+
+TIME_RULES = """\
+TIME — one contract, and it is not the database's clock:
+
+  * All Revel timestamps are stored UTC but ORIGINATE as America/Chicago
+    wall-clock. Convert with AT TIME ZONE 'America/Chicago', or read
+    v_orders_time_context, which does it for you. Never use the raw UTC date
+    for a business question -- every order after ~19:00 local would land on the
+    wrong day.
+  * created_date is the authoritative transaction time. Do NOT use
+    updated_date: it is a mutable ingestion/change timestamp. order_history_v2
+    .closed_at exists but is populated on only ~71% of orders, so it cannot be
+    the basis of a sales metric.
+  * business_date currently EQUALS the local calendar date, with
+    business_date_confidence = 'limited', because no authoritative rollover
+    rule exists for these stores. When a question turns on which day a
+    post-midnight order belongs to, SAY that: an order at 00:30 is counted on
+    the new calendar date, and no verified service-day cutoff has been
+    established. Do NOT assert a 2am/3am/4am rollover, and do NOT claim the
+    calendar date is operationally correct -- it is what we can defend.
+  * WEEKDAYS: prefer local_weekday_iso (Monday=1 .. Sunday=7) and name the day.
+    features_*_v2.day_of_week is Monday=0..Sunday=6 and EXTRACT(dow) is
+    Sunday=0 -- three conventions that disagree about Sunday. Always say which
+    you used.
+  * NEVER STATE A WEEKDAY FROM MEMORY. Read the day name from the VERIFIED
+    CALENDAR above, from v_orders_time_context.local_weekday_name, or from
+    check_data's time.period_start_weekday_name. Naming a weekday you have not
+    read from data is an error even when the date itself is right.
+  * A ZERO RESULT IS AN ANSWER. If a bounded, reconciled scope returns no rows,
+    COUNT = 0 or SUM = 0, that IS the finding: report it and stop. Do not
+    re-query, widen the period, drop filters or hunt for a non-empty result.
+    "No REAL transactions were recorded between 00:00 and 04:59" is a complete,
+    useful answer -- say it plainly, with the scope you used, and note the
+    local-calendar-date caveat when the question is about time-of-day.
+  * DAYPARTS ARE NOT DEFINED. There is no verified lunch/dinner/late-night
+    mapping in this system. Answer hourly questions with local_hour and actual
+    hours; do NOT label a range "dinner" or "lunch" as though it were a
+    maintained definition. If asked about a daypart, give the hourly numbers,
+    state that no verified daypart mapping exists, and ask which hours they
+    mean.
 """
 
 PAYMENT_RULES = """\
@@ -536,14 +590,68 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {UNAVAILABLE_METRICS}
 {GUARDRAILS}
 {ENTREE_RULES}
+{TIME_RULES}
 {PAYMENT_RULES}
 {RECONCILIATION_GATE}
 {FEW_SHOT}"""
 
 
+_CHICAGO = ZoneInfo("America/Chicago")
+
+
+def chicago_now() -> datetime:
+    """Wall-clock now in the stores' timezone, never the server's."""
+    return datetime.now(_CHICAGO)
+
+
 def _system_today() -> str:
-    return (f"Today is {date.today():%A, %Y-%m-%d} (America/Chicago). "
-            f"current_date in SQL resolves to this date.")
+    """Relative dates are resolved here, in application code, not in SQL.
+
+    date.today() reads the SERVER timezone, which is UTC on this host. Between
+    19:00 and midnight Chicago that returns TOMORROW's Chicago date, so the old
+    text confidently labelled a UTC date "(America/Chicago)". SQL current_date
+    has the same flaw, which is why business queries reject relative bounds and
+    the model is handed literal dates instead.
+    """
+    now = chicago_now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    # Most recent completed Friday/Saturday etc. are the usual follow-ups, so
+    # the weekday anchors are supplied rather than left to be counted back.
+    last_of = {}
+    for back in range(1, 8):
+        d = today - timedelta(days=back)
+        last_of.setdefault(d.strftime("%A"), d)
+    anchors = "  ".join(f"last {n} = {d}" for n, d in sorted(last_of.items()))
+    # An explicit calendar, because the model has demonstrably named a weekday
+    # from memory and got it wrong (it called Friday 2026-09-04 "Thursday").
+    # Weekday names are computed here, deterministically, and read off -- never
+    # recalled. Covers the window relative questions actually land in.
+    cal = "\n".join(
+        f"    {d}  ISO {d.isoweekday()}  {d:%A}"
+        for d in (today - timedelta(days=n) for n in range(0, 15))
+    )
+    return (
+        f"CURRENT TIME (America/Chicago, the stores' timezone): "
+        f"{now:%A %Y-%m-%d %H:%M} local.\n"
+        f"  today     = {today}\n"
+        f"  yesterday = {yesterday}\n"
+        f"  {anchors}\n"
+        f"Use these literal dates. Do NOT compute a period from SQL "
+        f"current_date/now(): the database session runs in UTC, so its "
+        f"current_date is wrong for up to 5-6 hours of every Chicago day, and "
+        f"business queries reject relative bounds for exactly that reason.\n"
+        f"VERIFIED CALENDAR (date, ISO weekday, weekday name) -- read the day "
+        f"name from here, never from memory:\n{cal}\n"
+        f"For any other date, take the weekday from "
+        f"v_orders_time_context.local_weekday_name or compute it in SQL; do NOT "
+        f"state a weekday you have not read from data.\n"
+        f"Weekday numbering: local_weekday_iso on v_orders_time_context is "
+        f"ISO-8601 (Monday=1 .. Sunday=7). features_*_v2.day_of_week is a "
+        f"DIFFERENT convention (Monday=0 .. Sunday=6), and PostgreSQL's "
+        f"EXTRACT(dow) is a third (Sunday=0). Prefer local_weekday_iso and say "
+        f"which you used."
+    )
 
 
 RUN_SQL_TOOL = {
@@ -608,6 +716,8 @@ _ALLOWED_RELATIONS = frozenset({
     # card brands, processor status or operator ids. payments_v2 itself stays
     # unreadable.
     "v_order_payment_summary", "v_orders_payment_classified",
+    # A6 (migration 29). Derived time columns only -- no new source data.
+    "v_orders_time_context",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1206,6 +1316,36 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             },
             "note": "REAL orders are expected to have a payment. EMPTY and COMP "
                     "orders legitimately have none -- absence is not lost revenue.",
+        },
+        "time": {
+            "source_timezone": "America/Chicago",
+            "timestamp_semantics": (
+                "Revel returns naive America/Chicago wall-clock; stored as UTC "
+                "timestamptz. Verified against the live Revel API, 4/4 exact."),
+            "transaction_timestamp": "orders_v2.created_date",
+            "business_date_method": "local_calendar_date",
+            "business_date_confidence": "limited",
+            "business_date_note": (
+                "No authoritative rollover rule exists: orders_v2 has no "
+                "business-date column, and Revel's BusinessDay resource covers "
+                "only 1 of 12 stores usefully. Post-midnight trade is 3.15% of "
+                "REAL orders network-wide, so the choice matters for late-night "
+                "stores -- disclose it rather than asserting a cutoff."),
+            "weekday_convention": "ISO-8601 Monday=1..Sunday=7 (local_weekday_iso)",
+            "weekday_convention_warning": (
+                "features_*_v2.day_of_week is Monday=0..Sunday=6; "
+                "PostgreSQL EXTRACT(dow) is Sunday=0. Three conventions."),
+            "daypart_mapping_status": "unavailable",
+            "relative_date_resolution": "application-side America/Chicago",
+            "today_local": chicago_now().date().isoformat(),
+            # Supplied so an answer never has to recall what day a scope
+            # boundary fell on.
+            "period_start_weekday_iso": date.fromisoformat(period_start).isoweekday(),
+            "period_start_weekday_name": date.fromisoformat(period_start).strftime("%A"),
+            "period_end_inclusive": (date.fromisoformat(period_end)
+                                     - timedelta(days=1)).isoformat(),
+            "period_end_inclusive_weekday_name": (
+                (date.fromisoformat(period_end) - timedelta(days=1)).strftime("%A")),
         },
         "identity_capture_rate": float(r["identity_capture_rate"] or 0),
         "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,
