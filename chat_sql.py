@@ -167,6 +167,30 @@ VIEW v_orders_time_context  -- the time contract (migration 29)
   USE local_weekday_iso for weekday questions. features_*_v2.day_of_week uses a
   DIFFERENT convention (Monday=0..Sunday=6) and EXTRACT(dow) a third (Sunday=0).
 
+VIEW v_product_category_current  -- CURRENT category reference (migration 32)
+  product_id, establishment_id, product_name, category_id, category_name,
+  parent_category_id, parent_category_name, mapping_source,
+  mapping_confidence, current_snapshot_at, category_stable_since
+  REFERENCE DATA: needs NO store/period scope and NO reconciliation. Use it for
+  "what category is X in" and "is there a Y category". It states TODAY's
+  mapping only -- it proves nothing about a past period.
+
+VIEW v_order_items_category_context  -- verified category dimension (migration 31)
+  order_item_id, order_id, establishment_id, product_id, product_name,
+  category_id, category_name, parent_category_id, parent_category_name,
+  category_stable_since         -- last date the product record changed
+  category_mapping_source       -- 'revel_product_api' | 'unresolved'
+  category_mapping_confidence   -- 'verified_current' | 'unknown'
+  historical_category_verified  -- TRUE only when the mapping predates THAT ROW's
+                                -- own date. FALSE = only today's category known.
+  Join this ONLY for category questions; it is not in the core views, so
+  ordinary analytics stay fast. Category comes from Revel's explicit
+  Product.category field -- NEVER from product_class, and never from a name.
+
+VIEW v_category_review_queue  -- products lacking a verified category
+  product_id, category_id, category_name_snapshot, category_stable_since,
+  mapping_confidence, line_items_90d, revenue_90d
+
 VIEW v_entree_coverage  -- per store/day entrée classification completeness
   establishment_id, business_date, real_orders, fully_resolved_orders,
   pct_orders_resolved, entrees, unresolved_items
@@ -403,6 +427,47 @@ STORE AGE — unknown for every store, and that is the answer:
   * Before comparing one store to others, state the age/history context first:
     if a store has materially less data than its peers, say so before
     interpreting its numbers.
+"""
+
+CATEGORY_RULES = """\
+CATEGORIES — verified dimension, but only CURRENT mapping is guaranteed:
+
+  * Category comes from v_order_items_category_context, sourced from Revel's
+    explicit Product.category field. NEVER use products.product_class as a
+    category: it is a DIFFERENT namespace whose ids coincide numerically with
+    ProductCategory ids but mean something else entirely (it files meals and
+    shakes under "Merch"). If asked for ProductClass analysis, call it
+    ProductClass and never rename it category.
+  * NEVER infer a category from a product name. "Chicken Wrap" is not evidence
+    of a chicken category; read category_name.
+  * TWO DIFFERENT QUESTIONS, TWO DIFFERENT RELATIONS:
+      "What category is X in?" / "Is there a Y category?" -> reference lookup on
+      v_product_category_current. No store, no period, no reconciliation needed.
+      Answer directly and add that it is the CURRENT mapping, which does not
+      prove the category for a past period.
+      "Top categories in June" / "% of June sales that were Drinks" / "did a
+      category grow" -> historical analysis on v_order_items_category_context.
+      Declare store and period, pass the gate, and report the historical
+      verification coverage. The reference view must NOT be used to answer these
+      -- it carries no dates and would silently apply today's mapping to the past.
+  * CURRENT vs HISTORICAL. The archive holds no Product snapshot older than
+    2026-09-02, so today's mapping is verified but a PAST assignment is not
+    automatically. historical_category_verified is TRUE for a row only when the
+    product had not been edited since before that row's own date.
+      - "Today this product is in category X" -- always fair.
+      - "This June sale belonged to category X" -- only when
+        historical_category_verified is TRUE for those rows.
+  * COVERAGE RULE, by REVENUE, using historical_category_verified:
+      >= 95%  state category mix normally
+      80-95%  state it WITH the coverage limitation named explicitly
+      < 80%   do NOT present a category ranking as authoritative
+    Nederland June 2026 sits at 83.6% verified revenue (100% mapped), so
+    category answers there must carry the limitation.
+  * Category is NOT entrée classification. is_entree, product_form,
+    entree_count, combo_count and txn_class are separate and unaffected --
+    do not substitute one for the other.
+  * Hierarchy: parent_category_name exists (e.g. "Main Menu", "Items to Make
+    Combos", "Online Menu"). Report the level you used.
 """
 
 TIME_RULES = """\
@@ -662,6 +727,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {GUARDRAILS}
 {ENTREE_RULES}
 {COHORT_RULES}
+{CATEGORY_RULES}
 {TIME_RULES}
 {PAYMENT_RULES}
 {RECONCILIATION_GATE}
@@ -790,6 +856,10 @@ _ALLOWED_RELATIONS = frozenset({
     "v_order_payment_summary", "v_orders_payment_classified",
     # A6 (migration 29). Derived time columns only -- no new source data.
     "v_orders_time_context",
+    # A5 (migration 31). Verified category dimension + its review queue.
+    # product_category_mapping itself is NOT granted.
+    "v_order_items_category_context", "v_category_review_queue",
+    "v_product_category_current",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1153,9 +1223,30 @@ pay AS (
              - (SELECT COUNT(*) FROM pay_rows)                    AS orders_without_payment,
            (SELECT COUNT(*) FROM pay_rows WHERE n > 1)            AS split_tender_count,
            (SELECT COALESCE(SUM(refunded), 0) FROM pay_rows)      AS refunded_payment_count
+),
+cat AS (
+    SELECT COUNT(*)                                                  AS cat_items,
+           COUNT(*) FILTER (WHERE cc.category_id IS NOT NULL)         AS cat_mapped_items,
+           COUNT(*) FILTER (WHERE cc.historical_category_verified)    AS cat_hist_items,
+           COALESCE(SUM(i.pure_sales), 0)                             AS cat_revenue,
+           COALESCE(SUM(i.pure_sales) FILTER (WHERE cc.category_id IS NOT NULL), 0)
+                                                                      AS cat_mapped_revenue,
+           COALESCE(SUM(i.pure_sales) FILTER (WHERE cc.historical_category_verified), 0)
+                                                                      AS cat_hist_revenue
+    FROM order_items_v2 i
+    JOIN real_scope rs ON rs.id = i.order_id
+    LEFT JOIN v_order_items_category_context cc ON cc.order_item_id = i.id
+    WHERE i.deleted IS NOT TRUE AND i.is_voided IS NOT TRUE
 )
-SELECT * FROM i_agg, orph, pay
+SELECT * FROM i_agg, orph, pay, cat
 """
+
+
+def _pct_of(part, whole):
+    """Percentage on a 0-100 scale, or None when the deep scan was skipped."""
+    if part is None or whole in (None, 0):
+        return None
+    return round(float(part) / float(whole) * 100.0, 2)
 
 
 def _pct(delta, base):
@@ -1292,7 +1383,10 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             r = dict(cur.fetchone())
 
             deep = {"order_item_rows": None, "duplicate_order_item_ids": None,
-                    "orphan_order_items": None, "orders_with_payment": None,
+                    "orphan_order_items": None, "cat_items": None,
+                    "cat_mapped_items": None, "cat_hist_items": None,
+                    "cat_revenue": None, "cat_mapped_revenue": None,
+                    "cat_hist_revenue": None, "orders_with_payment": None,
                     "orders_without_payment": None, "split_tender_count": None,
                     "refunded_payment_count": None}
             deep_evaluated = int(r["order_rows"] or 0) <= _DEEP_SCOPE_ROW_LIMIT
@@ -1461,6 +1555,32 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "note": "REAL orders are expected to have a payment. EMPTY and COMP "
                     "orders legitimately have none -- absence is not lost revenue.",
         },
+        "category_mapping": {
+            "status": "current_only",
+            "source": "revel_product_api (Product.category)",
+            "confidence": "verified_current",
+            "historical_verified": False,
+            "mapped_item_pct": _pct_of(deep["cat_mapped_items"], deep["cat_items"]),
+            "mapped_revenue_pct": _pct_of(deep["cat_mapped_revenue"], deep["cat_revenue"]),
+            "historically_verified_item_pct": _pct_of(deep["cat_hist_items"], deep["cat_items"]),
+            "historically_verified_revenue_pct": _pct_of(
+                deep["cat_hist_revenue"], deep["cat_revenue"]),
+            "unmapped_item_count": (
+                None if deep["cat_items"] is None
+                else int(deep["cat_items"]) - int(deep["cat_mapped_items"])),
+            "unmapped_revenue": (
+                None if deep["cat_revenue"] is None
+                else round(float(deep["cat_revenue"])
+                           - float(deep["cat_mapped_revenue"]), 2)),
+            "hierarchy_status": "parent_child available from product_categories",
+            "coverage_thresholds_pct": {"state_normally": 95, "state_with_caveat": 80},
+            "limitations": (
+                "Category is verified for TODAY. The raw archive holds no Product "
+                "snapshot older than 2026-09-02, so a past assignment is only "
+                "verified where the product was not edited after the sale "
+                "(historical_category_verified). Never derived from "
+                "product_class, which is a different namespace."),
+        },
         "store_cohort": _cohort_block,
         "time": {
             "source_timezone": "America/Chicago",
@@ -1623,6 +1743,11 @@ def _reconcile(meta: dict) -> dict:
 # added deliberately, and defaults to gated.
 _REFERENCE_RELATIONS = frozenset({
     "establishments", "products", "weather_daily", "v_store_cohort",
+    # Current product -> category reference. Safe to leave ungated because it
+    # reads only the mapping table and the product catalogue -- no order, item
+    # or payment row -- so there is no period to reconcile. The HISTORICAL view
+    # (v_order_items_category_context) joins order_items_v2 and stays gated.
+    "v_product_category_current",
 })
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
