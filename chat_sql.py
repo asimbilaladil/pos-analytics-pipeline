@@ -198,8 +198,10 @@ KNOWN DATA QUIRKS — account for these:
     is no combo price column — a combo's price is the SUM of its component
     rows. Use combo_count / in_combo from the classified views.
   * There is no product category anywhere (products.category_id is 100% NULL),
-    and no maintained entrée classification. Questions about category mix or
-    "entrées per check" cannot be answered from this database today.
+    so category mix and combo-attach-by-category remain unanswerable. Entrées
+    ARE available: product_analysis_classification is a maintained, human-
+    reviewed definition, surfaced as is_entree / product_form on
+    v_order_items_classified and entree_count on v_orders_classified.
   * Customer identity is captured on only ~14% of transactions, and enrollees
     are self-selected heavy users. Any customer-level figure must be reported
     with that capture rate and the selection-bias caveat. Never present
@@ -227,9 +229,10 @@ substitute a proxy or derive an estimate:
       Both flow through discount_total_amount; discount_reason is free text and
       is empty on effectively all orders. You can report total discounts, not
       the comp share of them.
-  * entrées per check / category mix / combo attach by category
-      No maintained product-classification or category table exists
-      (products.category_id is NULL for every row).
+  * category mix / combo attach by category
+      products.category_id is NULL for every row and no category source could be
+      verified, so any per-category breakdown is unavailable. NOTE: entrées per
+      check IS available via the maintained classification — do not refuse it.
   * weeks_since_open for the 10 stores whose open_date is unknown
       Any cohort or store-age comparison covering them is not available. Cypress
       and Downtown Houston have INFERRED dates only.
@@ -242,11 +245,44 @@ UNAVAILABLE_METRIC_KEYS = [
     "order_duration_or_service_time",
     "drive_thru_timing",
     "comp_vs_discount_separation",
-    "entrees_per_check",
     "product_category_mix",
     "weeks_since_open_for_10_of_12_stores",
 ]
 
+
+ENTREE_RULES = """\
+ENTRÉES — use the maintained classification, never a product name:
+
+  * is_entree, product_form and classification_confidence come from
+    v_order_items_classified; entree_count comes from v_orders_classified.
+    NEVER decide what an entrée is by pattern-matching a product name, and
+    never write your own CASE over product_name to do it.
+  * A product with no verified classification never counts as an entrée, so
+    entree_count is a FLOOR, not an estimate.
+  * check_data returns entree_classification.coverage_pct. Below the floor
+    (80%) do not state entrées per check as fact: give the floor figure, say
+    how many line items are unreviewed, and stop. Between 80% and 95%, quote
+    the figure as a lower bound and say so.
+  * product_form separates the two shapes a combo takes: combo_component (one
+    line inside a combo) and single_line_combo (one row that IS the combo).
+    Counting raw line items is NOT order size -- about 90% of lines sit inside
+    a combo, so prefer entree_count or combo_count.
+  * v_entree_review_queue lists what is unresolved and the revenue at stake.
+
+ITEMS PER ORDER — never lead with it:
+  * A raw line-item count is NOT order size and NOT products purchased. About
+    90% of lines sit inside a combo, so one guest buying one combo produces
+    roughly five rows (entrée, side, drink, sauce, toast). Leading with "about
+    6 items per order" tells the user something false about their business.
+  * When asked "how many items per order", answer with the maintained metrics
+    FIRST: entree_count per REAL transaction, combo_count per REAL transaction,
+    and the entrée distribution (0 / 1 / 2 / 3+). Explain that combos explode
+    into component rows and that this is why the raw count misleads.
+  * Report line items per order ONLY if the user explicitly asks for raw POS
+    line density, and label it exactly: "raw Revel line items per REAL order —
+    not products purchased and not order size."
+  * Never say entrée classification is unavailable. It exists and is maintained.
+"""
 
 RECONCILIATION_GATE = """\
 DATA TRUST GATE — enforced by the server, not by you:
@@ -418,6 +454,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
 {GUARDRAILS}
+{ENTREE_RULES}
 {RECONCILIATION_GATE}
 {FEW_SHOT}"""
 
@@ -480,6 +517,11 @@ _ALLOWED_RELATIONS = frozenset({
     # A12 reconciliation gate. payments_v2 itself stays unreadable: this view
     # exposes no transaction ids, card types, processor flags or user ids.
     "v_payments_daily_v2",
+    # A3 (migrations 24-25). Aggregate/reference only: coverage percentages and
+    # the human review queue. product_analysis_classification itself is NOT
+    # granted -- the assistant reads the classification through the analysis
+    # views and can never write it.
+    "v_entree_coverage", "v_entree_review_queue",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -717,6 +759,12 @@ def run_sql(sql: str) -> dict:
 # BEFORE it reasons about it, so a partial sync cannot be reported as a sales
 # decline. meta_extract() produces that as a structured dict, not prose.
 
+# A3 entrée coverage. Below MIN an entrée metric must be qualified with the
+# size of the gap; below FLOOR it must not be stated as fact at all, because
+# unresolved products could move it enough to change the reading.
+ENTREE_COVERAGE_MIN_PCT = 95.0
+ENTREE_COVERAGE_FLOOR_PCT = 80.0
+
 RECON_TOLERANCE_PCT = 0.5      # |delta| at or under this passes
 RECON_WARN_PCT = 0.2           # above this but within tolerance is worth saying
 FRESHNESS_MAX_LAG_HOURS = 36   # nightly sync; beyond this a run was missed
@@ -737,7 +785,8 @@ _META_SQL = """
 -- Timestamp bounds are passed as timestamptz so the created_date indexes are
 -- usable; an AT TIME ZONE cast in the predicate would force a sequential scan.
 WITH scope AS (
-    SELECT id, txn_class, final_total, item_count, business_date, identity_captured
+    SELECT id, txn_class, final_total, item_count, business_date, identity_captured,
+           entree_count, unresolved_item_count, entree_fully_resolved
     FROM v_orders_classified
     WHERE business_date >= %(start)s AND business_date < %(end)s
       AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
@@ -755,7 +804,12 @@ o_agg AS (
                                                                      AS computed_total,
            COUNT(DISTINCT business_date)                             AS days_with_data,
            ROUND(AVG(CASE WHEN identity_captured THEN 1 ELSE 0 END)
-                 FILTER (WHERE txn_class = 'REAL')::numeric, 4)      AS identity_capture_rate
+                 FILTER (WHERE txn_class = 'REAL')::numeric, 4)      AS identity_capture_rate,
+           SUM(entree_count) FILTER (WHERE txn_class = 'REAL')       AS entrees,
+           COUNT(*) FILTER (WHERE txn_class = 'REAL'
+                              AND entree_fully_resolved)             AS entree_resolved_orders,
+           SUM(unresolved_item_count) FILTER (WHERE txn_class = 'REAL')
+                                                                     AS entree_unresolved_items
     FROM scope
 ),
 pay AS (
@@ -936,6 +990,19 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 "confidence": "high",
             },
         },
+        "entree_classification": {
+            "entrees": float(r["entrees"] or 0),
+            "orders_fully_resolved": int(r["entree_resolved_orders"] or 0),
+            "coverage_pct": round(
+                (r["entree_resolved_orders"] or 0) / real * 100.0, 2) if real else None,
+            "unresolved_line_items": int(r["entree_unresolved_items"] or 0),
+            "entrees_per_real_check": round(float(r["entrees"] or 0) / real, 4) if real else None,
+            "min_coverage_pct": ENTREE_COVERAGE_MIN_PCT,
+            "floor_coverage_pct": ENTREE_COVERAGE_FLOOR_PCT,
+            "source": "product_analysis_classification (maintained); products "
+                      "without a verified classification never count as entrées, "
+                      "so entree_count is a floor, not an estimate",
+        },
         "identity_capture_rate": float(r["identity_capture_rate"] or 0),
         "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,
         "warnings": [],
@@ -1017,6 +1084,26 @@ def _reconcile(meta: dict) -> dict:
             f"identity captured on only "
             f"{meta['identity_capture_rate'] * 100:.1f}% of REAL transactions -- "
             "customer-level conclusions are selection-biased, not representative")
+
+    # A3 entrée coverage. An advisory, not a gate condition: unreviewed products
+    # make entree_count a floor, which changes how an entrée answer must be
+    # worded, but it does not make the period's sales figures untrustworthy.
+    ec = meta.get("entree_classification") or {}
+    cov = ec.get("coverage_pct")
+    if cov is not None and vol["real_count"]:
+        if cov < ENTREE_COVERAGE_FLOOR_PCT:
+            notes.append(
+                f"entree classification covers only {cov:.1f}% of REAL orders "
+                f"(floor {ENTREE_COVERAGE_FLOOR_PCT}%); "
+                f"{ec['unresolved_line_items']} line items are unreviewed, so "
+                "entree_count is a FLOOR and is understated by an unknown "
+                "amount. Do not state entrees per check as fact for this scope "
+                "-- give the floor, say what is unresolved, and stop there")
+        elif cov < ENTREE_COVERAGE_MIN_PCT:
+            notes.append(
+                f"entree classification covers {cov:.1f}% of REAL orders "
+                f"(target {ENTREE_COVERAGE_MIN_PCT}%); entree figures are a "
+                "lower bound, say so when quoting them")
 
     empty_share = vol["empty_count"] / vol["order_rows"] if vol["order_rows"] else 0
     if empty_share > 0.10:
