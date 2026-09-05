@@ -179,12 +179,48 @@ VIEW v_payments_daily_v2  -- per store/day payment totals (reconciliation)
   establishment_id, business_date, payment_count, paid_order_count,
   payment_amount, tip_amount, refunded_count
 
-VIEW v_store_cohort  -- store age, for cross-store comparison
-  establishment_id, store_name, open_date, open_date_source, weeks_since_open_int,
-  store_age_bucket (honeymoon 1-8 wk | ramp 9-26 | maturing 27-52 | mature 53+ | unknown)
-  open_date is only known for Cypress (54) and Downtown Houston (48), both
-  INFERRED from the first order in the backfill window, so they are a floor, not
-  a fact. The other 10 stores are 'unknown' — say so rather than guessing.
+VIEW v_store_cohort  -- store age vs DATA history (migration 30)
+  establishment_id, establishment_name,
+  verified_open_date        -- NULL for ALL 12 stores today: no authoritative
+                            -- source exists. NULL means unknown, never "new".
+  open_date_source, open_date_confidence ('unknown' for all)
+  revel_account_created_date -- Revel provisioning date, observed 20-49 days
+                            -- BEFORE first trade. A lower bound, NOT an opening.
+  first_seen_order_date, first_seen_real_order_date
+  available_history_start / _end / _days / _weeks
+  history_truncated bool    -- TRUE for 10 of 12: our data begins at the
+                            -- 2026-01-01 backfill edge, so the store was
+                            -- already trading before we could see it.
+  weeks_since_open          -- NULL unless verified_open_date is set (so NULL
+                            -- for every store). NEVER derived from first_seen.
+  maturity_threshold_status -- 'no maintained threshold configured'
+  DATA HISTORY IS NOT STORE AGE. "We have 8 months of data" is not "the store is
+  8 months old". Say which one you mean.
+
+VIEW v_orders_time_context  -- the time contract (migration 29)
+  order_id, establishment_id,
+  transaction_timestamp_local   -- created_date as America/Chicago wall-clock
+  local_calendar_date, local_hour (0-23),
+  local_weekday_iso             -- ISO-8601: Monday=1 .. Sunday=7
+  local_weekday_name            -- 'Monday' ... 'Sunday'
+  business_date                 -- currently EQUALS local_calendar_date
+  business_date_method          -- 'local_calendar_date'
+  business_date_confidence      -- 'limited' (no verified rollover rule exists)
+  transaction_timestamp_source  -- 'created_date'
+  USE local_weekday_iso for weekday questions. features_*_v2.day_of_week uses a
+  DIFFERENT convention (Monday=0..Sunday=6) and EXTRACT(dow) a third (Sunday=0).
+
+VIEW v_entree_coverage  -- per store/day entrée classification completeness
+  establishment_id, business_date, real_orders, fully_resolved_orders,
+  pct_orders_resolved, entrees, unresolved_items
+
+VIEW v_entree_review_queue  -- products awaiting human entrée classification
+  product_id, product_name_snapshot, confidence, classification_source,
+  line_items_90d, quantity_90d, revenue_90d, avg_price, reviewer_hint
+
+VIEW v_payments_daily_v2  -- per store/day payment totals (reconciliation)
+  establishment_id, business_date, payment_count, paid_order_count,
+  payment_amount, tip_amount, refunded_count
 
 DINING_OPTION codes (orders_v2.dining_option, order_items_v2.dining_option):
   4   = drive-through            1 = eat-in / dine-in        0 = to-go / takeout
@@ -285,9 +321,12 @@ substitute a proxy or derive an estimate:
       products.category_id is NULL for every row and no category source could be
       verified, so any per-category breakdown is unavailable. NOTE: entrées per
       check IS available via the maintained classification — do not refuse it.
-  * weeks_since_open for the 10 stores whose open_date is unknown
-      Any cohort or store-age comparison covering them is not available. Cypress
-      and Downtown Houston have INFERRED dates only.
+  * weeks_since_open / store age for EVERY store
+      No authoritative opening date exists for any of the 12 stores, so
+      verified_open_date and weeks_since_open are NULL throughout. Cohort and
+      store-age comparisons cannot be made. Do not substitute the first date in
+      our data -- for 10 stores that is the backfill edge, and for the other 2 it
+      is staff testing days before real trade.
 """
 
 # Machine-readable mirror of UNAVAILABLE_METRICS, for the meta_extract payload.
@@ -298,7 +337,7 @@ UNAVAILABLE_METRIC_KEYS = [
     "drive_thru_timing",
     "comp_vs_discount_separation",
     "product_category_mix",
-    "weeks_since_open_for_10_of_12_stores",
+    "store_age_and_weeks_since_open_all_stores",
 ]
 
 
@@ -334,6 +373,36 @@ ITEMS PER ORDER — never lead with it:
     line density, and label it exactly: "raw Revel line items per REAL order —
     not products purchased and not order size."
   * Never say entrée classification is unavailable. It exists and is maintained.
+"""
+
+COHORT_RULES = """\
+STORE AGE — unknown for every store, and that is the answer:
+
+  * verified_open_date is NULL for ALL 12 stores. No authoritative opening date
+    exists. If asked when a store opened, say it is not recorded -- do NOT
+    answer with the first date in our data.
+  * DATA HISTORY IS NOT STORE AGE. Our data starts 2026-01-01 for 10 of 12
+    stores because that is the backfill edge (history_truncated = TRUE), not
+    because they opened then. Say "we have N months of data for this store",
+    never "the store has been open N months".
+  * The other 2 stores (Downtown Houston, Cypress) first appear later, but their
+    earliest rows are staff testing -- Downtown Houston's first REAL day is 4
+    orders totalling $14. Still not an opening date.
+  * revel_account_created_date is when Revel provisioned the establishment,
+    observed 20-49 days BEFORE first trade. It is a lower bound on the opening
+    date, so "opened on or after <date>" is fair; "opened on <date>" is not.
+  * NEVER compute weeks_since_open from first_seen_* dates. It is NULL and must
+    stay NULL until a verified opening date is supplied.
+  * NEVER call a store new, young, mature or in a honeymoon period. No
+    maintained maturity threshold is configured (maturity_threshold_status), and
+    without a verified opening date the label has no basis. If the user wants
+    such a split, ask them for the threshold and the dates.
+  * YEAR-OVER-YEAR IS IMPOSSIBLE HERE. This database contains nothing before
+    2026-01-01. Any "vs last year" question must be refused with that fact, not
+    answered with an empty comparison.
+  * Before comparing one store to others, state the age/history context first:
+    if a store has materially less data than its peers, say so before
+    interpreting its numbers.
 """
 
 TIME_RULES = """\
@@ -533,12 +602,14 @@ A: "Month to date the average ticket is **$20.19** across **124,095 real
    would report $19.43, which is the figure the daily summary table gives."
    -- confidence: high. Denominator stated, as guardrail 1 requires.
 
-Q: "How is Cypress doing vs last year?"      (young store -> refuse the framing)
-A: Do NOT run a YoY query. Cypress opened June 2026, so "last year" is either
-   empty or the pre-opening period; a YoY read would compare against the
-   opening honeymoon and manufacture a decline. Say that, then offer the valid
-   alternative: its weeks-since-open curve against other stores (v_store_cohort),
-   noting its open_date is inferred.
+Q: "How is Cypress doing vs last year?"      (no prior-year data -> refuse)
+A: Do NOT run a YoY query. This database holds no data before 2026-01-01 at all,
+   so "last year" is empty for every store -- a YoY read would compare real
+   numbers against nothing and manufacture a decline. Say that plainly. Do NOT
+   say Cypress "opened in June 2026": its verified_open_date is unknown; June is
+   only when our data first sees it. Offer what is valid instead: its trend
+   since we first observed it, or a comparison against the network over the same
+   window, labelling it data history rather than store age.
 
 Q: "Top 5 products at Airtex last week"
 SQL:
@@ -590,6 +661,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {UNAVAILABLE_METRICS}
 {GUARDRAILS}
 {ENTREE_RULES}
+{COHORT_RULES}
 {TIME_RULES}
 {PAYMENT_RULES}
 {RECONCILIATION_GATE}
@@ -1124,6 +1196,77 @@ def _refund_observations_all_time() -> int | None:
     return value
 
 
+
+# Store-age context. v_store_cohort derives first/last seen dates by scanning
+# every order, which is far too heavy to repeat on each gated question -- it
+# nearly doubled meta_extract (0.85s -> 1.82s). The facts change at most once
+# per nightly sync, so they are cached per establishment.
+_COHORT_TTL_SECONDS = 3600
+_cohort_cache: dict = {}
+
+_COHORT_LIMITATIONS = (
+    "No verified opening date exists for any store, so store age and "
+    "weeks_since_open are unknown and no maturity label may be applied. Data "
+    "history is not store age: for 10 of 12 stores our history begins at the "
+    "2026-01-01 backfill edge. Year-over-year is impossible -- this database "
+    "holds nothing before 2026-01-01."
+)
+
+
+def _cohort_context(establishment_id) -> dict:
+    now = time.time()
+    hit = _cohort_cache.get(establishment_id)
+    if hit and now - hit["at"] < _COHORT_TTL_SECONDS:
+        return hit["value"]
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute("""
+                SELECT verified_open_date, open_date_source, open_date_confidence,
+                       revel_account_created_date, first_seen_real_order_date,
+                       available_history_start, available_history_days,
+                       available_history_weeks, history_truncated,
+                       weeks_since_open, maturity_threshold_status
+                FROM v_store_cohort
+                WHERE (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+                ORDER BY establishment_id LIMIT 1
+            """, {"est": establishment_id})
+            row = cur.fetchone()
+    except psycopg2.Error:
+        return {"open_date_confidence": "unknown",
+                "comparison_limitations": _COHORT_LIMITATIONS,
+                "yoy_supported": False}
+    finally:
+        conn.rollback()
+        conn.close()
+
+    value = {
+        "verified_open_date": _jsonable(row["verified_open_date"]) if row else None,
+        "open_date_source": row["open_date_source"] if row else None,
+        "open_date_confidence": row["open_date_confidence"] if row else "unknown",
+        "revel_account_created_date": (
+            _jsonable(row["revel_account_created_date"]) if row else None),
+        "first_seen_real_order_date": (
+            _jsonable(row["first_seen_real_order_date"]) if row else None),
+        "available_history_start": (
+            _jsonable(row["available_history_start"]) if row else None),
+        "available_history_days": row["available_history_days"] if row else None,
+        "available_history_weeks": row["available_history_weeks"] if row else None,
+        "history_truncated": row["history_truncated"] if row else None,
+        "weeks_since_open": row["weeks_since_open"] if row else None,
+        "maturity_threshold_status": (
+            row["maturity_threshold_status"] if row
+            else "no maintained threshold configured"),
+        "comparison_limitations": _COHORT_LIMITATIONS,
+        "yoy_supported": False,
+        "earliest_data_network_wide": "2026-01-01",
+    }
+    _cohort_cache[establishment_id] = {"value": value, "at": now}
+    return value
+
+
 def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
     """Structured completeness/trust profile for one analysis scope.
 
@@ -1157,6 +1300,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 cur.execute(_DEEP_SQL, params)
                 deep = dict(cur.fetchone())
 
+            _cohort_block = _cohort_context(establishment_id)
             if establishment_id is None:
                 store = "ALL STORES"
             else:
@@ -1317,6 +1461,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "note": "REAL orders are expected to have a payment. EMPTY and COMP "
                     "orders legitimately have none -- absence is not lost revenue.",
         },
+        "store_cohort": _cohort_block,
         "time": {
             "source_timezone": "America/Chicago",
             "timestamp_semantics": (
