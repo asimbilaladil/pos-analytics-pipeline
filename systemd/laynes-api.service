@@ -1,0 +1,22 @@
+[Unit]
+Description=Laynes Intelligence API (FastAPI/uvicorn — analytics assistant backend)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/root/pos-analytics-pipeline
+# Bound to loopback only: nginx is the sole way in, so port 8700 is never
+# reachable from the internet even if a firewall rule is missed.
+ExecStart=/root/pos-analytics-pipeline/venv/bin/uvicorn backend.api:app \
+    --host 127.0.0.1 --port 8700 --proxy-headers --forwarded-allow-ips 127.0.0.1
+# No secrets here. backend/api.py loads .env itself (mode 600, gitignored),
+# which keeps credentials out of this world-readable unit file.
+Environment=API_COOKIE_SECURE=1
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
