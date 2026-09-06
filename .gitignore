@@ -28,3 +28,6 @@ venv/
 
 # Claude Code local settings (contains a PGPASSWORD literal)
 .claude/settings.local.json
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
