@@ -167,6 +167,20 @@ VIEW v_orders_time_context  -- the time contract (migration 29)
   USE local_weekday_iso for weekday questions. features_*_v2.day_of_week uses a
   DIFFERENT convention (Monday=0..Sunday=6) and EXTRACT(dow) a third (Sunday=0).
 
+VIEW v_order_channel_context  -- channel context (migration 33)
+  order_id, establishment_id, business_date,
+  channel_code                      -- RAW orders_v2.dining_option integer
+  channel_source_field
+  channel_group                     -- 'web_associated' | 'non_web_associated'
+                                    -- ORDERING PATTERN, not a service mode
+  channel_group_confidence          -- 'verified_structural'
+  channel_name_project_convention   -- drive_through/eat_in/to_go/doordash/...
+  channel_name_confidence           -- 'project_convention_unverified'
+  web_order, possible_code_source_mismatch
+  Business data: needs store + period scope. The GROUP is verified but says
+  only how the order REACHED the POS. There is NO verified drive-thru / dine-in
+  / takeout / delivery mapping -- always give the raw code.
+
 VIEW v_product_category_current  -- CURRENT category reference (migration 32)
   product_id, establishment_id, product_name, category_id, category_name,
   parent_category_id, parent_category_name, mapping_source,
@@ -427,6 +441,71 @@ STORE AGE — unknown for every store, and that is the answer:
   * Before comparing one store to others, state the age/history context first:
     if a store has materially less data than its peers, say so before
     interpreting its numbers.
+"""
+
+CHANNEL_RULES = """\
+CHANNELS — no verified service-mode names exist. Read this before answering:
+
+  * THERE IS NO VERIFIED MAPPING from dining_option code to Drive Thru, Dine In,
+    Takeout or Delivery. Every Revel naming endpoint 404s and the Order schema
+    declares dining_option as a bare integer. So a "verified drive-thru share"
+    DOES NOT EXIST and you must say so when asked.
+  * What IS verified is an ORDERING-PATTERN split: channel_group is
+    'web_associated' or 'non_web_associated', corroborated by web_order and
+    payments.online agreeing independently across ~150k orders. This describes
+    how the order REACHED the POS. It is NOT a service mode:
+      web_associated     != delivery, != off-premise
+      non_web_associated != dine-in, != drive-thru, != on-premise
+    Never translate one into the other.
+  * channel_name_project_convention (drive_through, eat_in, to_go, doordash,
+    ubereats, online) is an UNVERIFIED project convention. You may quote it, but
+    only labelled as such -- e.g. "under the project-maintained convention
+    (UNVERIFIED), code 4 is labelled Drive Thru and is 67.8% of REAL orders".
+    Never state it as a verified channel fact, and never drop the label to make
+    a sentence read better. The convention even names codes 105/106 as drive-thru
+    lanes, and neither has ever occurred in this account's data.
+  * ALWAYS give the raw channel_code alongside any name.
+  * NEVER infer a channel from a product name, payment type, category,
+    ProductClass or station id. Only dining_option and web_order speak to it.
+  * possible_code_source_mismatch means the code's usual web association and the
+    web_order flag disagree ON THE RECORD. Report it as a metadata
+    inconsistency -- "3 orders show inconsistent channel metadata" -- NEVER as a
+    mis-ring, never as staff error, never as an accusation about a store or
+    shift. Always give the count and share.
+  * A numerical match to an earlier analysis does NOT verify semantics. If a
+    prior report said ~64% Drive Thru and code 4 is 64.66% of revenue, that is
+    consistent with the same unverified convention having been used -- it is not
+    independent confirmation that code 4 means Drive Thru. Say that explicitly.
+  * CHANNEL PRICE INDEX IS UNAVAILABLE. Only 6 products were sold under both
+    groups at Nederland in June, with 1-2 sales each on the smaller side, and A5
+    showed the catalogue carries channel-specific duplicate product records. Do
+    NOT compare prices across channels by product name, and do NOT treat
+    differently-numbered products as the same item.
+  * State channel mapping coverage, and leave unknown codes unknown.
+
+PRODUCT-NAME QUESTIONS ("which channel sold the most X"):
+  * A menu item can exist as SEVERAL product records with no maintained
+    equivalence between them. At Nederland in June "5 Finger" resolves to:
+      14548 "** 5 Finger Spicy **"    798 units, combo-component rows, codes 0/1/4
+      14547 "** 5 Finger Regular **"  424 units, combo-component rows, codes 0/1/4
+      14414 "5 Finger Meal*"          214 units, single-line combo,   codes 100/101/5/8
+      14640 "25 Finger Party Pack*"     1 unit  -- substring FALSE MATCH, exclude
+    The combo-component form and the single-line-combo form are CHANNEL-DISJOINT,
+    so a single merged ranking is not a fact about the business -- it is an
+    artefact of which records you chose to add together.
+  * So: resolve the exact product_ids first, drop substring false matches, and
+    REPORT BY VARIANT. Give each product record its own row with its own channel
+    split. Do NOT declare one cross-variant winner, and do NOT merge product ids
+    into one SKU -- no maintained equivalence table exists. Say that explicitly.
+  * Never use product_name LIKE to sum quantities across records as though they
+    were one product.
+
+BOUNDED TOOL PLAN — for a scoped historical question:
+    check_data -> at most one discovery query to resolve ids -> ONE aggregate
+    query -> answer.
+  Three to four tool calls. Once the ids are resolved, run the aggregate and
+  answer from it. Do NOT re-query hunting for a different, larger or non-zero
+  result: a zero or an awkward result is still the answer.
 """
 
 CATEGORY_RULES = """\
@@ -727,6 +806,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {GUARDRAILS}
 {ENTREE_RULES}
 {COHORT_RULES}
+{CHANNEL_RULES}
 {CATEGORY_RULES}
 {TIME_RULES}
 {PAYMENT_RULES}
@@ -860,6 +940,8 @@ _ALLOWED_RELATIONS = frozenset({
     # product_category_mapping itself is NOT granted.
     "v_order_items_category_context", "v_category_review_queue",
     "v_product_category_current",
+    # A8 (migration 33). Channel context: verified group + unverified names.
+    "v_order_channel_context",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1224,6 +1306,17 @@ pay AS (
            (SELECT COUNT(*) FROM pay_rows WHERE n > 1)            AS split_tender_count,
            (SELECT COALESCE(SUM(refunded), 0) FROM pay_rows)      AS refunded_payment_count
 ),
+chan AS (
+    SELECT COUNT(*)                                                     AS chan_orders,
+           COUNT(*) FILTER (WHERE cc.channel_group <> 'unknown')         AS chan_mapped,
+           COUNT(*) FILTER (WHERE cc.possible_code_source_mismatch)      AS chan_mismatch,
+           COALESCE(SUM(o.final_total), 0)                               AS chan_rev,
+           COALESCE(SUM(o.final_total) FILTER (WHERE cc.channel_group <> 'unknown'), 0)
+                                                                         AS chan_mapped_rev
+    FROM v_orders_classified o
+    JOIN real_scope rs ON rs.id = o.id
+    JOIN v_order_channel_context cc ON cc.order_id = o.id
+),
 cat AS (
     SELECT COUNT(*)                                                  AS cat_items,
            COUNT(*) FILTER (WHERE cc.category_id IS NOT NULL)         AS cat_mapped_items,
@@ -1238,7 +1331,7 @@ cat AS (
     LEFT JOIN v_order_items_category_context cc ON cc.order_item_id = i.id
     WHERE i.deleted IS NOT TRUE AND i.is_voided IS NOT TRUE
 )
-SELECT * FROM i_agg, orph, pay, cat
+SELECT * FROM i_agg, orph, pay, cat, chan
 """
 
 
@@ -1386,7 +1479,10 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                     "orphan_order_items": None, "cat_items": None,
                     "cat_mapped_items": None, "cat_hist_items": None,
                     "cat_revenue": None, "cat_mapped_revenue": None,
-                    "cat_hist_revenue": None, "orders_with_payment": None,
+                    "cat_hist_revenue": None, "chan_orders": None,
+                    "chan_mapped": None, "chan_mismatch": None,
+                    "chan_rev": None, "chan_mapped_rev": None,
+                    "orders_with_payment": None,
                     "orders_without_payment": None, "split_tender_count": None,
                     "refunded_payment_count": None}
             deep_evaluated = int(r["order_rows"] or 0) <= _DEEP_SCOPE_ROW_LIMIT
@@ -1554,6 +1650,63 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             },
             "note": "REAL orders are expected to have a payment. EMPTY and COMP "
                     "orders legitimately have none -- absence is not lost revenue.",
+        },
+        "channel_mapping": {
+            "status": "ordering_pattern_verified_service_mode_unverified",
+            "source": "orders_v2.dining_option (+ web_order corroboration)",
+            "group_meaning": ("web_associated / non_web_associated describes how "
+                              "the order reached the POS. It is NOT a service "
+                              "mode: it does not establish drive-thru, dine-in, "
+                              "takeout or delivery."),
+            "service_mode_mapping": "unavailable",
+            "group_confidence": "verified_structural",
+            "name_confidence": "project_convention_unverified",
+            "historical_verified": True,
+            "mapped_order_pct": _pct_of(deep["chan_mapped"], deep["chan_orders"]),
+            "mapped_revenue_pct": _pct_of(deep["chan_mapped_rev"], deep["chan_rev"]),
+            "unknown_order_count": (
+                None if deep["chan_orders"] is None
+                else int(deep["chan_orders"]) - int(deep["chan_mapped"])),
+            "unknown_revenue": (
+                None if deep["chan_rev"] is None
+                else round(float(deep["chan_rev"]) - float(deep["chan_mapped_rev"]), 2)),
+            "limitations": (
+                "No Revel source names these codes -- every candidate endpoint "
+                "404s and the Order schema declares dining_option as a bare "
+                "integer. The on/off-premise GROUP is verified by web_order and "
+                "payments.online agreeing independently; the NAMES are this "
+                "project's own convention, which even defines codes 105/106 that "
+                "have never occurred. Report the raw code. A numerical match to "
+                "an earlier report does not verify the semantics."),
+        },
+        "misring_detection": {
+            "status": "signal_only",
+            "methodology": ("orders where the code's usual web association and "
+                            "the web_order flag disagree on the record"),
+            "finding_type": "metadata_inconsistency",
+            "confidence": "suspected_only",
+            "suspected_count": deep["chan_mismatch"],
+            "suspected_pct": _pct_of(deep["chan_mismatch"], deep["chan_orders"]),
+            "limitations": ("A single contradicting field is NOT proof of a "
+                            "mis-ring. It is a record-keeping inconsistency, not "
+                            "an established fact about how food was served. "
+                            "Report it quantified, never as a confirmed "
+                            "operational finding or an accusation."),
+        },
+        "channel_price_index": {
+            "status": "unavailable",
+            "methodology": "same product_id across channels, realised unit price",
+            "comparability_coverage": (
+                "insufficient: only 6 products were sold under both channel "
+                "groups at Nederland in June 2026, with 1-2 sales each on the "
+                "smaller side"),
+            "limitations": (
+                "The catalogue carries channel-specific duplicate product "
+                "records (A5), so differently-numbered products must not be "
+                "treated as the same item. price is a UNIT price and "
+                "pure_sales = price x quantity excluding tax, but 8% of "
+                "standalone lines diverge (discounts), so realised price needs "
+                "care even within one channel."),
         },
         "category_mapping": {
             "status": "current_only",
