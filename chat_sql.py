@@ -167,6 +167,23 @@ VIEW v_orders_time_context  -- the time contract (migration 29)
   USE local_weekday_iso for weekday questions. features_*_v2.day_of_week uses a
   DIFFERENT convention (Monday=0..Sunday=6) and EXTRACT(dow) a third (Sunday=0).
 
+VIEW v_order_identity_context  -- per-order identity (migration 34)
+  order_id, establishment_id, business_date, txn_class,
+  has_customer_identity, anonymous_flag,
+  safe_customer_key   -- opaque hash; no name/email/phone exists in this DB
+  final_total
+
+VIEW v_identity_profile  -- aggregate behaviour per opaque identity (WHOLE HISTORY)
+  safe_customer_key, visits_all_time, distinct_establishments,
+  pct_web_associated, first_seen, last_seen,
+  suspected_non_individual  -- SUSPECTED marketplace account, not confirmed
+  This view groups EVERY identified order, so do NOT join it row-wise to a
+  scoped query -- the grouping cannot be pushed down and the join takes ~10s and
+  can hit the statement timeout. Instead either (a) read
+  identity.suspected_non_individual_customers from check_data, or (b) query this
+  view on its own to list the suspected keys, then exclude them in a separate
+  scoped aggregate over v_order_identity_context.
+
 VIEW v_order_channel_context  -- channel context (migration 33)
   order_id, establishment_id, business_date,
   channel_code                      -- RAW orders_v2.dining_option integer
@@ -441,6 +458,67 @@ STORE AGE — unknown for every store, and that is the answer:
   * Before comparing one store to others, state the age/history context first:
     if a store has materially less data than its peers, say so before
     interpreting its numbers.
+"""
+
+IDENTITY_RULES = """\
+CUSTOMER IDENTITY — a small, biased subset. Never speak for everyone:
+
+  * identity_capture_rate = identified REAL transactions / ALL REAL transactions,
+    on a 0-100 scale. Nederland June 2026 is 10.69% (488 of 4,565). NEVER use
+    identified customers as the denominator.
+  * Metrics from identified customers describe THE IDENTIFIED SUBSET, not "our
+    customers". Say "among customers identifiable in Revel..." and give the
+    capture rate. Below 30% capture, do NOT characterise anything as
+    representative of customers generally; 30-80% needs a strong caveat; 80%+
+    still needs the subset named.
+  * ANONYMOUS MEANS UNKNOWN, NOT NON-MEMBER. Loyalty data IS available upstream
+    in Revel's Order.gift_reward_data, but it is PII-bearing and was not
+    historically ingested into this analytics database. You therefore CANNOT
+    perform historical loyalty-member analysis until the safe loyalty backfill
+    is completed. Do NOT say loyalty does not exist -- say it is not yet
+    ingested. So you cannot answer "do loyalty customers spend more" YET;
+    explain that limitation rather than refusing as impossible. You MAY compare
+    identified vs unidentified transactions if you label them exactly that way.
+  * CUSTOMER IDENTITY IS NOT LOYALTY MEMBERSHIP. An identified customer_id says
+    an order was linked to a customer record; it says NOTHING about whether that
+    person is a loyalty member. Never treat identified/unidentified as a proxy
+    for member/non-member.
+  * OPERATOR IDS ARE NOT CUSTOMERS. created_by_user_id, updated_by_user_id,
+    voided_by_user_id, discounted_by_user_id, opened_by_user_id and
+    closed_by_user_id identify STAFF. Never treat them as customer identity.
+  * SOME IDENTIFIED IDS ARE NOT PEOPLE, but that is a HEURISTIC, not a verified
+    fact. 23 identified IDs hold 78.5% of all identified visits network-wide; at
+    Nederland in June, 2 of the 88 IDs hold 389 of 488 visits.
+    CHECK suspected_non_individual BEFORE any per-ID average -- read the count
+    from check_data's identity block, or query v_identity_profile ON ITS OWN (it
+    is ungated reference data) and exclude those keys in a separate scoped
+    aggregate. Do NOT join that profile view row-wise into a scoped query: it
+    groups every identified order in history and will hit the statement timeout.
+  * ALWAYS SHOW BOTH, never the filtered figure alone:
+        RAW IDENTIFIED IDS   88 IDs, 5.55 visits/ID, 10 with 2+ visits
+        AFTER EXCLUDING SUSPECTED NON-INDIVIDUAL IDS
+                             86 IDs, ~1.15 visits/ID, 8 with 2+ visits
+    The filtered view never silently replaces the raw one. State the exclusion
+    every time you apply it.
+  * TERMINOLOGY, exactly:
+      say "identified customer references" or "identified IDs"
+      say "suspected non-individual IDs"
+      say "after excluding suspected non-individual IDs"
+      do NOT say "after removing platform accounts" or "marketplace accounts" --
+          those IDs have NOT been manually verified as such
+      do NOT call the remaining IDs proven, real or human customers.
+          "human-like subset" is acceptable only if qualified as heuristic.
+  * REPEAT CUSTOMER must state its window: ">=2 REAL transactions AT THIS STORE
+    WITHIN THE ANALYSED PERIOD" is not "a repeat customer historically". Say
+    which you computed.
+  * UNIQUE CUSTOMERS CANNOT BE COUNTED. With ~11% identity capture, the number
+    of distinct identifiable customers is NOT the number of unique guests. Say
+    "N identifiable customers" and state plainly that total unique customers
+    cannot be determined from this data.
+  * NO CAUSAL CLAIMS. "Identified transactions averaged $X vs $Y" is allowed.
+    "Loyalty makes customers spend more" is not -- identification correlates
+    with channel (identified orders are overwhelmingly third-party/web), so the
+    gap is confounded by channel, not shown to be caused by membership.
 """
 
 CHANNEL_RULES = """\
@@ -806,6 +884,7 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {GUARDRAILS}
 {ENTREE_RULES}
 {COHORT_RULES}
+{IDENTITY_RULES}
 {CHANNEL_RULES}
 {CATEGORY_RULES}
 {TIME_RULES}
@@ -942,6 +1021,9 @@ _ALLOWED_RELATIONS = frozenset({
     "v_product_category_current",
     # A8 (migration 33). Channel context: verified group + unverified names.
     "v_order_channel_context",
+    # A11 (migration 34). Identity context; safe_customer_key is an opaque hash
+    # and no customer PII exists anywhere in this database.
+    "v_order_identity_context", "v_identity_profile",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1306,6 +1388,14 @@ pay AS (
            (SELECT COUNT(*) FROM pay_rows WHERE n > 1)            AS split_tender_count,
            (SELECT COALESCE(SUM(refunded), 0) FROM pay_rows)      AS refunded_payment_count
 ),
+ident AS (
+    SELECT COUNT(*) FILTER (WHERE o.customer_id IS NOT NULL)          AS ident_txn,
+           COUNT(DISTINCT o.customer_id)                              AS ident_cust,
+           COUNT(DISTINCT o.customer_id) FILTER (
+               WHERE o.customer_id = ANY(%(nonind)s))                 AS ident_nonind
+    FROM v_orders_classified o
+    JOIN real_scope rs ON rs.id = o.id
+),
 chan AS (
     SELECT COUNT(*)                                                     AS chan_orders,
            COUNT(*) FILTER (WHERE cc.channel_group <> 'unknown')         AS chan_mapped,
@@ -1331,7 +1421,7 @@ cat AS (
     LEFT JOIN v_order_items_category_context cc ON cc.order_item_id = i.id
     WHERE i.deleted IS NOT TRUE AND i.is_voided IS NOT TRUE
 )
-SELECT * FROM i_agg, orph, pay, cat, chan
+SELECT * FROM i_agg, orph, pay, cat, chan, ident
 """
 
 
@@ -1451,6 +1541,45 @@ def _cohort_context(establishment_id) -> dict:
     return value
 
 
+
+# The suspected-marketplace identities are a small, slowly-changing set (23 of
+# 16,297 network-wide). Deriving them inside meta_extract meant re-aggregating
+# every identified order on every gated question -- 1.0s -> 5.9s. They change at
+# most once per nightly sync, so the id list is cached and passed as a parameter.
+_NONIND_TTL_SECONDS = 3600
+_nonind_cache: dict = {"ids": None, "at": 0.0}
+
+
+def _suspected_non_individual_ids() -> list[int]:
+    now = time.time()
+    if (_nonind_cache["ids"] is not None
+            and now - _nonind_cache["at"] < _NONIND_TTL_SECONDS):
+        return _nonind_cache["ids"]
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute("""
+                SELECT o.customer_id
+                FROM v_orders_classified o
+                WHERE o.txn_class = 'REAL' AND o.customer_id IS NOT NULL
+                GROUP BY o.customer_id
+                HAVING (COUNT(DISTINCT o.establishment_id) >= 6
+                        AND 100.0 * COUNT(*) FILTER (WHERE o.web_order)
+                            / COUNT(*) >= 90)
+                    OR COUNT(*) >= 365
+            """)
+            ids = [r[0] for r in cur.fetchall()]
+    except psycopg2.Error:
+        return []
+    finally:
+        conn.rollback()
+        conn.close()
+    _nonind_cache.update({"ids": ids, "at": now})
+    return ids
+
+
 def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
     """Structured completeness/trust profile for one analysis scope.
 
@@ -1471,6 +1600,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                                              datetime.min.time(), tzinfo=tz),
                 "ts_end": datetime.combine(date.fromisoformat(period_end),
                                            datetime.min.time(), tzinfo=tz),
+                "nonind": _suspected_non_individual_ids(),
             }
             cur.execute(_META_SQL, params)
             r = dict(cur.fetchone())
@@ -1482,6 +1612,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                     "cat_hist_revenue": None, "chan_orders": None,
                     "chan_mapped": None, "chan_mismatch": None,
                     "chan_rev": None, "chan_mapped_rev": None,
+                    "ident_txn": None, "ident_cust": None, "ident_nonind": None,
                     "orders_with_payment": None,
                     "orders_without_payment": None, "split_tender_count": None,
                     "refunded_payment_count": None}
@@ -1651,6 +1782,50 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "note": "REAL orders are expected to have a payment. EMPTY and COMP "
                     "orders legitimately have none -- absence is not lost revenue.",
         },
+        "identity": {
+            "status": "identity_only_loyalty_not_yet_ingested",
+            "identity_field_source": "orders_v2.customer_id",
+            "loyalty_membership": (
+                "NOT INGESTED, not non-existent. Loyalty is available upstream "
+                "in Revel Order.gift_reward_data but is PII-bearing and was "
+                "not historically ingested here. Historical loyalty-member "
+                "analysis is unavailable until the safe loyalty backfill "
+                "completes. Customer identity is NOT loyalty membership."),
+            "real_transactions": real,
+            "identified_transactions": (
+            None if deep["ident_txn"] is None else int(deep["ident_txn"])),
+            "unidentified_transactions": (
+            None if deep["ident_txn"] is None
+            else real - int(deep["ident_txn"])),
+            "identity_capture_rate": _pct_of(deep["ident_txn"], real),
+            "heuristic_status": ("suspected_non_individual is an evidence-led "
+                                 "heuristic, NOT a verified business rule; those "
+                                 "IDs have not been manually confirmed"),
+            "reporting_rule": ("report RAW identified-ID figures and the figures "
+                               "after excluding suspected non-individual IDs "
+                               "TOGETHER; the filtered view never replaces the raw "
+                               "one without disclosure"),
+            "distinct_identified_customers": (
+            None if deep["ident_cust"] is None else int(deep["ident_cust"])),
+            "suspected_non_individual_ids": (
+            None if deep["ident_nonind"] is None else int(deep["ident_nonind"])),
+            "selection_bias_status": "material" if (
+            deep["ident_txn"] is not None and real
+            and (int(deep["ident_txn"]) / real) < 0.30) else "check_capture_rate",
+            "advisory_only": True,
+            "limitations": (
+            "identity_capture_rate is ADVISORY and never affects the A12 "
+            "reconciliation status -- data completeness and identity "
+            "completeness are different things. Identified customers are a "
+            "self-selected subset and are NOT all customers; total unique "
+            "guests cannot be determined. Anonymous means unknown, NOT "
+            "non-member, and identity is NOT loyalty membership. Loyalty "
+            "exists upstream in Revel but is not yet ingested here, so "
+            "historical loyalty analysis is unavailable rather than "
+            "impossible. Some identified accounts "
+            "are suspected marketplace accounts rather than people -- check "
+            "suspected_non_individual before any per-customer average."),
+            },
         "channel_mapping": {
             "status": "ordering_pattern_verified_service_mode_unverified",
             "source": "orders_v2.dining_option (+ web_order corroboration)",
@@ -1765,7 +1940,11 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "period_end_inclusive_weekday_name": (
                 (date.fromisoformat(period_end) - timedelta(days=1)).strftime("%A")),
         },
-        "identity_capture_rate": float(r["identity_capture_rate"] or 0),
+        # 0-100 scale, matching identity.identity_capture_rate and every other
+        # rate in this payload. It was a 0-1 fraction while the A11 block used
+        # 0-100, i.e. the same name meaning two different things -- exactly the
+        # scale hazard that produced a hundredfold reporting error before.
+        "identity_capture_rate": round(float(r["identity_capture_rate"] or 0) * 100.0, 2),
         "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,
         "warnings": [],
     }
@@ -1841,10 +2020,10 @@ def _reconcile(meta: dict) -> dict:
     # in this scope. They belong in the payload so the model reasons correctly,
     # but they must not move the gate -- if they did, every scope would be WARN
     # and the status would stop meaning anything.
-    if meta["identity_capture_rate"] < 0.25:
+    if meta["identity_capture_rate"] < 25.0:
         notes.append(
             f"identity captured on only "
-            f"{meta['identity_capture_rate'] * 100:.1f}% of REAL transactions -- "
+            f"{meta['identity_capture_rate']:.1f}% of REAL transactions -- "
             "customer-level conclusions are selection-biased, not representative")
 
     # A3 entrée coverage. An advisory, not a gate condition: unreviewed products
@@ -1901,6 +2080,12 @@ _REFERENCE_RELATIONS = frozenset({
     # or payment row -- so there is no period to reconcile. The HISTORICAL view
     # (v_order_items_category_context) joins order_items_v2 and stays gated.
     "v_product_category_current",
+    # Whole-history aggregate behaviour per OPAQUE key: no per-order rows, no
+    # dates to scope, no PII, no revenue. Gating it as business data was a
+    # mistake -- the model was told to query it standalone, then rejected for
+    # not declaring a period it has no column for. The per-order view
+    # (v_order_identity_context) stays gated.
+    "v_identity_profile",
 })
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
