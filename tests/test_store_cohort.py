@@ -137,6 +137,38 @@ def main() -> int:
           meta["time"]["business_date_method"] == "local_calendar_date")
     check("REAL count unchanged", meta["volumes"]["real_count"] == 4565)
 
+    # ── A7 consistency: the prompt must not assert an opening date ──────────
+    # DATA_NOTES once said "LCF Cypress (id 54) opened in June 2026", which
+    # contradicted the cohort view's deliberate verified_open_date = NULL.
+    # Cypress is the one store whose history is NOT truncated, so the temptation
+    # to read first-seen as opening is strongest exactly there.
+    print("\n=== Z. prompt asserts no opening date for Cypress ===")
+    flat = re.sub(r"\s+", " ", cs.DATA_NOTES + cs.COHORT_RULES)
+    # Every mention of the phrase must be a PROHIBITION, never an assertion.
+    # Counting bare occurrences would fail on the prohibition itself, and
+    # dropping the check would let a real assertion slip back in.
+    asserted = [m.start() for m in re.finditer(r"Cypress[^.]{0,20}opened in June", flat)
+                if not flat[max(0, m.start() - 12):m.start()].rstrip().endswith("Do NOT say")]
+    check("prompt never ASSERTS that Cypress opened in June",
+          not asserted, f"{len(asserted)} bare assertion(s)")
+    check("the old affirmative sentence is gone",
+          "Cypress (id 54) opened in June 2026" not in flat)
+    check("prompt states it as a fact about our DATA, not the store",
+          "NO observed sales history in this database before June 2026" in flat)
+    check("prompt explicitly forbids calling it an opening date",
+          "Do NOT say Cypress opened in June" in flat)
+    check("prompt forbids reading first-seen as an opening date",
+          "do NOT treat the first date we can see as an opening date" in flat)
+    check("operational purpose preserved: missing history is not a decline",
+          "as a real decline" in flat)
+    cur.execute("""SELECT verified_open_date, open_date_confidence
+                   FROM v_store_cohort WHERE establishment_id = 54""")
+    row = cur.fetchone()
+    check("Cypress verified_open_date is still NULL", row[0] is None)
+    check("Cypress open_date_confidence is still 'unknown'", row[1] == "unknown")
+    cur.execute("SELECT COUNT(*) FROM v_store_cohort WHERE verified_open_date IS NOT NULL")
+    check("no store has a verified opening date", cur.fetchone()[0] == 0)
+
     conn.close()
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")

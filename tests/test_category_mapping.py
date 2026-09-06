@@ -265,6 +265,72 @@ def main() -> int:
     cur.execute("SELECT COUNT(*) FROM product_category_mapping WHERE snapshot_taken_at IS NULL")
     check("every mapping row is snapshot-stamped", cur.fetchone()[0] == 0)
 
+    # ── A9 consistency: the unavailable-metrics list must not contradict A5 ──
+    # This block exists because it once did: UNAVAILABLE_METRICS claimed
+    # "products.category_id is NULL for every row and no category source could
+    # be verified", which A5 disproved, while the model answered category
+    # questions anyway -- right answer, but reached by ignoring its own
+    # authoritative list.
+    print("\n=== M. category is NOT listed as an unavailable metric ===")
+    check("product_category_mix is absent from UNAVAILABLE_METRIC_KEYS",
+          "product_category_mix" not in cs.UNAVAILABLE_METRIC_KEYS)
+    flat_unavail = re.sub(r"\s+", " ", cs.UNAVAILABLE_METRICS)
+    check("stale 'category_id is NULL' claim is gone",
+          "category_id is NULL for every row" not in flat_unavail)
+    check("stale 'no category source could be verified' claim is gone",
+          "no category source could be verified" not in flat_unavail)
+    check("genuinely unavailable metrics are NOT weakened",
+          all(k in cs.UNAVAILABLE_METRIC_KEYS for k in (
+              "order_duration_or_service_time", "drive_thru_timing",
+              "comp_vs_discount_separation",
+              "store_age_and_weeks_since_open_all_stores")))
+
+    print("=== N. category analysis routes through the A5 views ===")
+    flat_cat = re.sub(r"\s+", " ", cs.CATEGORY_RULES)
+    check("historical analysis names v_order_items_category_context",
+          "v_order_items_category_context" in flat_cat)
+    check("current lookup names v_product_category_current",
+          "v_product_category_current" in flat_cat)
+    check("both A5 views are in the relation allowlist",
+          {"v_order_items_category_context", "v_product_category_current"}
+          <= cs._ALLOWED_RELATIONS)
+    check("category is sourced from Revel Product.category",
+          "Product.category" in flat_cat)
+
+    print("=== O. historical needs scope + gate; current reference does not ===")
+    check("historical category view is scope-gated (not reference)",
+          "v_order_items_category_context" not in cs._REFERENCE_RELATIONS)
+    check("current category view is ungated reference",
+          "v_product_category_current" in cs._REFERENCE_RELATIONS)
+    check("prompt requires store+period+gate for historical category",
+          "Declare store and period, pass the gate" in flat_cat)
+    check("prompt allows reference lookup with no store/period/reconciliation",
+          "No store, no period, no reconciliation needed" in flat_cat)
+
+    print("=== P. current mapping must never be silently backdated ===")
+    check("prompt forbids using the reference view for historical questions",
+          "The reference view must NOT be used to answer these" in flat_cat)
+    check("prompt names the silent-backdating failure mode",
+          "silently apply today's mapping to the past" in flat_cat)
+
+    print("=== Q. ProductClass is not ProductCategory (permanent constraint) ===")
+    check("prompt forbids product_class as category",
+          "NEVER use products.product_class as a" in flat_cat)
+    check("prompt states they are different namespaces",
+          "DIFFERENT namespace" in flat_cat)
+    cur.execute("""SELECT COUNT(DISTINCT p.product_id) FROM products pr
+                   JOIN product_analysis_classification p ON p.product_id = pr.id
+                   WHERE pr.product_class LIKE '%%/166/' AND p.is_entree""")
+    check("product_class 166 still contains entrees (route stays disproven)",
+          cur.fetchone()[0] > 0)
+
+    print("=== R. historical coverage caveat remains active ===")
+    check("coverage bands are stated", "80-95%" in flat_cat and ">= 95%" in flat_cat)
+    check("sub-80% ranking is not authoritative",
+          "do NOT present a category ranking as authoritative" in flat_cat)
+    check("Nederland June coverage names the limitation",
+          "must carry the limitation" in flat_cat)
+
     conn.close()
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")

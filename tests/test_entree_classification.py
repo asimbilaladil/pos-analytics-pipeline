@@ -145,8 +145,16 @@ def main() -> int:
           and "cannot be answered from this database today" not in prompt)
     check("entrées per check is not listed as unavailable",
           "entrees_per_check" not in cs.UNAVAILABLE_METRIC_KEYS)
-    check("category mix is still listed as unavailable",
-          "product_category_mix" in cs.UNAVAILABLE_METRIC_KEYS)
+    # Written during A3, when category analysis genuinely was unavailable; the
+    # intent was "A3 must not accidentally unlock category". A5 later unlocked
+    # it legitimately, so assert the separation that actually matters instead:
+    # entree classification and category remain distinct dimensions.
+    check("category mix is no longer listed as unavailable (A5 delivered it)",
+          "product_category_mix" not in cs.UNAVAILABLE_METRIC_KEYS)
+    check("entree classification is not substituted for category",
+          "Category is NOT entrée classification" in cs.CATEGORY_RULES)
+    check("category rules keep entree fields out of the category dimension",
+          "is_entree, product_form" in cs.CATEGORY_RULES)
     check("items-per-order guardrail present", "ITEMS PER ORDER" in prompt)
     check("guardrail forbids leading with the raw count",
           "never lead with it" in prompt.lower())

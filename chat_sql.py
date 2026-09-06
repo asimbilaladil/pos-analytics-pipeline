@@ -319,8 +319,13 @@ KNOWN DATA QUIRKS — account for these:
     multi-hour average). If a kitchen-time figure looks physically
     implausible (> ~1800 s), say so and treat it as a data artefact rather
     than real prep time; offer to check order-level detail.
-  * LCF Cypress (id 54) opened in June 2026 — it has no data before then;
-    don't report $0 for Cypress in earlier periods as a real decline.
+  * LCF Cypress (id 54) has NO observed sales history in this database before
+    June 2026. That is a statement about our data, NOT about the store: its
+    verified_open_date is NULL and its open_date_confidence is 'unknown', like
+    every other store. Do NOT say Cypress opened in June, and do NOT treat the
+    first date we can see as an opening date. Equally, do NOT report $0 for
+    Cypress in earlier periods as a real decline — there is no history to
+    decline from.
   * Historical order data currently goes back to 2026-01-01; feature tables
     (features_*_v2) are being backfilled and may start later than that —
     check the min(date) if a question reaches far back.
@@ -372,10 +377,10 @@ substitute a proxy or derive an estimate:
       Both flow through discount_total_amount; discount_reason is free text and
       is empty on effectively all orders. You can report total discounts, not
       the comp share of them.
-  * category mix / combo attach by category
-      products.category_id is NULL for every row and no category source could be
-      verified, so any per-category breakdown is unavailable. NOTE: entrées per
-      check IS available via the maintained classification — do not refuse it.
+  * NOT LISTED HERE: category / product-category analysis. It IS available —
+      Revel's Product.category is the authoritative source and the mapping is
+      maintained. Do NOT refuse category questions; follow CATEGORY RULES for
+      which relation to use and what coverage caveat to state.
   * weeks_since_open / store age for EVERY store
       No authoritative opening date exists for any of the 12 stores, so
       verified_open_date and weeks_since_open are NULL throughout. Cohort and
@@ -391,7 +396,10 @@ UNAVAILABLE_METRIC_KEYS = [
     "order_duration_or_service_time",
     "drive_thru_timing",
     "comp_vs_discount_separation",
-    "product_category_mix",
+    # "product_category_mix" was removed here: A5 established Revel's
+    # Product.category as an authoritative source, so category analysis IS
+    # available through the A5 views. Leaving it listed made the model's own
+    # authoritative unavailable-list contradict what it could actually answer.
     "store_age_and_weeks_since_open_all_stores",
 ]
 
