@@ -1978,7 +1978,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                     "orders legitimately have none -- absence is not lost revenue.",
         },
         "identity": {
-            "status": "identity_only_loyalty_not_yet_ingested",
+            "status": "identity_captured_loyalty_tracked_separately",
             "evaluated": advisory_evaluated,
             "not_evaluated_reason": (None if advisory_evaluated else
                 "scope exceeds the advisory row limit, so identity capture was not "
@@ -1986,11 +1986,19 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 "unaffected and the FAIL-critical integrity checks still ran."),
             "identity_field_source": "orders_v2.customer_id",
             "loyalty_membership": (
-                "NOT INGESTED, not non-existent. Loyalty is available upstream "
-                "in Revel Order.gift_reward_data but is PII-bearing and was "
-                "not historically ingested here. Historical loyalty-member "
-                "analysis is unavailable until the safe loyalty backfill "
-                "completes. Customer identity is NOT loyalty membership."),
+                "SEPARATE CONCEPT, tracked in its own block. Order-level "
+                "loyalty EVIDENCE is safely ingested (see meta['loyalty']); "
+                "this identity block does not measure it. has_loyalty_payload "
+                "TRUE = 'loyalty evidence present'; FALSE = 'no loyalty "
+                "evidence observed', which must NEVER be read as "
+                "non-membership -- a member who does not identify at the till "
+                "is indistinguishable from a non-member here. A customer_id "
+                "says an order was linked to a customer record and says "
+                "NOTHING about membership, so identity capture and the loyalty "
+                "evidence rate are different measurements of different fields "
+                "and must never be merged. No membership roster exists: a "
+                "person's complete historical membership status cannot be "
+                "established from this data."),
             "real_transactions": real,
             "identified_transactions": (
             None if deep["ident_txn"] is None else int(deep["ident_txn"])),

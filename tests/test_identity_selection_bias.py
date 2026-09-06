@@ -7,6 +7,7 @@ The central risks: speaking for all customers from a ~11% identified subset,
 mistaking staff ids for customers, mistaking anonymity for non-membership, and
 computing per-customer averages over accounts that are not people.
 """
+import json
 import os
 import re
 import sys
@@ -76,10 +77,40 @@ def main() -> int:
           not [c for c in loyalty_cols
                if re.search(r"key_hash|customer_id|external", c, re.I)],
           str(loyalty_cols))
-    check("meta reports loyalty evidence as ingested",
-          idn["loyalty_membership"].startswith("NOT INGESTED") is False
-          or "evidence" in idn["loyalty_membership"].lower()
-          or "ingested" in idn["loyalty_membership"].lower())
+    # The previous version of this check was an OR chain that also passed on the
+    # stale text, because "ingested" is a substring of "NOT INGESTED". It let a
+    # contradiction survive: identity said loyalty was un-ingested while the
+    # sibling loyalty block said evidence_ingested, in the same payload.
+    lm = idn["loyalty_membership"]
+    lm_flat = re.sub(r"\s+", " ", lm)
+    check("metadata no longer says loyalty is un-ingested",
+          "NOT INGESTED" not in lm
+          and "not historically ingested" not in lm
+          and "until the safe loyalty backfill" not in lm)
+    check("metadata no longer calls loyalty analysis unavailable",
+          "analysis is unavailable" not in lm_flat)
+    check("metadata states loyalty evidence IS ingested",
+          "safely ingested" in lm_flat)
+    check("metadata states identity and loyalty are SEPARATE",
+          "SEPARATE CONCEPT" in lm_flat
+          and "must never be merged" in lm_flat)
+    check("metadata says customer_id is not membership",
+          "says NOTHING about membership" in lm_flat)
+    check("metadata forbids reading absence as non-membership",
+          "NEVER be read as non-membership" in lm_flat
+          and "indistinguishable from a non-member" in lm_flat)
+    check("metadata disclaims complete historical membership",
+          "complete historical membership status cannot be established" in lm_flat)
+    check("identity status no longer claims loyalty is un-ingested",
+          "not_yet_ingested" not in idn["status"])
+    check("sibling loyalty block agrees loyalty is ingested",
+          meta["loyalty"]["status"] == "evidence_ingested")
+    check("no raw loyalty identifier is exposed in the identity block",
+          not any(k in json.dumps(idn).lower() for k in
+                  ("loyalty_key_hash", "externalid", "printedcardnumber",
+                   "customername", "firstname", "lastname", "phonenumber")))
+    check("the two rates stay distinct measurements",
+          idn["identity_capture_rate"] != meta["loyalty"]["evidence_rate_pct"])
     check("prompt forbids equating anonymous with non-member",
           "ANONYMOUS MEANS UNKNOWN, NOT NON-MEMBER" in flat)
     check("prompt no longer claims loyalty is un-ingested",
