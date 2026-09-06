@@ -41,9 +41,22 @@ RAW_ARCHIVE_DIR = os.getenv("RAW_ARCHIVE_DIR", DEFAULT_ARCHIVE_ROOT)
 VALID_RESOURCES = {
     "orders", "order_items", "modifier_items", "payments",
     "order_history", "products", "product_categories",
+    # Timesheets are archived with `remarks` excluded at the request layer, so
+    # the archived body carries no free-text employee content. Loyalty is
+    # deliberately absent from this set: Order.gift_reward_data embeds
+    # plaintext PII that cannot be stripped server-side, so that backfill
+    # archives nothing at all (see backfill_loyalty_v2.py).
+    "timesheets",
 }
 
-_verified_roots: set[str] = set()  # avoid re-checking writability/disk space every call
+_verified_roots: set[str] = set()
+
+# The archive holds raw POS business data. Every consumer (the pipeline cron,
+# both Streamlit services, all backfills) runs as root and there are no other
+# accounts on the host, so nothing needs group/other access. Created
+# restrictively rather than relying on umask.
+ARCHIVE_DIR_MODE = 0o700
+ARCHIVE_FILE_MODE = 0o600  # avoid re-checking writability/disk space every call
 
 
 class ArchiveError(RuntimeError):
@@ -68,7 +81,7 @@ def _ensure_archive_root(base_dir: str) -> None:
         return
 
     try:
-        os.makedirs(base_dir, exist_ok=True)
+        os.makedirs(base_dir, mode=ARCHIVE_DIR_MODE, exist_ok=True)
     except OSError as exc:
         raise ArchiveError(f"cannot create archive root {base_dir}: {exc}") from exc
 
@@ -96,6 +109,107 @@ def _ensure_archive_root(base_dir: str) -> None:
     _verified_roots.add(base_dir)
 
 
+# Fields that must NEVER reach disk, per resource.
+#
+# Revel's Order.gift_reward_data embeds plaintext customerName, firstName,
+# lastName, phoneNumber and birthday in the SAME JSON value as the loyalty
+# fields, so Revel's `fields=` parameter cannot strip it server-side: the PII
+# is inside the value, not in a sibling field. The whole field is therefore
+# removed here, at the archive boundary, before anything is compressed or
+# written.
+#
+# Removal, not redaction: a redacted-in-place blob still invites someone to
+# loosen the redaction later, and leaves PII-shaped structure on disk. The key
+# is deleted outright.
+#
+# This does NOT affect analytics. archive_response only writes to disk; callers
+# still receive and parse the untouched response body in memory (see
+# fetch_all_pages: archive raw body -> json.loads). Loyalty extraction happens
+# on that in-memory copy and discards it -- see backfill_loyalty_v2.py.
+PII_FIELDS_BY_RESOURCE = {
+    "orders": ("gift_reward_data",),
+}
+
+
+def _sanitize_for_archive(resource: str, raw_text: str) -> tuple[str, dict]:
+    """Remove PII-bearing fields from a response body before it is archived.
+
+    Returns (text_to_archive, sanitation_metadata). For a resource with no
+    declared PII fields the body is returned byte-identical and untouched, so
+    every existing archive path is unchanged.
+
+    If a PII-bearing resource's body cannot be parsed, the body is WITHHELD
+    rather than archived: an unparseable body may still contain the plaintext
+    PII, and archiving a malformed body is not worth writing names and phone
+    numbers to disk. A placeholder is archived in its place so the attempt
+    remains visible and the archive stays structurally valid. This is the one
+    deliberate exception to "malformed bodies are archived too".
+    """
+    pii_fields = PII_FIELDS_BY_RESOURCE.get(resource)
+    if not pii_fields:
+        return raw_text, {"pii_sanitized": False}
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        # Deliberately records only the parser's positional complaint, never
+        # the body -- str(exc) from json includes no document content.
+        placeholder = json.dumps({
+            "objects": [],
+            "_archive_note": (
+                f"body withheld: {resource} carries PII-bearing fields "
+                f"{list(pii_fields)} and this response could not be parsed, "
+                "so the PII could not be removed"
+            ),
+        })
+        return placeholder, {
+            "pii_sanitized": True,
+            "pii_fields": list(pii_fields),
+            "body_withheld_unparseable": True,
+            "pii_sanitize_parse_error": str(exc),
+            "pii_fields_removed": 0,
+        }
+
+    removed = 0
+    objects = parsed.get("objects") if isinstance(parsed, dict) else parsed
+    if isinstance(objects, list):
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            for field in pii_fields:
+                if field in obj:
+                    del obj[field]
+                    removed += 1
+
+    return json.dumps(parsed), {
+        "pii_sanitized": True,
+        "pii_fields": list(pii_fields),
+        "body_withheld_unparseable": False,
+        "pii_fields_removed": removed,
+    }
+
+
+def _tighten_dir_modes(base_dir: str, dir_path: str) -> None:
+    """Apply ARCHIVE_DIR_MODE to every level from base_dir down to dir_path.
+
+    os.makedirs applies `mode` only to the final component, and skips it
+    entirely for levels that already exist, so intermediate resource/year/month
+    directories would otherwise keep the process umask's 755.
+    """
+    rel = os.path.relpath(dir_path, base_dir)
+    if rel.startswith(".."):
+        return
+    current = base_dir
+    for part in rel.split(os.sep):
+        current = os.path.join(current, part)
+        try:
+            if (os.stat(current).st_mode & 0o777) != ARCHIVE_DIR_MODE:
+                os.chmod(current, ARCHIVE_DIR_MODE)
+        except OSError:
+            # A permissions tweak must never fail an archive write.
+            pass
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     tmp_path = path + ".tmp"
     try:
@@ -103,6 +217,9 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        # Set the mode BEFORE the rename so the file is never briefly visible
+        # at its final path with looser permissions.
+        os.chmod(tmp_path, ARCHIVE_FILE_MODE)
         os.replace(tmp_path, path)  # atomic on the same filesystem
     except OSError as exc:
         # Clean up a half-written tmp file rather than leaving debris behind.
@@ -185,10 +302,14 @@ def archive_response(
     _ensure_archive_root(base_dir)
     fetch_time = fetch_time or datetime.now(timezone.utc)
 
+    # Strip PII-bearing fields BEFORE anything is counted, compressed or
+    # written. Everything below operates on the sanitized text only.
+    archive_text, sanitation = _sanitize_for_archive(resource, raw_text)
+
     # Best-effort only — a parse failure here is exactly the case this
     # function must still successfully archive, not reject.
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(archive_text)
         object_count = len(parsed.get("objects", [])) if isinstance(parsed, dict) else None
         total_count = parsed.get("meta", {}).get("total_count") if isinstance(parsed, dict) else None
         parse_error = None
@@ -208,7 +329,10 @@ def archive_response(
     dir_path = os.path.join(*parts)
 
     try:
-        os.makedirs(dir_path, exist_ok=True)
+        # exist_ok=True ignores mode on existing dirs, so set it explicitly on
+        # each newly created level -- makedirs applies mode only to the leaf.
+        os.makedirs(dir_path, mode=ARCHIVE_DIR_MODE, exist_ok=True)
+        _tighten_dir_modes(base_dir, dir_path)
     except OSError as exc:
         raise ArchiveError(f"cannot create archive directory {dir_path}: {exc}") from exc
 
@@ -233,7 +357,7 @@ def archive_response(
             f"(same resource/establishment/run/window/batch/page/attempt already archived)"
         )
 
-    compressed = gzip.compress(raw_text.encode("utf-8"))
+    compressed = gzip.compress(archive_text.encode("utf-8"))
     _atomic_write_bytes(json_path, compressed)
 
     meta = {
@@ -252,6 +376,7 @@ def archive_response(
         "run_id": run_id,
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "object_count": object_count,
+        **sanitation,
         "total_count": total_count,
         "parse_error": parse_error,
         "compressed_bytes": len(compressed),
