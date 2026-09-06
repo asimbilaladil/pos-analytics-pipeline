@@ -27,12 +27,14 @@ export function Sidebar({
       )}
       <aside
         className={clsx(
-          'z-40 flex h-full w-72 shrink-0 flex-col border-r border-slate-200 bg-white',
+          // h-[100dvh] + overflow-hidden: the rail is always exactly viewport
+          // height, whether there are 3 conversations or 500.
+          'z-40 flex h-[100dvh] w-72 shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white',
           'max-lg:fixed max-lg:inset-y-0 max-lg:left-0 max-lg:transition-transform',
           !open && 'max-lg:-translate-x-full',
         )}
       >
-        <div className="flex items-center justify-between px-4 pb-2 pt-4">
+        <div className="flex shrink-0 items-center justify-between px-4 pb-2 pt-4">
           <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-slate-400">
             Conversations
           </span>
@@ -51,7 +53,7 @@ export function Sidebar({
         </div>
 
         {/* The list is the only thing that scrolls; header and footer stay put */}
-        <nav className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-2 scroll-thin">
+        <nav className="min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2 pb-2 scroll-thin">
           {conversations.length === 0 ? (
             <p className="px-3 py-2 text-[13px] leading-relaxed text-slate-400">
               No conversations yet. Start a new chat and it will appear here.
@@ -90,7 +92,7 @@ export function Sidebar({
         </nav>
 
         {/* Import / Export share one row, as in the reference */}
-        <div className="flex items-center gap-2 border-t border-slate-100 p-3">
+        <div className="flex shrink-0 items-center gap-2 border-t border-slate-100 p-3">
           <input
             ref={fileRef} type="file" accept="application/json,.json" className="hidden"
             onChange={(e) => {

@@ -3,7 +3,12 @@
 @tailwind utilities;
 
 @layer base {
-  html, body, #root { height: 100%; }
+  /* The document itself must never scroll. Without overflow:hidden here the
+     app shell's h-full resolves against a document that grows with the
+     transcript, which is what let the header scroll away and made the sidebar
+     as tall as the conversation. Only two regions scroll: the conversation
+     list and the transcript. */
+  html, body, #root { height: 100%; overflow: hidden; }
   body {
     @apply bg-slate-50 text-slate-800 antialiased;
     font-family: Inter, ui-sans-serif, system-ui, sans-serif;
