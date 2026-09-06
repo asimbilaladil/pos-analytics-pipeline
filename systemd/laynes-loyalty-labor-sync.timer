@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily loyalty + labour sync at 04:15 America/Chicago
+
+[Timer]
+# The timezone is part of the OnCalendar EXPRESSION (systemd 252+). A
+# `Timezone=` key in [Timer] does NOT exist and is silently ignored -- that was
+# verified here: with it, the next elapse resolved to 04:15 UTC rather than
+# 04:15 Chicago. This is the same class of bug as the crontab's bare
+# `TZ=America/Chicago`, which is likewise not honoured on this host (its
+# 0 9 * * * entry fires at 09:00 UTC = 04:00 Chicago).
+#
+# Verify after any change with:  systemctl list-timers laynes-loyalty-labor-sync.timer
+# During CDT the next elapse must read 09:15 UTC; during CST, 10:15 UTC.
+OnCalendar=*-*-* 04:15:00 America/Chicago
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

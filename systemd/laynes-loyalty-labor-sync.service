@@ -1,0 +1,12 @@
+[Unit]
+Description=Laynes loyalty + labour incremental sync (Revel updated_date, 48h overlap)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline/sync_loyalty_labor.py
+StandardOutput=append:/var/log/laynes/loyalty_labor_sync.log
+StandardError=append:/var/log/laynes/loyalty_labor_sync.log
+TimeoutStartSec=3600

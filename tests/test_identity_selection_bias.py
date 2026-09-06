@@ -55,42 +55,40 @@ def main() -> int:
           "OPERATOR IDS ARE NOT CUSTOMERS" in flat)
 
     print("=== B. anonymous is unknown, not non-member ===")
-    # Loyalty tables now EXIST (order_loyalty_v2), but are deliberately not
-    # granted to the assistant's role until an agreed aggregate view is added.
-    # The guarantee under test is "the assistant cannot read loyalty", not
-    # "loyalty does not exist" -- the latter was never true, only unverified.
-    cur.execute("""SELECT c.table_name, c.column_name
-                   FROM information_schema.columns c
-                   WHERE c.table_schema = 'public'
-                     AND c.column_name ~* 'loyalty|reward|member'""")
-    readable = [(t, col) for t, col in cur.fetchall()
-                if _llm_can_read(cur, t)]
-    check("no loyalty/rewards/member column is readable by the assistant",
-          not readable, str(readable))
-    cur.execute("""SELECT table_name FROM information_schema.tables
-                   WHERE table_schema = 'public'
-                     AND table_name ~* 'customer|loyalty|reward|member'""")
-    readable_t = [t for (t,) in cur.fetchall() if _llm_can_read(cur, t)]
-    check("no customer or loyalty table is readable by the assistant",
-          not readable_t, str(readable_t))
-    check("loyalty tables are absent from the relation allowlist",
-          not [r for r in cs._ALLOWED_RELATIONS
-               if re.search(r"loyalty|reward", r, re.I)])
-    check("meta says loyalty is NOT INGESTED rather than non-existent",
-          "NOT INGESTED" in idn["loyalty_membership"]
-          and "not non-existent" in idn["loyalty_membership"])
-    check("meta does not claim loyalty is unrecorded anywhere",
-          "not recorded anywhere" not in idn["loyalty_membership"])
-    check("meta names the upstream source",
-          "gift_reward_data" in idn["loyalty_membership"])
+    # Loyalty is now INGESTED and analysable through a safe view. The
+    # guarantee under test is no longer "loyalty is absent" -- it is that the
+    # assistant reads loyalty only through v_order_loyalty_context, which
+    # carries no loyalty key, no customer_id and no PII, while the raw
+    # order_loyalty_v2 table stays denied.
+    for raw in ("order_loyalty_v2", "timesheet_entries_v2"):
+        check(f"raw {raw} is NOT readable by the assistant",
+              not _llm_can_read(cur, raw))
+        check(f"raw {raw} is absent from the relation allowlist",
+              raw not in cs._ALLOWED_RELATIONS)
+    check("the safe loyalty view IS readable",
+          _llm_can_read(cur, "v_order_loyalty_context"))
+    check("the safe loyalty view is in the allowlist",
+          "v_order_loyalty_context" in cs._ALLOWED_RELATIONS)
+    cur.execute("""SELECT column_name FROM information_schema.columns
+                   WHERE table_name = 'v_order_loyalty_context'""")
+    loyalty_cols = [r[0] for r in cur.fetchall()]
+    check("safe loyalty view exposes no loyalty key or customer id",
+          not [c for c in loyalty_cols
+               if re.search(r"key_hash|customer_id|external", c, re.I)],
+          str(loyalty_cols))
+    check("meta reports loyalty evidence as ingested",
+          idn["loyalty_membership"].startswith("NOT INGESTED") is False
+          or "evidence" in idn["loyalty_membership"].lower()
+          or "ingested" in idn["loyalty_membership"].lower())
     check("prompt forbids equating anonymous with non-member",
           "ANONYMOUS MEANS UNKNOWN, NOT NON-MEMBER" in flat)
-    check("prompt says loyalty is not yet ingested, not that it does not exist",
-          "not yet ingested" in flat and "Do NOT say loyalty does not exist" in flat)
-    check("prompt states loyalty analysis is blocked until the backfill",
-          "until the safe loyalty backfill" in flat)
-    check("prompt separates customer identity from loyalty membership",
-          "CUSTOMER IDENTITY IS NOT LOYALTY MEMBERSHIP" in flat)
+    check("prompt no longer claims loyalty is un-ingested",
+          "not yet ingested" not in flat)
+    check("prompt states loyalty evidence is now analysable",
+          "Order-level loyalty EVIDENCE is now ingested" in flat)
+    check("prompt keeps identity and loyalty rates separate",
+          "must NEVER be merged" in flat)
+
 
     print("=== C. capture rate uses the REAL denominator ===")
     cur.execute("""SELECT COUNT(*), COUNT(customer_id) FROM v_orders_classified

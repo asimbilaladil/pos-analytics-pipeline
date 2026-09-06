@@ -471,18 +471,18 @@ CUSTOMER IDENTITY — a small, biased subset. Never speak for everyone:
     capture rate. Below 30% capture, do NOT characterise anything as
     representative of customers generally; 30-80% needs a strong caveat; 80%+
     still needs the subset named.
-  * ANONYMOUS MEANS UNKNOWN, NOT NON-MEMBER. Loyalty data IS available upstream
-    in Revel's Order.gift_reward_data, but it is PII-bearing and was not
-    historically ingested into this analytics database. You therefore CANNOT
-    perform historical loyalty-member analysis until the safe loyalty backfill
-    is completed. Do NOT say loyalty does not exist -- say it is not yet
-    ingested. So you cannot answer "do loyalty customers spend more" YET;
-    explain that limitation rather than refusing as impossible. You MAY compare
-    identified vs unidentified transactions if you label them exactly that way.
-  * CUSTOMER IDENTITY IS NOT LOYALTY MEMBERSHIP. An identified customer_id says
-    an order was linked to a customer record; it says NOTHING about whether that
-    person is a loyalty member. Never treat identified/unidentified as a proxy
-    for member/non-member.
+  * ANONYMOUS MEANS UNKNOWN, NOT NON-MEMBER. Order-level loyalty EVIDENCE is
+    now ingested (v_order_loyalty_context) and you CAN analyse it -- see the
+    LOYALTY EVIDENCE section. What you still cannot do is call an
+    unidentified customer a non-member: absence of identity proves nothing
+    about membership.
+  * CUSTOMER IDENTITY IS NOT LOYALTY MEMBERSHIP, and the two rates are
+    SEPARATE NUMBERS. identity_capture_rate (customer_id present) and the
+    loyalty evidence rate (a loyalty payload on the order) measure different
+    things, come from different fields and must NEVER be merged, averaged or
+    substituted for one another. An identified customer_id says an order was
+    linked to a customer record; it says NOTHING about membership. Never treat
+    identified/unidentified as a proxy for member/non-member.
   * OPERATOR IDS ARE NOT CUSTOMERS. created_by_user_id, updated_by_user_id,
     voided_by_user_id, discounted_by_user_id, opened_by_user_id and
     closed_by_user_id identify STAFF. Never treat them as customer identity.
@@ -520,6 +520,94 @@ CUSTOMER IDENTITY — a small, biased subset. Never speak for everyone:
     with channel (identified orders are overwhelmingly third-party/web), so the
     gap is confounded by channel, not shown to be caused by membership.
 """
+
+LOYALTY_RULES = """\
+LOYALTY EVIDENCE -- what the data proves, and what it cannot:
+
+  * THE FIELD IS EVIDENCE, NOT MEMBERSHIP. v_order_loyalty_context.
+    has_loyalty_payload = TRUE means Revel attached a loyalty structure to that
+    order: LOYALTY EVIDENCE PRESENT. FALSE means NO LOYALTY EVIDENCE OBSERVED.
+    It does NOT mean the guest is not a member. A member who does not identify
+    at the till produces an order with no payload, and nothing in this data can
+    tell that apart from a genuine non-member's order.
+  * REQUIRED WORDING. Say "orders with loyalty evidence" and "orders with no
+    loyalty evidence observed". NEVER say "loyalty customers" vs "non-loyalty
+    customers", "members vs non-members", or "loyalty members spend X".
+  * IF THE USER ASKS MEMBER VS NON-MEMBER, do not refuse -- answer the
+    answerable half. Give the loyalty-evidence comparison, then state plainly
+    that the non-member side cannot be established, because absence of evidence
+    is not evidence of non-membership.
+  * NEVER CLAIM CAUSATION. "Did loyalty cause customers to spend more" cannot be
+    answered from this data. Report the observed difference and say explicitly
+    that it is observational: guests who identify at the till are self-selected,
+    and the comparison is confounded by that selection. No experiment exists
+    here.
+  * IT IS A MINORITY SIGNAL. Loyalty evidence appears on about 5% of orders
+    network-wide (3.3%-9.1% depending on store). Always give the rate alongside
+    any loyalty figure, and never present the loyalty-evidence subset as the
+    behaviour of all guests.
+  * DENOMINATOR IS REAL ORDERS. Compute rates over txn_class = 'REAL' only,
+    exactly as elsewhere. State the denominator.
+  * loyalty_registered = TRUE is "registered loyalty evidence on this order". It
+    does NOT establish a person's full historical membership status.
+  * total_points_present is a PRESENCE FLAG. The underlying balance is a
+    per-person running total that says nothing about the order and is not
+    exposed. Never sum or average points.
+  * NO PER-PERSON LOYALTY ANALYSIS. There is no loyalty customer key in any
+    view you can read. You cannot count loyalty members, measure repeat member
+    visits, or compute per-member value. Say so plainly if asked.
+"""
+
+
+LABOR_RULES = """\
+LABOUR -- v_labor_hourly_context (est x business_date x local_hour) and
+v_labor_daily_context (est x business_date). Never join labour to individual
+orders; relate it only by establishment_id + business_date (+ local_hour).
+
+  * BREAKS ARE NOT RECORDED. break_data_status is always 'unavailable'.
+    labor_hours is ELAPSED CLOCKED TIME (clock_out - clock_in) and INCLUDES any
+    unpaid break actually taken, so it OVERSTATES paid-worked time by an unknown
+    amount. Never call it verified paid-worked time. State this whenever you
+    report labour hours or a labour percentage.
+  * estimated_labor_cost IS NOT PAYROLL COST. It is hours x role wage, and
+    excludes overtime premiums, employer taxes, burden and benefits. Always call
+    it "estimated labour cost". Never call it payroll, never call it what the
+    business actually paid.
+  * SHIFTS ARE ALREADY SPLIT ACROSS HOURS. A 17:30-19:15 shift contributes 0.5h
+    to hour 17, 1.0h to hour 18 and 0.25h to hour 19. Do not re-apportion, and
+    do not assume a shift belongs to its clock-in hour.
+  * COUNT COLUMNS THAT ARE NOT SUMMABLE. shift_day_count (daily) counts a
+    midnight-crossing shift on both days; shift_overlap_count (hourly) is a
+    staffing level, not a shift count. To count shifts worked, use
+    shifts_started_count. Summing the other two overstates.
+  * SALES VS LABOUR uses REAL orders and REAL sales only:
+        labour % of sales   = estimated_labor_cost / REAL final_total x 100
+        sales per labour hr = REAL final_total / labor_hours
+        orders per labour hr= REAL order count  / labor_hours
+    Name the denominator every time, and label the cost as estimated.
+  * NEVER DECLARE OVER- OR UNDERSTAFFING. No staffing target, sales forecast or
+    labour standard exists in this data, so "overstaffed" is not derivable.
+    Quantify instead: labour hours and estimated cost against sales and orders
+    for the same hour, and use wording like "hours with relatively high labour
+    intensity (labour cost per sales dollar)".
+    WHEN ASKED WHICH HOURS WERE OVERSTAFFED, DO NOT STOP AT THE REFUSAL AND DO
+    NOT ASK WHETHER TO CONTINUE. In the SAME reply: (1) say in one line that a
+    staffing target would be needed to call an hour overstaffed, and (2) GO
+    AHEAD AND RUN the hourly query and give the labour-intensity ranking --
+    hours ranked by estimated labour cost per sales dollar, with labour hours,
+    estimated cost, REAL sales and REAL orders for each hour. Offering the
+    breakdown instead of delivering it is a failed answer.
+  * NO CAUSAL CLAIMS from one metric. Low sales per labour hour may reflect
+    demand, menu mix, a training shift or a delivery-heavy period. Report the
+    measurement, not a diagnosis.
+  * OPEN SHIFTS (open_shift_count) have no clock_out yet and contribute NO hours
+    or cost. Today's figures are therefore incomplete -- say so when reporting
+    the current day.
+  * NO EMPLOYEE IDENTITY. Employee ids are not exposed. unique_employee_count
+    and employee_count are counts only; you cannot identify, rank or compare
+    individual staff, and must decline requests to do so.
+"""
+
 
 CHANNEL_RULES = """\
 CHANNELS — no verified service-mode names exist. Read this before answering:
@@ -878,6 +966,28 @@ used. Don't print SQL unless asked. Keep it tight — this is a chat, not a repo
 Flag anything that looks like a data anomaly rather than reporting it as fact.
 
 {SCHEMA_DOC}
+v_order_loyalty_context  — one row per order, loyalty EVIDENCE only (A11 follow-up)
+    order_id, establishment_id, business_date, txn_class, final_total,
+    has_loyalty_payload   TRUE = loyalty evidence present on this order;
+                          FALSE = no loyalty evidence observed (NOT non-member),
+    loyalty_registered, has_applied_reward, applied_rewards_count,
+    has_reward_card, total_points_present (presence flag; balance not exposed)
+    No loyalty key, no customer_id, no PII. ~5% of orders carry evidence.
+
+v_labor_hourly_context   — establishment_id x business_date x local_hour
+    labor_hours (shift time SPLIT across the hours it spans, Chicago, DST-correct;
+                 includes unpaid breaks — breaks are not recorded),
+    estimated_labor_cost (hours x wage; NOT payroll cost),
+    employee_count, shift_overlap_count (staffing level, not summable),
+    missing_wage_shift_count, auto_clock_out_count, break_data_status
+
+v_labor_daily_context    — establishment_id x business_date
+    labor_hours, estimated_labor_cost, unique_employee_count,
+    shift_day_count (NOT summable across days), shifts_started_count (summable),
+    missing_wage_shift_count, auto_clock_out_count, open_shift_count,
+    break_data_status
+    No employee_id anywhere. Join labour to sales by establishment_id +
+    business_date (+ local_hour) — never to an individual order.
 {GLOSSARY}
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
@@ -885,6 +995,8 @@ Flag anything that looks like a data anomaly rather than reporting it as fact.
 {ENTREE_RULES}
 {COHORT_RULES}
 {IDENTITY_RULES}
+{LOYALTY_RULES}
+{LABOR_RULES}
 {CHANNEL_RULES}
 {CATEGORY_RULES}
 {TIME_RULES}
@@ -1024,6 +1136,11 @@ _ALLOWED_RELATIONS = frozenset({
     # A11 (migration 34). Identity context; safe_customer_key is an opaque hash
     # and no customer PII exists anywhere in this database.
     "v_order_identity_context", "v_identity_profile",
+    # Loyalty + labour (migration 37). All three are AGGREGATE OR DERIVED views
+    # over tables the assistant cannot read: order_loyalty_v2 and
+    # timesheet_entries_v2 stay denied to laynes_ro. No loyalty key hash, no
+    # employee_id, no customer_id, no PII crosses this boundary.
+    "v_order_loyalty_context", "v_labor_hourly_context", "v_labor_daily_context",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1344,6 +1461,42 @@ SELECT * FROM o_agg, pay, src, prod
 # is cheap at any scope; only the items-side cross-checks are deferred.
 _DEEP_SCOPE_ROW_LIMIT = 250_000
 
+# Loyalty and labour are ADVISORY context, not completeness signals, so they
+# get their own tighter size gate rather than riding on _DEEP_SQL. A network-
+# wide month is already an expensive deep pass; adding ~2s of advisory context
+# to it made the slowest path slower for questions that never asked about
+# loyalty or labour. Below this limit the pair costs ~230ms; above it the block
+# reports not_evaluated and the assistant can still query the views directly.
+_ADVISORY_SCOPE_ROW_LIMIT = 100_000
+
+_LOYALTY_LABOR_SQL = """
+WITH loy AS (
+    -- Loyalty EVIDENCE over REAL orders. Reads the safe view; the raw
+    -- order_loyalty_v2 table is not readable by this role.
+    SELECT COUNT(*) FILTER (WHERE has_loyalty_payload)                   AS loy_evidence,
+           COUNT(*) FILTER (WHERE loyalty_registered)                    AS loy_registered,
+           COUNT(*) FILTER (WHERE has_applied_reward)                    AS loy_reward,
+           ROUND(AVG(final_total) FILTER (WHERE has_loyalty_payload), 2)     AS loy_aov_evidence,
+           ROUND(AVG(final_total) FILTER (WHERE NOT has_loyalty_payload), 2) AS loy_aov_none
+    FROM v_order_loyalty_context
+    WHERE txn_class = 'REAL'
+      AND business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+),
+lab AS (
+    SELECT ROUND(SUM(labor_hours), 2)          AS lab_hours,
+           ROUND(SUM(estimated_labor_cost), 2) AS lab_cost,
+           SUM(missing_wage_shift_count)       AS lab_missing_wage,
+           SUM(shifts_started_count)           AS lab_shifts,
+           SUM(open_shift_count)               AS lab_open_shifts
+    FROM v_labor_daily_context
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+)
+SELECT * FROM loy, lab
+"""
+
+
 _DEEP_SQL = """
 WITH i_agg AS (
     SELECT COUNT(*)                        AS order_item_rows,
@@ -1615,11 +1768,21 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                     "ident_txn": None, "ident_cust": None, "ident_nonind": None,
                     "orders_with_payment": None,
                     "orders_without_payment": None, "split_tender_count": None,
-                    "refunded_payment_count": None}
+                    "refunded_payment_count": None,
+                    "loy_evidence": None, "loy_registered": None, "loy_reward": None,
+                    "loy_aov_evidence": None, "loy_aov_none": None,
+                    "lab_hours": None, "lab_cost": None, "lab_missing_wage": None,
+                    "lab_shifts": None, "lab_open_shifts": None}
             deep_evaluated = int(r["order_rows"] or 0) <= _DEEP_SCOPE_ROW_LIMIT
             if deep_evaluated:
                 cur.execute(_DEEP_SQL, params)
-                deep = dict(cur.fetchone())
+                deep.update(dict(cur.fetchone()))
+
+            advisory_evaluated = (
+                int(r["order_rows"] or 0) <= _ADVISORY_SCOPE_ROW_LIMIT)
+            if advisory_evaluated:
+                cur.execute(_LOYALTY_LABOR_SQL, params)
+                deep.update(dict(cur.fetchone()))
 
             _cohort_block = _cohort_context(establishment_id)
             if establishment_id is None:
@@ -1819,13 +1982,89 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
             "completeness are different things. Identified customers are a "
             "self-selected subset and are NOT all customers; total unique "
             "guests cannot be determined. Anonymous means unknown, NOT "
-            "non-member, and identity is NOT loyalty membership. Loyalty "
-            "exists upstream in Revel but is not yet ingested here, so "
-            "historical loyalty analysis is unavailable rather than "
-            "impossible. Some identified accounts "
+            "non-member, and identity is NOT loyalty membership -- the "
+            "identity capture rate and the loyalty evidence rate are separate "
+            "measurements of different fields and must never be merged. "
+            "Order-level loyalty evidence IS now ingested; see the loyalty "
+            "block. Some identified accounts "
             "are suspected marketplace accounts rather than people -- check "
             "suspected_non_individual before any per-customer average."),
             },
+        "loyalty": {
+            "status": ("evidence_ingested" if deep["loy_evidence"] is not None
+                       else "not_evaluated_scope_too_large"),
+            "source": "v_order_loyalty_context (Order.gift_reward_data, PII stripped)",
+            "denominator": "REAL orders in this scope",
+            "real_orders": real,
+            "evidence_orders": (None if deep["loy_evidence"] is None
+                                else int(deep["loy_evidence"])),
+            "registered_orders": (None if deep["loy_registered"] is None
+                                  else int(deep["loy_registered"])),
+            "reward_use_orders": (None if deep["loy_reward"] is None
+                                  else int(deep["loy_reward"])),
+            "evidence_rate_pct": _pct_of(deep["loy_evidence"], real),
+            "aov_loyalty_evidence": (None if deep["loy_aov_evidence"] is None
+                                     else float(deep["loy_aov_evidence"])),
+            "aov_no_loyalty_evidence": (None if deep["loy_aov_none"] is None
+                                        else float(deep["loy_aov_none"])),
+            "terminology": ("has_loyalty_payload TRUE = 'loyalty evidence "
+                            "present'; FALSE = 'no loyalty evidence observed'. "
+                            "NEVER say 'loyalty customers vs non-loyalty "
+                            "customers' or 'members vs non-members'."),
+            "advisory_only": True,
+            "limitations": (
+                "Absence of loyalty evidence does NOT prove non-membership: a "
+                "member who does not identify at the till is indistinguishable "
+                "from a non-member here. Evidence covers a MINORITY of orders "
+                "(~5% network-wide, 3.3%-9.1% by store), so the evidence subset "
+                "is self-selected and never represents all guests. The AOV "
+                "difference is OBSERVATIONAL and confounded by that selection "
+                "-- it does not show loyalty causes higher spend. No loyalty "
+                "customer key is exposed, so per-member counts, repeat-member "
+                "visits and per-member value cannot be computed. This block is "
+                "ADVISORY and never affects the A12 reconciliation status."),
+        },
+        "labor": {
+            "status": ("available" if deep["lab_hours"] is not None
+                       else "not_evaluated_scope_too_large"),
+            "source": "v_labor_daily_context (TimeSheetEntry; no employee identity)",
+            "labor_hours": (None if deep["lab_hours"] is None
+                            else float(deep["lab_hours"])),
+            "estimated_labor_cost": (None if deep["lab_cost"] is None
+                                     else float(deep["lab_cost"])),
+            "labor_pct_sales": (
+                round(float(deep["lab_cost"]) / computed * 100.0, 2)
+                if deep["lab_cost"] is not None and computed else None),
+            "sales_per_labor_hour": (
+                round(computed / float(deep["lab_hours"]), 2)
+                if deep["lab_hours"] else None),
+            "orders_per_labor_hour": (
+                round(real / float(deep["lab_hours"]), 2)
+                if deep["lab_hours"] else None),
+            "shifts_started": (None if deep["lab_shifts"] is None
+                               else int(deep["lab_shifts"])),
+            "missing_wage_shift_count": (None if deep["lab_missing_wage"] is None
+                                         else int(deep["lab_missing_wage"])),
+            "open_shift_count": (None if deep["lab_open_shifts"] is None
+                                 else int(deep["lab_open_shifts"])),
+            "break_data_status": "unavailable",
+            "sales_basis": "REAL orders, final_total",
+            "advisory_only": True,
+            "limitations": (
+                "BREAKS ARE NOT RECORDED, so labor_hours is elapsed clocked "
+                "time (clock_out - clock_in) and INCLUDES any unpaid break "
+                "taken -- it OVERSTATES paid-worked time by an unknown amount "
+                "and is not verified paid time. estimated_labor_cost is hours x "
+                "role wage and EXCLUDES overtime premiums, employer taxes, "
+                "burden and benefits: it is NOT payroll cost and must not be "
+                "called what the business paid. Labour is aggregated by "
+                "establishment and business_date/hour and CANNOT be attributed "
+                "to individual orders. No staffing target exists, so over- or "
+                "understaffing is NOT derivable -- report labour intensity, not "
+                "a diagnosis. Open shifts contribute no hours, so the current "
+                "day is incomplete. This block is ADVISORY and never affects "
+                "the A12 reconciliation status."),
+        },
         "channel_mapping": {
             "status": "ordering_pattern_verified_service_mode_unverified",
             "source": "orders_v2.dining_option (+ web_order corroboration)",
