@@ -139,6 +139,62 @@ def main() -> int:
     check("no credentials leaked into payload",
           not any(w in blob for w in ("password", "sk-ant", "ghp_", "secret", "token")))
 
+    # ── size-gating: advisory work is deferred, the gate never is ───────────
+    # A network-wide month sat ~73ms from the 15s statement timeout because the
+    # deep pass ran four purely-advisory CTEs (payment/category/channel/identity)
+    # that cost 6.5s of its 9.7s. Those moved behind the tighter advisory gate.
+    # The two deep values that _reconcile can turn into a FAIL stayed put.
+    print("\n=== S. advisory deferral must never weaken the gate ===")
+    small = cs.meta_extract(26, "2026-06-01", "2026-07-01")
+    wide = cs.meta_extract(None, "2026-06-01", "2026-07-01")
+
+    check("A12 runs on the small scope", small["reconciliation"]["status"] is not None)
+    check("A12 runs on the wide scope too", wide["reconciliation"]["status"] is not None)
+    check("wide scope still reconciles to PASS/WARN, not skipped",
+          wide["reconciliation"]["status"] in ("PASS", "WARN", "FAIL"))
+
+    check("small scope still gets FULL advisory metadata",
+          all(small[b]["evaluated"] for b in
+              ("payment_linkage", "identity", "channel_mapping", "category_mapping")))
+    check("wide scope defers advisory metadata",
+          not any(wide[b]["evaluated"] for b in
+                  ("payment_linkage", "identity", "channel_mapping", "category_mapping")))
+
+    print("=== T. deferral is explicit, never a silent omission ===")
+    for b in ("payment_linkage", "identity", "channel_mapping", "category_mapping"):
+        check(f"{b} states why it was skipped",
+              isinstance(wide[b].get("not_evaluated_reason"), str)
+              and "ADVISORY only" in wide[b]["not_evaluated_reason"])
+        check(f"{b} says the skip does not affect A12",
+              "A12 reconciliation status is unaffected" in wide[b]["not_evaluated_reason"]
+              or "does not affect the A12" in wide[b]["not_evaluated_reason"])
+        check(f"{b} reason is absent when it WAS evaluated",
+              small[b].get("not_evaluated_reason") is None)
+
+    print("=== U. FAIL-critical deep checks still run at network-month ===")
+    check("item-side checks evaluated on the wide scope",
+          wide["integrity"]["item_side_checks_evaluated"] is True)
+    check("duplicate_order_item_ids is a number, not None",
+          isinstance(wide["integrity"]["duplicate_order_item_ids"], int))
+    check("orphan_order_items is a number, not None",
+          isinstance(wide["integrity"]["orphan_order_items"], int))
+    check("the deep query still carries both FAIL inputs",
+          "duplicate_order_item_ids" in cs._DEEP_SQL
+          and "orphan_order_items" in cs._DEEP_SQL)
+    check("the deep query no longer carries the advisory CTEs",
+          not any(f"\n{n} AS (" in cs._DEEP_SQL or f" {n} AS (" in cs._DEEP_SQL
+                  for n in ("pay", "cat", "chan", "ident")))
+    check("the advisory query carries them instead",
+          all(n in cs._LOYALTY_LABOR_SQL for n in ("pay", "cat", "chan", "ident")))
+
+    print("=== V. thresholds are ordered and unchanged ===")
+    check("advisory gate is tighter than the deep gate",
+          cs._ADVISORY_SCOPE_ROW_LIMIT < cs._DEEP_SCOPE_ROW_LIMIT)
+    check("deep gate still 250k (not lowered)", cs._DEEP_SCOPE_ROW_LIMIT == 250_000)
+    check("advisory gate still 100k", cs._ADVISORY_SCOPE_ROW_LIMIT == 100_000)
+    check("top-level identity_capture_rate survives deferral (core-sourced)",
+          isinstance(wide["identity_capture_rate"], (int, float)))
+
     failed = [n for n, ok, _ in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     if failed:

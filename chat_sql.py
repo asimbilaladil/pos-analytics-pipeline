@@ -1478,50 +1478,14 @@ _DEEP_SCOPE_ROW_LIMIT = 250_000
 _ADVISORY_SCOPE_ROW_LIMIT = 100_000
 
 _LOYALTY_LABOR_SQL = """
-WITH loy AS (
-    -- Loyalty EVIDENCE over REAL orders. Reads the safe view; the raw
-    -- order_loyalty_v2 table is not readable by this role.
-    SELECT COUNT(*) FILTER (WHERE has_loyalty_payload)                   AS loy_evidence,
-           COUNT(*) FILTER (WHERE loyalty_registered)                    AS loy_registered,
-           COUNT(*) FILTER (WHERE has_applied_reward)                    AS loy_reward,
-           ROUND(AVG(final_total) FILTER (WHERE has_loyalty_payload), 2)     AS loy_aov_evidence,
-           ROUND(AVG(final_total) FILTER (WHERE NOT has_loyalty_payload), 2) AS loy_aov_none
-    FROM v_order_loyalty_context
-    WHERE txn_class = 'REAL'
-      AND business_date >= %(start)s AND business_date < %(end)s
-      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
-),
-lab AS (
-    SELECT ROUND(SUM(labor_hours), 2)          AS lab_hours,
-           ROUND(SUM(estimated_labor_cost), 2) AS lab_cost,
-           SUM(missing_wage_shift_count)       AS lab_missing_wage,
-           SUM(shifts_started_count)           AS lab_shifts,
-           SUM(open_shift_count)               AS lab_open_shifts
-    FROM v_labor_daily_context
-    WHERE business_date >= %(start)s AND business_date < %(end)s
-      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
-)
-SELECT * FROM loy, lab
-"""
-
-
-_DEEP_SQL = """
-WITH i_agg AS (
-    SELECT COUNT(*)                        AS order_item_rows,
-           COUNT(*) - COUNT(DISTINCT i.id) AS duplicate_order_item_ids
-    FROM order_items_v2 i
-    JOIN v_orders_classified o ON o.id = i.order_id
-    WHERE o.business_date >= %(start)s AND o.business_date < %(end)s
-      AND (%(est)s::int IS NULL OR o.establishment_id = %(est)s::int)
-),
-orph AS (
-    SELECT COUNT(DISTINCT i.order_id) AS orphan_order_items
-    FROM order_items_v2 i
-    WHERE i.created_date >= %(ts_start)s AND i.created_date < %(ts_end)s
-      AND (%(est)s::int IS NULL OR i.establishment_id = %(est)s::int)
-      AND NOT EXISTS (SELECT 1 FROM orders_v2 x WHERE x.id = i.order_id)
-),
--- A10 payment linkage. Kept in the deep query rather than the core one so a
+-- ADVISORY CONTEXT ONLY -- nothing here can move the A12 verdict, which is
+-- why it sits behind the tighter _ADVISORY_SCOPE_ROW_LIMIT.
+--
+-- payment linkage, category coverage, channel mix and identity capture are
+-- all advisory_only blocks. The one identity figure the gate does read --
+-- the top-level identity_capture_rate -- comes from the CORE query, not from
+-- here, and it only ever appends a note.
+WITH -- A10 payment linkage. Kept in the deep query rather than the core one so a
 -- very wide scope skips it along with the other line-item scans; the gate must
 -- not get slower for metadata most questions never read.
 real_scope AS (
@@ -1581,8 +1545,61 @@ cat AS (
     JOIN real_scope rs ON rs.id = i.order_id
     LEFT JOIN v_order_items_category_context cc ON cc.order_item_id = i.id
     WHERE i.deleted IS NOT TRUE AND i.is_voided IS NOT TRUE
+),
+loy AS (
+    -- Loyalty EVIDENCE over REAL orders. Reads the safe view; the raw
+    -- order_loyalty_v2 table is not readable by this role.
+    SELECT COUNT(*) FILTER (WHERE has_loyalty_payload)                   AS loy_evidence,
+           COUNT(*) FILTER (WHERE loyalty_registered)                    AS loy_registered,
+           COUNT(*) FILTER (WHERE has_applied_reward)                    AS loy_reward,
+           ROUND(AVG(final_total) FILTER (WHERE has_loyalty_payload), 2)     AS loy_aov_evidence,
+           ROUND(AVG(final_total) FILTER (WHERE NOT has_loyalty_payload), 2) AS loy_aov_none
+    FROM v_order_loyalty_context
+    WHERE txn_class = 'REAL'
+      AND business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+),
+lab AS (
+    SELECT ROUND(SUM(labor_hours), 2)          AS lab_hours,
+           ROUND(SUM(estimated_labor_cost), 2) AS lab_cost,
+           SUM(missing_wage_shift_count)       AS lab_missing_wage,
+           SUM(shifts_started_count)           AS lab_shifts,
+           SUM(open_shift_count)               AS lab_open_shifts
+    FROM v_labor_daily_context
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
 )
-SELECT * FROM i_agg, orph, pay, cat, chan, ident
+SELECT * FROM pay, cat, chan, ident, loy, lab
+"""
+
+
+_DEEP_SQL = """
+-- FAIL-CRITICAL DEEP CHECKS ONLY.
+--
+-- These two are the only deep-side values _reconcile can turn into a FAIL
+-- (duplicate order-item ids, orphan order-items), so they keep the wider
+-- _DEEP_SCOPE_ROW_LIMIT gate and still run for network-month scopes.
+--
+-- pay/cat/chan/ident used to live here and moved to _LOYALTY_LABOR_SQL: on a
+-- network-wide month they were 6,465ms of a 9,653ms deep pass while being
+-- purely advisory. Measured, not assumed -- an expression index on
+-- orders_v2's business_date was tried first and regressed every scope.
+WITH i_agg AS (
+    SELECT COUNT(*)                        AS order_item_rows,
+           COUNT(*) - COUNT(DISTINCT i.id) AS duplicate_order_item_ids
+    FROM order_items_v2 i
+    JOIN v_orders_classified o ON o.id = i.order_id
+    WHERE o.business_date >= %(start)s AND o.business_date < %(end)s
+      AND (%(est)s::int IS NULL OR o.establishment_id = %(est)s::int)
+),
+orph AS (
+    SELECT COUNT(DISTINCT i.order_id) AS orphan_order_items
+    FROM order_items_v2 i
+    WHERE i.created_date >= %(ts_start)s AND i.created_date < %(ts_end)s
+      AND (%(est)s::int IS NULL OR i.establishment_id = %(est)s::int)
+      AND NOT EXISTS (SELECT 1 FROM orders_v2 x WHERE x.id = i.order_id)
+)
+SELECT * FROM i_agg, orph
 """
 
 
@@ -1934,7 +1951,14 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 "validated. Report the observed count, state that no positive "
                 "refund sample exists yet, and do NOT call refund detection "
                 "high confidence. This does not mean refunds are impossible."),
-            "evaluated": deep_evaluated,
+            # pay moved to the advisory gate, so this must track THAT gate.
+            # Reporting deep_evaluated here would claim the block was
+            # computed for 100k-250k scopes where it no longer is.
+            "evaluated": advisory_evaluated,
+            "not_evaluated_reason": (None if advisory_evaluated else
+                "scope exceeds the advisory row limit, so payment linkage was "
+                "not computed. ADVISORY only -- the A12 reconciliation status is "
+                "unaffected and the FAIL-critical integrity checks still ran."),
             "payment_type_mapping_status": "unavailable",
             "payment_type_mapping_confidence": "none",
             "payment_type_mapping": {
@@ -1955,6 +1979,11 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
         },
         "identity": {
             "status": "identity_only_loyalty_not_yet_ingested",
+            "evaluated": advisory_evaluated,
+            "not_evaluated_reason": (None if advisory_evaluated else
+                "scope exceeds the advisory row limit, so identity capture was not "
+                "computed. ADVISORY only -- the A12 reconciliation status is "
+                "unaffected and the FAIL-critical integrity checks still ran."),
             "identity_field_source": "orders_v2.customer_id",
             "loyalty_membership": (
                 "NOT INGESTED, not non-existent. Loyalty is available upstream "
@@ -2075,6 +2104,11 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
         },
         "channel_mapping": {
             "status": "ordering_pattern_verified_service_mode_unverified",
+            "evaluated": advisory_evaluated,
+            "not_evaluated_reason": (None if advisory_evaluated else
+                "scope exceeds the advisory row limit, so channel mapping was not "
+                "computed. ADVISORY only -- the A12 reconciliation status is "
+                "unaffected and the FAIL-critical integrity checks still ran."),
             "source": "orders_v2.dining_option (+ web_order corroboration)",
             "group_meaning": ("web_associated / non_web_associated describes how "
                               "the order reached the POS. It is NOT a service "
@@ -2132,6 +2166,11 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
         },
         "category_mapping": {
             "status": "current_only",
+            "evaluated": advisory_evaluated,
+            "not_evaluated_reason": (None if advisory_evaluated else
+                "scope exceeds the advisory row limit, so category coverage was not "
+                "computed. ADVISORY only -- the A12 reconciliation status is "
+                "unaffected and the FAIL-critical integrity checks still ran."),
             "source": "revel_product_api (Product.category)",
             "confidence": "verified_current",
             "historical_verified": False,
