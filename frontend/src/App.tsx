@@ -24,6 +24,6 @@ export default function App() {
     )
   }
   return user
-    ? <Chat onSignedOut={() => setUser(null)} />
+    ? <Chat user={user} onSignedOut={() => setUser(null)} />
     : <Login onSignedIn={setUser} />
 }

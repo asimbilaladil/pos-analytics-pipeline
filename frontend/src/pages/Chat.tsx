@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertCircle, ArrowDown, X } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import { Composer } from '../components/Composer'
-import { EmptyState } from '../components/EmptyState'
+import { QuickChips } from '../components/QuickChips'
+import { WelcomeState } from '../components/WelcomeState'
 import { Header } from '../components/Header'
-import { MessageList, ThinkingMessage, UserMessage } from '../components/Messages'
+import { MessageList, ThinkingMessage, UserMessage } from '../components/ChatMessage'
 import { Sidebar } from '../components/Sidebar'
-import type { Conversation, Message } from '../types'
+import type { Conversation, Message, User } from '../types'
 
-export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
+export function Chat({ user, onSignedOut }: { user: User; onSignedOut: () => void }) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -54,7 +55,11 @@ export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
   }, [])
 
   // New content arrives: follow only if the reader had not scrolled away.
+  // Skipped entirely on the empty state — there is nothing to follow there,
+  // and scrolling to the "bottom" of the welcome screen pushed the hero off
+  // the top of the viewport.
   useEffect(() => {
+    if (messages.length === 0 && !pending) return
     if (atBottom) scrollToBottom('smooth')
     // atBottom is intentionally omitted: this must react to new content, not
     // to the flag flipping while the reader scrolls.
@@ -136,6 +141,7 @@ export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
       {/* min-w-0 stops a wide table inside the transcript widening the column */}
       <div className="flex h-full min-w-0 flex-col overflow-hidden">
         <Header
+          user={user}
           models={models} model={model} onModelChange={setModel}
           onNewChat={newChat} onSignOut={signOut}
           onOpenSidebar={() => setSidebarOpen(true)}
@@ -143,8 +149,9 @@ export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
 
         {error && (
           <div role="alert"
-            className="mx-auto mt-4 flex w-full max-w-4xl items-start gap-2 rounded-lg border
-                       border-amber-200 bg-amber-50 px-4 py-2.5 text-[13px] text-amber-800">
+            className="mx-auto mt-4 flex w-full max-w-4xl items-start gap-2.5 rounded-xl border
+                       border-amber-200/80 bg-amber-50 px-4 py-3 text-[13px] text-amber-900
+                       shadow-card">
             <AlertCircle size={15} className="mt-px shrink-0" />
             <span className="flex-1">{error}</span>
             <button onClick={() => setError(null)} aria-label="Dismiss"><X size={14} /></button>
@@ -159,13 +166,16 @@ export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
           <div
             ref={scrollRef}
             onScroll={onTranscriptScroll}
-            className="min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-thin"
+            className="canvas-wash relative min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-thin"
           >
-            <div className="mx-auto w-full max-w-4xl px-6">
+            {/* Wider than the old 896px reading column so three analytics cards
+                fit a row; the transcript keeps its own narrower measure below. */}
+            <div className={`relative z-10 mx-auto w-full px-5 sm:px-8
+                             ${empty ? 'max-w-[1240px]' : 'max-w-[900px]'}`}>
               {empty ? (
-                <EmptyState onPick={send} />
+                <WelcomeState onPick={send} />
               ) : (
-                <div className="space-y-6 py-8">
+                <div className="space-y-7 py-8">
                   <MessageList messages={messages} />
                   {pending && (
                     <>
@@ -178,22 +188,30 @@ export function Chat({ onSignedOut }: { onSignedOut: () => void }) {
             </div>
           </div>
 
-          <div className="relative shrink-0 bg-slate-50 px-6 pb-4 pt-3">
+          <div className="relative shrink-0 bg-canvas-50 px-6 pb-5 pt-3">
             {/* Only offered when you have actually scrolled away from the end,
                 so it never covers the newest answer you are already reading. */}
             {!atBottom && !empty && (
               <button
                 onClick={() => scrollToBottom('smooth')}
-                className="absolute -top-11 left-1/2 flex -translate-x-1/2 items-center gap-1.5
-                           rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs
-                           font-medium text-slate-600 shadow-md transition-colors hover:bg-slate-50"
+                className="absolute -top-12 left-1/2 flex -translate-x-1/2 animate-pop-in
+                           items-center gap-1.5 rounded-full border border-canvas-200 bg-white
+                           px-3.5 py-2 text-[12px] font-medium text-ink-700 shadow-float
+                           transition-colors hover:bg-canvas-50"
               >
                 <ArrowDown size={13} /> Newest
               </button>
             )}
-            <div className="mx-auto w-full max-w-4xl">
-              <Composer onSend={send} disabled={!!pending} />
-            </div>
+            <Composer onSend={send} disabled={!!pending} />
+            {/* Starter chips belong to the empty state only — once a
+                conversation exists they are noise under a real transcript. */}
+            {empty ? (
+              <QuickChips onPick={send} />
+            ) : (
+              <p className="mt-2.5 text-center text-[11px] text-ink-400">
+                Answers are generated from live data · every question is logged
+              </p>
+            )}
           </div>
         </div>
       </div>

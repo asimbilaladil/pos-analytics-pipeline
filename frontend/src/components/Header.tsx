@@ -1,14 +1,17 @@
-import { ChevronDown, Menu, Plus } from 'lucide-react'
-import logo from '../assets/ayg-logo.png'
+import { ChevronDown, Menu, Plus, Sparkles } from 'lucide-react'
+import type { User } from '../types'
 
 /**
- * 64px bar spanning the full main column. It is deliberately OUTSIDE the
- * centred content column so it runs edge to edge, with the actions as one
- * tight right-aligned group rather than spread across the width.
+ * Light 64px bar. The sidebar owns the branding, so the header carries only
+ * controls — matching the reference, where the left side is empty on desktop.
+ *
+ * shrink-0 inside the main column's flex layout is what keeps it visible:
+ * because the column itself never scrolls, the header simply never moves.
  */
 export function Header({
-  models, model, onModelChange, onNewChat, onSignOut, onOpenSidebar,
+  user, models, model, onModelChange, onNewChat, onSignOut, onOpenSidebar,
 }: {
+  user: User | null
   models: string[]
   model: string
   onModelChange: (m: string) => void
@@ -16,55 +19,70 @@ export function Header({
   onSignOut: () => void
   onOpenSidebar: () => void
 }) {
-  return (
-    <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200
-                       bg-white/80 px-6 backdrop-blur-md">
-      <div className="flex min-w-0 items-center gap-3">
-        <button onClick={onOpenSidebar} aria-label="Open sidebar"
-          className="-ml-1 flex h-8 w-8 items-center justify-center rounded-lg text-slate-500
-                     hover:bg-slate-100 lg:hidden">
-          <Menu size={17} />
-        </button>
-        <img src={logo} alt="AYG Food Services" className="h-6 w-auto shrink-0" />
-        <span className="truncate text-base font-semibold text-slate-900">
-          <span className="hidden sm:inline">Laynes Intelligence</span>
-          <span className="sm:hidden">Laynes</span>
-        </span>
-      </div>
+  // Real data only: initials come from the signed-in account, never invented.
+  const name = user?.full_name?.trim() || user?.email?.split('@')[0] || null
+  const initials = name
+    ? name.split(/[\s._-]+/).filter(Boolean).slice(0, 2).map((p) => p[0]!.toUpperCase()).join('')
+    : null
 
-      <div className="flex items-center gap-3">
+  return (
+    <header className="z-20 flex h-16 shrink-0 items-center justify-between gap-3
+                       border-b border-line bg-white/70 px-4 backdrop-blur-md sm:px-6">
+      <button onClick={onOpenSidebar} aria-label="Open sidebar"
+        className="flex h-9 w-9 items-center justify-center rounded-lg text-ink-500
+                   transition-colors hover:bg-app hover:text-ink-900 lg:hidden">
+        <Menu size={18} />
+      </button>
+      <div className="hidden lg:block" />
+
+      <div className="flex shrink-0 items-center gap-2.5">
         <div className="relative hidden sm:block">
+          <Sparkles size={13}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-brand-500" />
           <select
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
-            aria-label="Model"
-            className="cursor-pointer appearance-none rounded-full border border-slate-200 bg-slate-100
-                       py-1.5 pl-3 pr-8 text-xs font-medium text-slate-700 transition-colors
-                       hover:bg-slate-200/70 focus:outline-none"
+            aria-label="Assistant model"
+            className="h-10 cursor-pointer appearance-none rounded-xl border border-line bg-white
+                       pl-8 pr-9 text-[13px] font-medium text-ink-900 shadow-card
+                       transition-colors hover:border-ink-400/40 focus:outline-none"
           >
             {models.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
-          <ChevronDown size={11}
-            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <ChevronDown size={14}
+            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-400" />
         </div>
 
         <button
           onClick={onNewChat}
-          className="flex items-center gap-1.5 rounded-full bg-brand-500 px-4 py-1.5 text-xs
-                     font-semibold text-white shadow-sm shadow-brand-200 transition-all
-                     hover:bg-brand-700 active:scale-95"
+          className="flex h-10 items-center gap-1.5 rounded-xl bg-brand-500 px-4 text-[13px]
+                     font-semibold text-white shadow-[0_1px_2px_rgba(214,32,47,.28)]
+                     transition-all hover:bg-brand-600 active:scale-[.97]"
         >
-          <Plus size={13} strokeWidth={2.5} />
+          <Plus size={15} strokeWidth={2.6} />
           <span className="hidden sm:inline">New chat</span>
         </button>
 
-        <div className="hidden h-4 w-px bg-slate-200 sm:block" />
+        <span className="hidden h-6 w-px bg-line sm:block" aria-hidden />
 
-        <button onClick={onSignOut}
-          className="whitespace-nowrap text-xs font-medium text-slate-500 transition-colors
-                     hover:text-slate-800">
-          Sign out
-        </button>
+        {initials ? (
+          <button onClick={onSignOut} title="Sign out"
+            className="flex items-center gap-2.5 rounded-xl py-1.5 pl-1.5 pr-2.5 transition-colors
+                       hover:bg-app">
+            <span className="flex h-8 w-8 items-center justify-center rounded-full bg-ink-900/[.06]
+                             text-[11.5px] font-semibold text-ink-700">
+              {initials}
+            </span>
+            <span className="hidden text-[13px] font-medium text-ink-700 md:inline">{name}</span>
+            <ChevronDown size={13} className="hidden text-ink-400 md:inline" />
+          </button>
+        ) : (
+          <button onClick={onSignOut}
+            className="whitespace-nowrap rounded-lg px-2.5 py-2 text-[13px] font-medium
+                       text-ink-500 transition-colors hover:bg-app hover:text-ink-900">
+            Sign out
+          </button>
+        )}
       </div>
     </header>
   )

@@ -3,25 +3,46 @@
 @tailwind utilities;
 
 @layer base {
-  /* The document itself must never scroll. Without overflow:hidden here the
-     app shell's h-full resolves against a document that grows with the
-     transcript, which is what let the header scroll away and made the sidebar
-     as tall as the conversation. Only two regions scroll: the conversation
-     list and the transcript. */
+  /* The document itself must never scroll. Without overflow:hidden the app
+     shell's height resolves against a document that grows with the transcript,
+     which is what let the header scroll away and made the sidebar as tall as
+     the conversation. Only two regions scroll: the conversation list and the
+     transcript. */
   html, body, #root { height: 100%; overflow: hidden; }
+
   body {
-    @apply bg-slate-50 text-slate-800 antialiased;
+    @apply bg-app text-ink-700 antialiased;
     font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
-  /* Focus rings are visible for keyboard users and invisible for mouse users. */
-  :focus-visible { @apply outline-none ring-2 ring-brand-500/40 ring-offset-1 ring-offset-white; }
+
+  :focus-visible { @apply outline-none ring-2 ring-brand-300/60 ring-offset-2 ring-offset-white; }
+  ::selection { @apply bg-brand-100 text-ink-900; }
 }
 
 @layer utilities {
-  /* Thin, quiet scrollbars: the rail and transcript both scroll independently
-     and the default chrome is heavy enough to read as a border. */
-  .scroll-thin { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
-  .scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
-  .scroll-thin::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: #D0D5DD transparent; }
+  .scroll-thin::-webkit-scrollbar { width: 7px; height: 7px; }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: #D0D5DD; border-radius: 4px; border: 2px solid transparent; background-clip: content-box;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb:hover { background: #B4BAC5; background-clip: content-box; }
   .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+  /* Very low-opacity warm wash behind the workspace. Kept in CSS rather than
+     as an image so it costs nothing and can never fight the text: it sits at
+     a few percent opacity and is pointer-events:none. */
+  .canvas-wash::before,
+  .canvas-wash::after {
+    content: ''; position: absolute; pointer-events: none; z-index: 0;
+    border-radius: 9999px; filter: blur(80px);
+  }
+  .canvas-wash::before {
+    width: 620px; height: 620px; right: -220px; top: -180px;
+    background: radial-gradient(circle, rgba(214,32,47,.055), transparent 68%);
+  }
+  .canvas-wash::after {
+    width: 560px; height: 560px; left: -200px; bottom: -220px;
+    background: radial-gradient(circle, rgba(14,147,132,.05), transparent 68%);
+  }
 }
