@@ -1,4 +1,5 @@
-import { ChevronDown, Menu, Plus, Sparkles } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { ChevronDown, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
 import type { User } from '../types'
 
 /**
@@ -66,16 +67,8 @@ export function Header({
         <span className="hidden h-6 w-px bg-line sm:block" aria-hidden />
 
         {initials ? (
-          <button onClick={onSignOut} title="Sign out"
-            className="flex items-center gap-2.5 rounded-xl py-1.5 pl-1.5 pr-2.5 transition-colors
-                       hover:bg-app">
-            <span className="flex h-8 w-8 items-center justify-center rounded-full bg-ink-900/[.06]
-                             text-[11.5px] font-semibold text-ink-700">
-              {initials}
-            </span>
-            <span className="hidden text-[13px] font-medium text-ink-700 md:inline">{name}</span>
-            <ChevronDown size={13} className="hidden text-ink-400 md:inline" />
-          </button>
+          <ProfileMenu name={name!} email={user?.email ?? null} initials={initials}
+                       onSignOut={onSignOut} />
         ) : (
           <button onClick={onSignOut}
             className="whitespace-nowrap rounded-lg px-2.5 py-2 text-[13px] font-medium
@@ -85,5 +78,89 @@ export function Header({
         )}
       </div>
     </header>
+  )
+}
+
+/**
+ * Avatar button + dropdown. The trigger only toggles the menu; signing out is
+ * a deliberate second click on the menu item, which reuses the same `onSignOut`
+ * handler the header already owns — there is no second copy of that logic.
+ */
+function ProfileMenu({ name, email, initials, onSignOut }: {
+  name: string
+  email: string | null
+  initials: string
+  onSignOut: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+
+  // Close on outside click and on Escape. Bound only while open so the app is
+  // not listening on document for the whole session.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  return (
+    <div ref={root} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="Account menu"
+        className={`flex items-center gap-2.5 rounded-xl py-1.5 pl-1.5 pr-2.5 transition-colors
+                    focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2
+                    focus-visible:outline-brand-500 hover:bg-app ${open ? 'bg-app' : ''}`}
+      >
+        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-ink-900/[.06]
+                         text-[11.5px] font-semibold text-ink-700">
+          {initials}
+        </span>
+        <span className="hidden text-[13px] font-medium text-ink-700 md:inline">{name}</span>
+        <ChevronDown size={13}
+          className={`hidden text-ink-400 transition-transform md:inline ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Account"
+          className="absolute right-0 top-[calc(100%+8px)] z-50 w-[236px] max-w-[calc(100vw-2rem)]
+                     overflow-hidden rounded-xl border border-line bg-white p-1.5 shadow-float"
+        >
+          <div className="px-2.5 py-2">
+            <p className="truncate text-[13px] font-semibold text-ink-900">{name}</p>
+            {email && <p className="truncate text-[12px] text-ink-500">{email}</p>}
+          </div>
+          <div className="my-1 h-px bg-line" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            autoFocus
+            onClick={() => { setOpen(false); onSignOut() }}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]
+                       font-medium text-ink-700 transition-colors hover:bg-app hover:text-ink-900
+                       focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px]
+                       focus-visible:outline-brand-500"
+          >
+            <LogOut size={14} className="text-ink-400" />
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
   )
 }

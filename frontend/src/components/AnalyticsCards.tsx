@@ -80,7 +80,7 @@ export function AnalyticsCards({ onPick }: { onPick: (prompt: string) => void })
               <ArrowRight size={15}
                 className="text-ink-400 transition-transform duration-200 group-hover:translate-x-0.5" />
             </h3>
-            <p className="max-w-[74%] text-[13px] leading-snug text-ink-500">
+            <p className="max-w-[72%] text-[13px] leading-snug text-ink-500">
               “{example}”
             </p>
           </div>
