@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
 import type { User } from '../types'
+import { modelLabel } from '../lib/format'
 
 /**
  * Light 64px bar. The sidebar owns the branding, so the header carries only
@@ -44,11 +45,12 @@ export function Header({
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
             aria-label="Assistant model"
+            title={model}
             className="h-10 cursor-pointer appearance-none rounded-xl border border-line bg-white
                        pl-8 pr-9 text-[13px] font-medium text-ink-900 shadow-card
                        transition-colors hover:border-ink-400/40 focus:outline-none"
           >
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            {models.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
           </select>
           <ChevronDown size={14}
             className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-400" />
