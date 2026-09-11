@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ChevronDown, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
+import { ChevronDown, Eye, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
 import type { User } from '../types'
 import { modelLabel } from '../lib/format'
 
@@ -11,7 +11,7 @@ import { modelLabel } from '../lib/format'
  * because the column itself never scrolls, the header simply never moves.
  */
 export function Header({
-  user, models, model, onModelChange, onNewChat, onSignOut, onOpenSidebar,
+  user, models, model, onModelChange, onNewChat, onSignOut, onOpenSidebar, onOpenAdmin,
 }: {
   user: User | null
   models: string[]
@@ -20,6 +20,7 @@ export function Header({
   onNewChat: () => void
   onSignOut: () => void
   onOpenSidebar: () => void
+  onOpenAdmin?: () => void
 }) {
   // Real data only: initials come from the signed-in account, never invented.
   const name = user?.full_name?.trim() || user?.email?.split('@')[0] || null
@@ -70,7 +71,7 @@ export function Header({
 
         {initials ? (
           <ProfileMenu name={name!} email={user?.email ?? null} initials={initials}
-                       onSignOut={onSignOut} />
+                       onSignOut={onSignOut} onOpenAdmin={onOpenAdmin} />
         ) : (
           <button onClick={onSignOut}
             className="whitespace-nowrap rounded-lg px-2.5 py-2 text-[13px] font-medium
@@ -88,11 +89,12 @@ export function Header({
  * a deliberate second click on the menu item, which reuses the same `onSignOut`
  * handler the header already owns — there is no second copy of that logic.
  */
-function ProfileMenu({ name, email, initials, onSignOut }: {
+function ProfileMenu({ name, email, initials, onSignOut, onOpenAdmin }: {
   name: string
   email: string | null
   initials: string
   onSignOut: () => void
+  onOpenAdmin?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
@@ -148,6 +150,18 @@ function ProfileMenu({ name, email, initials, onSignOut }: {
             {email && <p className="truncate text-[12px] text-ink-500">{email}</p>}
           </div>
           <div className="my-1 h-px bg-line" role="separator" />
+          {onOpenAdmin && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => { setOpen(false); onOpenAdmin() }}
+              className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]
+                         font-medium text-ink-700 transition-colors hover:bg-app hover:text-ink-900"
+            >
+              <Eye size={14} className="text-ink-400" />
+              All users' chats
+            </button>
+          )}
           <button
             type="button"
             role="menuitem"

@@ -136,6 +136,28 @@ def import_payload(user_id, title, msgs, model=None) -> int:
     return cid
 
 
+# ── super-admin read-only views ─────────────────────────────────────────────
+# These deliberately bypass the per-user scoping above. They are only ever
+# called behind the admin_user dependency in api.py.
+def admin_users():
+    return query(
+        "SELECT u.id, u.email, u.full_name, u.role, u.is_active, u.last_login_at, "
+        "       COUNT(c.id) AS conversation_count, MAX(c.updated_at) AS last_chat_at "
+        "FROM app_users u LEFT JOIN chat_conversations c ON c.user_id = u.id "
+        "GROUP BY u.id ORDER BY MAX(c.updated_at) DESC NULLS LAST, u.email",
+    )
+
+
+def admin_conversation(conversation_id):
+    convo = query(
+        "SELECT id, title, model, user_id FROM chat_conversations WHERE id = %s",
+        (conversation_id,), fetch="one",
+    )
+    if not convo:
+        return None
+    return convo, messages(conversation_id, convo["user_id"]) or []
+
+
 def auto_title(first_prompt: str) -> str:
     t = " ".join((first_prompt or "").split())
     return (t[:57] + "…") if len(t) > 58 else (t or "New chat")

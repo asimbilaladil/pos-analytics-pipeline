@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { api } from './api/client'
+import { AdminChats } from './pages/AdminChats'
 import { Chat } from './pages/Chat'
 import { Login } from './pages/Login'
 import type { User } from './types'
@@ -8,6 +9,7 @@ import type { User } from './types'
 export default function App() {
   const [user, setUser] = useState<User | null>(null)
   const [checking, setChecking] = useState(true)
+  const [view, setView] = useState<'chat' | 'admin'>('chat')
 
   // The session lives in an HttpOnly cookie, so the only way to know whether
   // we are signed in is to ask the server. That also means a refresh restores
@@ -23,7 +25,10 @@ export default function App() {
       </div>
     )
   }
-  return user
-    ? <Chat user={user} onSignedOut={() => setUser(null)} />
-    : <Login onSignedIn={setUser} />
+  if (!user) return <Login onSignedIn={setUser} />
+  const signedOut = () => { setUser(null); setView('chat') }
+  return view === 'admin' && user.is_admin
+    ? <AdminChats onBack={() => setView('chat')} onSignedOut={signedOut} />
+    : <Chat user={user} onSignedOut={signedOut}
+            onOpenAdmin={user.is_admin ? () => setView('admin') : undefined} />
 }

@@ -9,7 +9,9 @@ import { MessageList, ThinkingMessage, UserMessage } from '../components/ChatMes
 import { Sidebar } from '../components/Sidebar'
 import type { Conversation, Message, User } from '../types'
 
-export function Chat({ user, onSignedOut }: { user: User; onSignedOut: () => void }) {
+export function Chat({ user, onSignedOut, onOpenAdmin }: {
+  user: User; onSignedOut: () => void; onOpenAdmin?: () => void
+}) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -147,7 +149,7 @@ export function Chat({ user, onSignedOut }: { user: User; onSignedOut: () => voi
         <Header
           user={user}
           models={models} model={model} onModelChange={setModel}
-          onNewChat={newChat} onSignOut={signOut}
+          onNewChat={newChat} onSignOut={signOut} onOpenAdmin={onOpenAdmin}
           onOpenSidebar={() => setSidebarOpen(true)}
         />
 

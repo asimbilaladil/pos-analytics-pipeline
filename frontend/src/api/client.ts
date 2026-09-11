@@ -1,4 +1,4 @@
-import type { AskResponse, Conversation, ConversationDetail, User } from '../types'
+import type { AdminUser, AskResponse, Conversation, ConversationDetail, User } from '../types'
 
 /**
  * Every call is credentialed so the HttpOnly session cookie travels with it.
@@ -85,4 +85,10 @@ export const api = {
     return request<Conversation>('/api/conversations/import', { method: 'POST', body: fd })
   },
   exportUrl: (id: number) => `/api/conversations/${id}/export`,
+
+  adminUsers: () => request<AdminUser[]>('/api/admin/users'),
+  adminUserConversations: (uid: number) =>
+    request<Conversation[]>(`/api/admin/users/${uid}/conversations`),
+  adminConversation: (id: number) =>
+    request<ConversationDetail>(`/api/admin/conversations/${id}`),
 }

@@ -65,6 +65,17 @@ class ModelsOut(BaseModel):
     default: str
 
 
+class AdminUserOut(BaseModel):
+    id: int
+    email: str
+    full_name: str | None = None
+    role: str
+    is_active: bool
+    last_login_at: datetime | None = None
+    conversation_count: int
+    last_chat_at: datetime | None = None
+
+
 class ImportIn(BaseModel):
     title: str | None = None
     model: str | None = None

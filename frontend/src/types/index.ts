@@ -25,6 +25,17 @@ export interface ConversationDetail {
   messages: Message[]
 }
 
+export interface AdminUser {
+  id: number
+  email: string
+  full_name: string | null
+  role: string
+  is_active: boolean
+  last_login_at: string | null
+  conversation_count: number
+  last_chat_at: string | null
+}
+
 export interface AskResponse {
   conversation_id: number
   title: string

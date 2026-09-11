@@ -28,7 +28,7 @@ from . import chat as chat_svc
 from . import conversations as convo
 from .auth import (SESSION_COOKIE, clear_cookie, create_session, current_user,
                    delete_session, set_cookie, verify_login)
-from .models import (AskIn, AskOut, ConversationDetail, ConversationOut, ImportIn,
+from .models import (AdminUserOut, AskIn, AskOut, ConversationDetail, ConversationOut, ImportIn,
                      LoginIn, MessageOut, ModelsOut, NewConversationIn, UserOut)
 
 app = FastAPI(title="Laynes Intelligence API", docs_url=None, redoc_url=None)
@@ -212,6 +212,33 @@ def _ask(cid: int, question: str, model: str | None, user,
     row = convo.owned(cid, user["id"])
     return AskOut(conversation_id=cid, title=row["title"], answer=answer,
                   duration_ms=dur)
+
+
+# ── super admin: read other users' chats ────────────────────────────────────
+def admin_user(user=Depends(current_user)):
+    if user["role"] != "super_admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
+@app.get("/api/admin/users", response_model=list[AdminUserOut])
+def admin_list_users(admin=Depends(admin_user)):
+    return [AdminUserOut(**r) for r in convo.admin_users()]
+
+
+@app.get("/api/admin/users/{uid}/conversations", response_model=list[ConversationOut])
+def admin_user_conversations(uid: int, admin=Depends(admin_user)):
+    return [ConversationOut(**r) for r in convo.list_for_user(uid, limit=500)]
+
+
+@app.get("/api/admin/conversations/{cid}", response_model=ConversationDetail)
+def admin_get_conversation(cid: int, admin=Depends(admin_user)):
+    found = convo.admin_conversation(cid)
+    if not found:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    row, msgs = found
+    return ConversationDetail(id=row["id"], title=row["title"], model=row["model"],
+                              messages=[MessageOut(**m) for m in msgs])
 
 
 # ── import / export ─────────────────────────────────────────────────────────
