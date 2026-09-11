@@ -2514,10 +2514,13 @@ class ChatResult:
         self.steps = steps  # [{sql, row_count, error}]
 
 
-def answer_question(history: list[dict], question: str, model: str | None = None) -> ChatResult:
+def answer_question(history: list[dict], question: str, model: str | None = None,
+                    attachments: list[dict] | None = None) -> ChatResult:
     """
     history: prior turns as [{"role": "user"|"assistant", "content": str}, ...]
     model: override the default MODEL for this call (e.g. a per-conversation choice).
+    attachments: Anthropic content blocks (image / document / text) sent with
+        this question only; they are not replayed on later turns.
     Returns ChatResult(answer, steps). Raises anthropic.APIError on API failure.
     """
     client = anthropic.Anthropic()  # ANTHROPIC_API_KEY from env
@@ -2525,7 +2528,11 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     messages: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history
     ]
-    messages.append({"role": "user", "content": question})
+    if attachments:
+        messages.append({"role": "user", "content": [
+            *attachments, {"type": "text", "text": question}]})
+    else:
+        messages.append({"role": "user", "content": question})
 
     steps: list[dict] = []
     final_text = ""

@@ -33,12 +33,13 @@ def assistant_configured() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY"))
 
 
-def ask(history, question: str, model: str):
+def ask(history, question: str, model: str, attachments: list[dict] | None = None):
     """Returns (answer, steps, duration_ms, error). Never raises to the caller."""
     started = time.time()
     error = None
     try:
-        result = chat_sql.answer_question(history, question, model=model)
+        result = chat_sql.answer_question(history, question, model=model,
+                                          attachments=attachments)
         answer, steps = result.answer, result.steps
     except Exception as exc:                      # noqa: BLE001
         # The class name is safe to record; the message may carry internals, so

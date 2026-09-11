@@ -16,8 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-from fastapi import (Cookie, Depends, FastAPI, File, HTTPException, Response,
+import base64
+
+from fastapi import (Cookie, Depends, FastAPI, File, Form, HTTPException, Response,
                      UploadFile, status)
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -125,14 +128,67 @@ def ask(cid: int, body: AskIn, user=Depends(current_user)):
     A12 is NOT re-implemented here: chat_sql.answer_question runs the same gate
     it always has, server-side, before any transactional business SQL.
     """
+    return _ask(cid, body.question, body.model, user)
+
+
+# Images and PDFs go to the model natively; text-like files are inlined.
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_TEXT_EXTS = (".txt", ".csv", ".md", ".json", ".tsv", ".log")
+MAX_FILES = 5
+MAX_FILE_BYTES = 10_000_000
+
+
+async def _to_block(f: UploadFile) -> dict:
+    raw = await f.read(MAX_FILE_BYTES + 1)
+    name = f.filename or "file"
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail=f"{name} is larger than 10 MB.")
+    ctype = (f.content_type or "").lower()
+    if ctype in _IMAGE_TYPES:
+        return {"type": "image", "source": {
+            "type": "base64", "media_type": ctype,
+            "data": base64.b64encode(raw).decode()}}
+    if ctype == "application/pdf" or name.lower().endswith(".pdf"):
+        return {"type": "document", "title": name, "source": {
+            "type": "base64", "media_type": "application/pdf",
+            "data": base64.b64encode(raw).decode()}}
+    if ctype.startswith("text/") or name.lower().endswith(_TEXT_EXTS):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail=f"{name} is not UTF-8 text.")
+        return {"type": "document", "title": name,
+                "source": {"type": "text", "media_type": "text/plain", "data": text}}
+    raise HTTPException(
+        status_code=415,
+        detail=f"{name}: unsupported type. Use an image, PDF, or text/CSV file.")
+
+
+@app.post("/api/conversations/{cid}/messages/upload", response_model=AskOut)
+async def ask_with_files(cid: int, question: str = Form(...),
+                         model: str | None = Form(default=None),
+                         files: list[UploadFile] = File(default=[]),
+                         user=Depends(current_user)):
+    """Same as ask, plus up to MAX_FILES attachments sent with this turn only."""
+    if len(files) > MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"Attach at most {MAX_FILES} files.")
+    blocks = [await _to_block(f) for f in files]
+    names = [f.filename or "file" for f in files]
+    return await run_in_threadpool(_ask, cid, question, model, user, blocks, names)
+
+
+def _ask(cid: int, question: str, model: str | None, user,
+         attachments: list[dict] | None = None, names: list[str] | None = None):
     if not chat_svc.assistant_configured():
         raise HTTPException(status_code=503,
                             detail="The assistant is not configured on the server.")
-    question = body.question.strip()
+    question = question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if len(question) > 4000:
+        raise HTTPException(status_code=400, detail="Question is too long.")
 
-    model = chat_svc.resolve_model(body.model)
+    model = chat_svc.resolve_model(model)
     is_new = cid == 0
     if is_new:
         cid = convo.create(user["id"], convo.auto_title(question), model)
@@ -142,9 +198,11 @@ def ask(cid: int, body: AskIn, user=Depends(current_user)):
         convo.set_model(cid, model)
 
     history = convo.messages(cid, user["id"]) or []
-    convo.add_message(cid, "user", question)
+    # File bytes are not stored; the transcript records which files were sent.
+    stored = question + ("".join(f"\n📎 {n}" for n in names) if names else "")
+    convo.add_message(cid, "user", stored)
 
-    answer, steps, dur, error = chat_svc.ask(history, question, model)
+    answer, steps, dur, error = chat_svc.ask(history, question, model, attachments)
 
     convo.add_message(cid, "assistant", answer)
     convo.touch(cid, title=convo.auto_title(question) if is_new else None)

@@ -69,6 +69,16 @@ export const api = {
       method: 'POST', body: JSON.stringify({ question, model }),
     }),
 
+  askWithFiles: (id: number, question: string, model: string, files: File[]) => {
+    const fd = new FormData()
+    fd.append('question', question)
+    fd.append('model', model)
+    files.forEach((f) => fd.append('files', f))
+    return request<AskResponse>(`/api/conversations/${id}/messages/upload`, {
+      method: 'POST', body: fd,
+    })
+  },
+
   importConversation: (file: File) => {
     const fd = new FormData()
     fd.append('file', file)

@@ -83,13 +83,17 @@ export function Chat({ user, onSignedOut }: { user: User; onSignedOut: () => voi
     setError(null); setSidebarOpen(false); setAtBottom(true)
   }
 
-  const send = async (question: string) => {
-    setError(null); setPending(question)
+  const send = async (question: string, files: File[] = []) => {
+    // Mirrors how the server stores the turn, so a reload looks the same.
+    const shown = question + files.map((f) => `\n📎 ${f.name}`).join('')
+    setError(null); setPending(shown)
     // Sending is an explicit action, so it always returns you to the end.
     setAtBottom(true)
     try {
-      const res = await api.ask(activeId ?? 0, question, model)
-      setMessages((prev) => [...prev, { role: 'user', content: question },
+      const res = files.length
+        ? await api.askWithFiles(activeId ?? 0, question, model, files)
+        : await api.ask(activeId ?? 0, question, model)
+      setMessages((prev) => [...prev, { role: 'user', content: shown },
                                        { role: 'assistant', content: res.answer }])
       setActiveId(res.conversation_id)
       refreshList()

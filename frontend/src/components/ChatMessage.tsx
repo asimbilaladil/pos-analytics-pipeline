@@ -18,7 +18,7 @@ export function UserMessage({ content }: { content: string }) {
           filling each one with the brand colour turns the transcript into a
           wall of red. Red stays reserved for actions; the bubble is
           distinguished by shape, tint and alignment instead. */}
-      <div className="max-w-[72%] rounded-2xl rounded-br-md border border-brand-100 bg-brand-50 px-4 py-3 text-[14.5px] leading-relaxed text-ink-900">
+      <div className="max-w-[72%] rounded-2xl rounded-br-md border border-brand-100 bg-brand-50 px-4 py-3 text-[14.5px] leading-relaxed text-ink-900 whitespace-pre-wrap break-words">
         {content}
       </div>
     </div>
