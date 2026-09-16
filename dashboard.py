@@ -3,6 +3,7 @@ dashboard.py — Laynes Daily Prediction Dashboard
 Streamlit app serving 15-min item forecasts for all 11 locations.
 """
 
+import json
 import os
 import re
 from datetime import date, timedelta
@@ -20,6 +21,7 @@ import plotly.graph_objects as go
 import psycopg2
 import psycopg2.extras
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -708,6 +710,61 @@ def zebra_style(df: pd.DataFrame):
 
 
 
+def build_slot_print_html(display_df: pd.DataFrame, loc_name: str, flavor_name: str,
+                          selected_date, n_weeks: int, has_actual: bool,
+                          pred_total: float, act_total=None) -> str:
+    """Self-contained printable page for the 'Every 15 min' table.
+
+    Kept independent of the on-screen table (progress bars and emoji dots don't
+    print well) — plain numbers, repeating header row across pages, black on white.
+    """
+    dow_name = selected_date.strftime("%A")
+    cols = ["Time", "Predicted"] + (["Actual", "Gap"] if has_actual else [])
+    head = "".join(f"<th>{esc(c)}</th>" for c in cols)
+
+    rows = []
+    for _, r in display_df.iterrows():
+        cells = [f'<td class="t">{esc(str(r["Time"]))}</td>',
+                 f'<td class="n">{float(r["Predicted"]):,.0f}</td>']
+        if has_actual:
+            a = r["Actual"]
+            cells.append(f'<td class="n">{"—" if pd.isna(a) else f"{float(a):,.0f}"}</td>')
+            # Strip the emoji dot — it prints as a grey blob on most printers.
+            cells.append(f'<td class="n">{esc(str(r["Gap"]).split(" ")[-1])}</td>')
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    summary = f"Predicted total: <b>{pred_total:,.0f}</b>"
+    if has_actual and act_total is not None:
+        gap = (act_total - pred_total) / pred_total * 100 if pred_total else 0
+        summary += (f" &nbsp;·&nbsp; Actual total: <b>{act_total:,.0f}</b>"
+                    f" &nbsp;·&nbsp; Gap: <b>{gap:+.0f}%</b>")
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>{esc(loc_name)} — {esc(flavor_name)} — {selected_date:%Y-%m-%d}</title>
+<style>
+ @page {{ size: letter portrait; margin: 12mm; }}
+ body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; color:#111; margin:0; }}
+ h1 {{ font-size:18px; margin:0 0 2px; }}
+ .sub {{ font-size:11px; color:#444; margin-bottom:4px; }}
+ .sum {{ font-size:12px; margin-bottom:10px; }}
+ table {{ width:100%; border-collapse:collapse; font-size:11px; }}
+ thead {{ display:table-header-group; }}   /* repeat header on every page */
+ tr {{ page-break-inside:avoid; }}
+ th, td {{ border:1px solid #bbb; padding:3px 6px; }}
+ th {{ background:#eee; text-align:left; }}
+ td.n {{ text-align:right; }}
+ tbody tr:nth-child(even) {{ background:#f4f4f7; }}
+ .foot {{ margin-top:10px; font-size:10px; color:#666; }}
+ @media print {{ .noprint {{ display:none; }} }}
+ .noprint button {{ font-size:14px; padding:6px 14px; margin-bottom:10px; cursor:pointer; }}
+</style></head><body>
+<div class="noprint"><button onclick="window.print()">Print / Save as PDF</button></div>
+<h1>{esc(loc_name)} — {esc(flavor_name)} — every 15 min</h1>
+<div class="sub">{dow_name}, {selected_date:%B %-d, %Y} · predicted from the last {n_weeks} {dow_name}s (median per slot)</div>
+<div class="sum">{summary}</div>
+<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>
+<div class="foot">Laynes · Tender Planning — generated {selected_date:%Y-%m-%d}</div>
+</body></html>"""
 
 # ── Tender planning helpers ───────────────────────────────────────────────────
 
@@ -1171,6 +1228,34 @@ if page == "🍗 Tender Planning":
                 display_df["Actual"] = "—"
                 display_df["Gap"] = "—"
 
+            # ── Print / share ────────────────────────────────────────────
+            _print_html = build_slot_print_html(
+                display_df, loc["name"], flavor_name, selected_date, n_weeks,
+                has_actual, pred_total,
+                slotly["actual"].sum(skipna=True) if has_actual else None,
+            )
+            # "</" must be escaped or the page's own closing tags would end the
+            # <script> block this string is embedded in.
+            _js_html = json.dumps(_print_html).replace("</", "<\\/")
+            _pc1, _ = st.columns([1, 5])
+            with _pc1:
+                # Opened from an iframe button so the click counts as a user
+                # gesture (popup blockers reject window.open otherwise).
+                components.html(
+                    f"""<button id="p" style="width:100%;padding:7px 10px;border:1px solid #c7c9d9;
+                    border-radius:8px;background:#fff;font:600 14px 'Plus Jakarta Sans',sans-serif;
+                    cursor:pointer">🖨️ Print table</button>
+                    <script>
+                    const html = {_js_html};
+                    document.getElementById('p').onclick = () => {{
+                      const w = window.open('', '_blank');
+                      if (!w) {{ alert('Allow pop-ups for this site, then click Print again.'); return; }}
+                      w.document.write(html); w.document.close(); w.focus();
+                      setTimeout(() => w.print(), 400);
+                    }};
+                    </script>""",
+                    height=44,
+                )
             # Zebra-striped rows so the eye tracks across 90+ slots more easily.
             event = st.dataframe(
                 zebra_style(display_df),
