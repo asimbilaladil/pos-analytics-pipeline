@@ -1,0 +1,32 @@
+[Unit]
+Description=HME drive-thru daily canonical ingest (Power BI querydata -> PostgreSQL)
+Documentation=file:///root/pos-analytics-pipeline/migrations/39_hme_canonical.sql
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline
+# One orchestration service rather than two ordered units: a failed extraction
+# must PREVENT the load, not merely be sequenced before it. The orchestrator
+# owns the lock, the bounded-backoff retries, and the hme_ingest_run record.
+#
+# The extractor itself lives in the separate downloader application at
+# /opt/hme-report-downloader and is invoked as a subprocess; its source is
+# deliberately not part of this repository.
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline/hme_daily_ingest.py
+# Credentials reach the child through the orchestrator, which reads this file
+# directly (root-only, 0600). Deliberately NOT EnvironmentFile=, so the values
+# never appear in `systemctl show` or the journal.
+Environment=HME_ENV_FILE=/etc/laynes/hme-downloader.env
+Environment=HME_DOWNLOADER_DIR=/opt/hme-report-downloader
+Environment=HME_RAW_DIR=/var/lib/laynes/hme/raw
+Environment=HME_LOG_DIR=/var/lib/laynes/hme/logs
+# Playwright drives a real Chromium; four Power BI reports with settle time plus
+# up to two backoff retries fits comfortably inside this ceiling.
+TimeoutStartSec=5400
+# A tenant-scope abort exits 1 and must stay visible as a failure.
+# 75 (EX_TEMPFAIL) means "another run held the lock" and is not a failure.
+SuccessExitStatus=0 75
+StandardOutput=append:/var/lib/laynes/hme/logs/daily-ingest.service.log
+StandardError=append:/var/lib/laynes/hme/logs/daily-ingest.service.log

@@ -1,0 +1,50 @@
+[Unit]
+Description=Daily HME canonical ingest at 05:30 America/Chicago
+
+[Timer]
+# The timezone MUST be part of the OnCalendar EXPRESSION (systemd 252+).
+# A `Timezone=` key in [Timer] does not exist and is silently ignored, which
+# resolves the elapse to UTC instead -- the same trap already documented in
+# laynes-loyalty-labor-sync.timer. Bare `TZ=` in crontab is likewise not
+# honoured on this host.
+#
+# Verify after any change with:  systemctl list-timers hme-daily-ingest.timer
+#   during CDT (summer) the next elapse must read 10:30 UTC
+#   during CST (winter) the next elapse must read 11:30 UTC
+#
+# Why 05:30 Chicago (moved from 03:30 on 2026-09-17)
+# ---------------------------------------------------
+# 03:30 was chosen on the premise that HME is near real-time with no overnight
+# delay. That held for Performance Analysis and Outliers but NOT for the Trend
+# Dashboard. The first unattended run (03:32:47 CDT, business_date 2026-09-16,
+# run_id 63) found:
+#
+#     PA total_orders          = 5783
+#     Trend total_cars         = 5730   (delta -53)
+#     store mismatches         = 5      (01 San Marcos -1, 115 Shepherd -34,
+#                                        1153869 BAUM -14, 1163022 Missouri City -1,
+#                                        16 Pasadena -3)
+#
+# Re-extracting the SAME completed business date 6h09m later (09:42 CDT, run_id
+# 64) reconciled fully: Trend 5783 = PA 5783, 0 mismatches, every other store
+# unchanged and PA byte-identical across both extracts. Only the five lagging
+# Trend figures caught up, which is the signature of upstream Trend aggregation
+# settling rather than an incomplete business day.
+#
+# The earlier 8 business dates showed 0 mismatches only because they were
+# backfilled 1-8 days after they closed -- they never tested the schedule.
+#
+# 05:30 gives ~2 extra hours of settling over 03:30 while staying well before
+# normal business reporting usage. It also stays clear of
+# laynes-loyalty-labor-sync.timer at 04:15 Chicago, so the two never contend.
+#
+# The settle point is bracketed, not pinpointed: unreconciled at 03:32,
+# reconciled by 09:42. If a PARTIAL day recurs at 05:30, move later -- a
+# too-early run is now self-announcing (hme_load records status='partial' and
+# exits 2) and the day stays idempotently correctable.
+OnCalendar=*-*-* 05:30:00 America/Chicago
+Persistent=true
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target
