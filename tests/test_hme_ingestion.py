@@ -864,6 +864,232 @@ finally:
     conn11.close()
 
 # ---------------------------------------------------------------------------
+print("\n== date-control detection is independent of fact-field mapping ==")
+# HME migrates reports onto a renamed model one report at a time, repeatedly, so
+# neither the date control nor the field names may be assumed per report. These
+# are detected separately: the extractor classifies the date control, hme.facts
+# classifies the semantic fields.
+import hme_querydata as hq  # noqa: E402
+
+spec = hq.DATE_STRUCTURES
+check("date-control spec exposes both naming families",
+      bool(spec["old_naming"]) and bool(spec["new_naming"]))
+check("old range control allowlist is Date_Table[Date]",
+      spec["old_range_controls"] == ("Date_Table[Date]",), str(spec["old_range_controls"]))
+check("new range controls allowlist both observed targets",
+      set(spec["new_range_controls"]) == {"Dim_Date[Date]", "Dates_Filter[date]"},
+      str(spec["new_range_controls"]))
+check("mode slicer is not treated as a range control",
+      "Dates_Filter[Date Filter]" not in spec["old_range_controls"]
+      and "Dates_Filter[Date_Filter]" not in spec["new_range_controls"])
+
+import re as _re
+cd = _re.compile(spec["custom_date_page_re"], _re.I)
+for pg, want in (("Performance Analysis CD", True), ("Trend Dashboard CD", True),
+                 ("Outliers CD", True), ("Custom Date", True), ("Custom Dates", True),
+                 ("Date Interval", False), ("Performance Analysis", False),
+                 ("Trend Dashboard", False), ("Outliers", False)):
+    check(f"custom-date page match {pg!r} -> {want}", bool(cd.search(pg.strip())) == want)
+
+# The detection contract, asserted as a pure decision table mirroring the JS.
+def classify(targets, pages):
+    """Mirror of the extractor's PHASE 2 decision, for testing the contract."""
+    old = any(t.startswith(x) for t in targets for x in spec["old_naming"])
+    new = any(t.startswith(x) for t in targets for x in spec["new_naming"])
+    cdp = next((p for p in pages if cd.search(p.strip())), None)
+    if old and new:
+        return "UNKNOWN"
+    if old:
+        ctl = next((c for c in spec["old_range_controls"] if c in targets), None)
+        return "OLD_REPORT_FILTER" if ctl else "UNKNOWN"
+    if new:
+        if not cdp:
+            return "UNKNOWN"
+        ctl = next((c for c in spec["new_range_controls"] if c in targets), None)
+        return "NEW_PAGE_SLICER" if ctl else "UNKNOWN"
+    return "UNKNOWN"
+
+# Observed 2026-09-15 (all four on the old model)
+check("PA old structure -> OLD_REPORT_FILTER",
+      classify(["Date_Table[Date]", "DIM User Info[User_EmailAddress]",
+                "Dates_Filter[Date Filter]"],
+               ["Performance Analysis"]) == "OLD_REPORT_FILTER")
+check("Trend old structure -> OLD_REPORT_FILTER",
+      classify(["Date_Table[Date]", "Dates_Filter[Date Filter]"],
+               ["Trend Dashboard"]) == "OLD_REPORT_FILTER")
+check("Multi old structure -> OLD_REPORT_FILTER",
+      classify(["Date_Table[Day_Name]", "DIM User Info[User_EmailAddress]",
+                "Detector Event Data Hour[Detector]", "Date_Table[Date]"],
+               ["Multi Store - Summary Report", "Multi Store - Day CD Store TM"])
+      == "OLD_REPORT_FILTER")
+check("Outliers old structure still -> OLD_REPORT_FILTER (unchanged behaviour)",
+      classify(["Dates_Filter[Date Filter]", "Device Event Statistics[Store Number]",
+                "DIM User Info[User_EmailAddress]", "Date_Table[Date]"],
+               ["Outliers CD", "Outliers"]) == "OLD_REPORT_FILTER")
+
+# Observed 2026-09-17/18 (the rollout)
+check("PA new structure -> NEW_PAGE_SLICER via Dim_Date[Date]",
+      classify(["Dim_Date[Date]", "Dim_User_Info[User_EmailAddress]",
+                "Dates_Filter[Start_Day]", "Fact_Detectors_Eventdata_Daypart[DayPart_Id]"],
+               ["Performance Analysis", "Performance Analysis CD"]) == "NEW_PAGE_SLICER")
+check("Trend new structure -> NEW_PAGE_SLICER via Dim_Date[Date]",
+      classify(["Dim_Date[Date]", "Dates_Filter[Start_Day]", "Trends_info[DetectorGrouped]"],
+               ["Trend Dashboard", "Trend Dashboard CD"]) == "NEW_PAGE_SLICER")
+check("Multi new structure -> NEW_PAGE_SLICER via Dates_Filter[date]",
+      classify(["Dates_Filter[Start_Day]", "Dates_Filter[date]", "Dim_Date[Day_Name]",
+                "Dim_Group_Level[Level]", "Fact_Detectors_Eventdata_Daypart[Day Part]"],
+               ["Date Interval", "Custom Date"]) == "NEW_PAGE_SLICER")
+# The exact case that broke production on 2026-09-18: report filters reduced to
+# Dates_Filter[Start_Day] alone identifies nothing, so slicer targets must count.
+check("Multi with only Dates_Filter[Start_Day] in FILTERS is UNKNOWN on filters alone",
+      classify(["Dates_Filter[Start_Day]"], ["Date Interval", "Custom Date"]) == "UNKNOWN")
+check("...but resolves once slicer targets are included",
+      classify(["Dates_Filter[Start_Day]", "Dim_Date[Day_Name]", "Dates_Filter[date]"],
+               ["Date Interval", "Custom Date"]) == "NEW_PAGE_SLICER")
+
+# Fail-closed cases
+check("both naming families present -> UNKNOWN",
+      classify(["Date_Table[Date]", "Dim_Date[Date]"],
+               ["X CD"]) == "UNKNOWN")
+check("new naming but no custom-date page -> UNKNOWN",
+      classify(["Dim_Date[Date]", "Dim_User_Info[x]"], ["Only Page"]) == "UNKNOWN")
+check("new naming, custom-date page, but no allowlisted range control -> UNKNOWN",
+      classify(["Dim_User_Info[x]", "Fact_Detectors_Eventdata_Daypart[y]"],
+               ["Custom Date"]) == "UNKNOWN")
+check("old naming but no Date_Table[Date] range control -> UNKNOWN",
+      classify(["DIM User Info[User_EmailAddress]", "Date_Table[Day_Name]"],
+               ["Outliers"]) == "UNKNOWN")
+check("page name alone is never sufficient evidence",
+      classify(["Something_Else[x]"], ["Custom Date"]) == "UNKNOWN")
+check("unknown structure entirely -> UNKNOWN",
+      classify(["Weird_Table[col]"], ["Page A", "Page B"]) == "UNKNOWN")
+
+# ---------------------------------------------------------------------------
+print("\n== fact field maps: OLD and NEW, detected per fact set ==")
+
+def _fex(fields, rows, date_lit=None):
+    keys = [f"M{i}" for i in range(len(fields))]
+    sel = [{"Kind": 2, "Value": k, "Name": nm} for k, nm in zip(keys, fields)]
+    dm = [{"S": [{"N": k, "T": 4} for k in keys], "C": rows[0]}]
+    for r in rows[1:]:
+        dm.append({"C": r})
+    where = ([{"Condition": {"c": f"datetime'{date_lit}T00:00:00'"}}] if date_lit else [])
+    return {"endpoint_class": "shared:explore/querydata",
+            "req_body": {"queries": [{"Query": {"Commands": [
+                {"SemanticQueryDataShapeCommand": {"Query": {
+                    "Version": 2, "From": [], "Select": sel, "Where": where}}}]}}]},
+            "resp_json": {"results": [{"result": {"data": {
+                "descriptor": {"Select": sel},
+                "dsr": {"DS": [{"N": "DS0", "PH": [{"DM1": dm}]}]}}}}]}}
+
+SD_OLD = dict(hfacts.STORE_DAILY_MAPS)["old"]
+SD_NEW = dict(hfacts.STORE_DAILY_MAPS)["new"]
+ORDER = ("store", "total_orders", "regular_orders", "disastrous_orders", "disastrous_pct",
+         "lane_total_avg_seconds", "lane_queue_avg_seconds", "lane_total_2_avg_seconds",
+         "lane_total_goal_d_seconds")
+VALS = [" 00111 Beaumont", 168, 139, 29, "0.172", 201, 55, 201, 285]
+
+for label, fm in (("OLD", SD_OLD), ("NEW", SD_NEW)):
+    ex = _fex([fm[k] for k in ORDER], [VALS], date_lit="2026-09-17")
+    r = hfacts.store_daily([ex], "2026-09-17")
+    ok = r is not None and r["schema"] == label.lower() and len(r["rows"]) == 1
+    row = r["rows"][0] if ok else {}
+    check(f"store_daily {label} field map detected",
+          ok and row.get("hme_store_number") == "00111"
+          and row.get("total_orders") == 168
+          and row.get("lane_total_goal_d_seconds") == 285,
+          json.dumps(row)[:150] if ok else str(r))
+
+TR_OLD = dict(hfacts.TREND_MAPS)["old"]
+TR_NEW = dict(hfacts.TREND_MAPS)["new"]
+for label, fm in (("OLD", TR_OLD), ("NEW", TR_NEW)):
+    ex = _fex([fm["store"], fm["total_cars"], fm["avg_time_seconds"]],
+              [[" 00111 Beaumont", 168, 201]], date_lit="2026-09-17")
+    r = hfacts.trend_store_daily([ex], "2026-09-17")
+    ok = r is not None and r["schema"] == label.lower()
+    row = r["rows"][0] if ok else {}
+    check(f"trend_store_daily {label} field map detected",
+          ok and row.get("hme_store_number") == "00111" and row.get("total_cars") == 168,
+          json.dumps(row)[:120] if ok else str(r))
+
+# Outliers must keep working unchanged
+OU = dict(hfacts.OUTLIERS_MAPS)["old"]
+# outliers_daily requires >= 6 projections on the identity query, matching the
+# real visual (it also carries Total_Car_Departure), so the fixture must too.
+ex_o = _fex([OU["store"], OU["store_name"], OU["all_car_records"],
+             OU["total_outliers"], OU["outlier_pct"],
+             "Device Event Statistics.Total_Car_Departure"],
+            [["00111", "Beaumont", 180, 12, "0.066", 168]], date_lit="2026-09-17")
+r = hfacts.outliers_daily([ex_o], "2026-09-17")
+check("outliers_daily old path still works unchanged",
+      r is not None and r["rows"] and r["rows"][0]["hme_store_number"] == "00111"
+      and r["rows"][0]["all_car_records"] == 180
+      and r["rows"][0]["car_departures"] == 168,
+      json.dumps(r["rows"][0])[:150] if (r and r["rows"]) else str(r))
+
+# Known date strategy + UNKNOWN fact schema must fail closed
+bad = _fex(["Weird_Fact.Total Order", "Weird_Dim.store", "Weird_Fact.Threshold"],
+           [[" 00111 Beaumont", 1, 2]], date_lit="2026-09-17")
+try:
+    hfacts.store_daily([bad], "2026-09-17")
+    check("unknown store_daily fact schema fails closed", False, "did not raise")
+except hfacts.UnknownFactSchema:
+    check("unknown store_daily fact schema fails closed", True)
+bad_t = _fex(["Weird_Fact.TotalCars", "Weird_Dim.Desc_Level"],
+             [[" 00111 Beaumont", 5]], date_lit="2026-09-17")
+try:
+    hfacts.trend_store_daily([bad_t], "2026-09-17")
+    check("unknown trend fact schema fails closed", False, "did not raise")
+except hfacts.UnknownFactSchema:
+    check("unknown trend fact schema fails closed", True)
+check("no recognisable fields at all yields None, not an error",
+      hfacts.store_daily([_fex(["A.b"], [["x"]], date_lit="2026-09-17")],
+                         "2026-09-17") is None)
+
+# Store identity split is value-driven, not flag-driven
+for raw, want in ((" 00111 Beaumont", ("00111", "Beaumont")),
+                  ("00111", ("00111", None)),
+                  ("  002 Lewisville ", ("002", "Lewisville")),
+                  ("1", ("1", None))):
+    check(f"store split {raw!r} -> {want}", hfacts._split_store(raw) == want,
+          str(hfacts._split_store(raw)))
+
+# ---------------------------------------------------------------------------
+print("\n== 2026-09-17 rollout regression ==")
+conn12 = hme_load.connect()
+try:
+    c12 = conn12.cursor()
+    c12.execute("""SELECT count(*) FROM hme_store_daily WHERE business_date='2026-09-17'""")
+    check("2026-09-17 loaded with 34 canonical rows", c12.fetchone()[0] == 34)
+    c12.execute("""SELECT count(*) FROM v_hme_store_daily_verified
+                   WHERE business_date='2026-09-17'""")
+    check("2026-09-17 exposes 11 verified rows", c12.fetchone()[0] == 11)
+    c12.execute("""SELECT sum(total_orders), sum(total_cars) FROM hme_store_daily
+                   WHERE business_date='2026-09-17'""")
+    pa, tr = c12.fetchone()
+    check("2026-09-17 PA and Trend totals agree at 6482", pa == 6482 and tr == 6482,
+          f"PA={pa} Trend={tr}")
+    c12.execute("""SELECT count(*) FROM hme_store_daily
+                   WHERE business_date='2026-09-17'
+                     AND total_orders IS DISTINCT FROM total_cars""")
+    check("2026-09-17 has no Trend mismatches", c12.fetchone()[0] == 0)
+    c12.execute("""SELECT count(*) FROM hme_store_daily d
+                   JOIN hme_goal_history g USING (hme_store_number)
+                   WHERE d.business_date='2026-09-17' AND g.effective_to_date IS NULL
+                     AND d.lane_total_goal_d_seconds IS DISTINCT FROM g.goal_d_seconds""")
+    check("2026-09-17 Goal D matches PA Threshold for every store", c12.fetchone()[0] == 0)
+    c12.execute("""SELECT extractor_version FROM hme_ingest_run
+                   WHERE business_date='2026-09-17' AND status='succeeded'
+                   ORDER BY run_id DESC LIMIT 1""")
+    check("09-17 recorded by the rollout-compatible extractor",
+          (c12.fetchone() or [None])[0] == "hme_querydata/1.4.0")
+    c12.execute("""SELECT count(*) FROM hme_ingest_run
+                   WHERE business_date='2026-09-17' AND status='failed'""")
+    check("the original 09-17 failure remains auditable", c12.fetchone()[0] >= 1)
+finally:
+    conn12.close()
+
+# ---------------------------------------------------------------------------
 passed = sum(1 for _, ok, _ in results if ok)
 failed = len(results) - passed
 print(f"\n{'='*66}\nHME ingestion tests: {passed} passed, {failed} failed, {len(results)} total")
