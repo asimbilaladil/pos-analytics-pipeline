@@ -1,0 +1,11 @@
+-- Export the HME tenant allowlist for the (separate) extractor application.
+--
+-- Two distinct jobs are served by this one file:
+--   SECURITY    -- the extractor fails closed if a querydata result contains a
+--                  store number that is not in this list, which prevents a lost
+--                  scope filter from silently ingesting another HME customer.
+--   COMPLETENESS -- mapping_status lets the extractor grade a MISSING store.
+--                  A missing VERIFIED store is a hard stop (those 11 are
+--                  mandatory for Laynes analytics); a missing OUT_OF_SCOPE store
+--                  marks the day incomplete without blocking it.
+\copy (SELECT json_agg(json_build_object('hme_store_number', hme_store_number, 'hme_store_name', hme_store_name, 'mapping_status', mapping_status) ORDER BY hme_store_number) FROM hme_store_mapping WHERE active) TO PROGRAM 'cat > /var/lib/laynes/hme/state/tenant_inventory.json'
