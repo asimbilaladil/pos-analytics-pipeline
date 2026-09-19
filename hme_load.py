@@ -32,7 +32,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ov
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "hme_load/1.3.0"
+LOADER_VERSION = "hme_load/1.4.0"
 RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 FORBIDDEN_KEYS = ("token", "id_token", "ctx_token", "cookie", "password", "authorization")
 
@@ -322,6 +322,14 @@ def load(doc, conn, dry_run=False):
         "verified_observed_count": sum(
             1 for n in payload_stores
             if (inv[n]["mapping_status"] or "").upper() == "VERIFIED"),
+        # Both directions are exposed explicitly so no reader has to guess
+        # which population a count refers to.
+        "out_of_scope_expected_count": sum(
+            1 for v in inv.values()
+            if (v["mapping_status"] or "").upper() == "OUT_OF_SCOPE"),
+        "out_of_scope_observed_count": sum(
+            1 for n in payload_stores
+            if (inv[n]["mapping_status"] or "").upper() == "OUT_OF_SCOPE"),
         "complete": not missing,
     }
 
@@ -334,10 +342,23 @@ def load(doc, conn, dry_run=False):
 
     recon_ok, recon = reconcile(doc)
 
-    cur.execute("""SELECT count(*) FILTER (WHERE mapping_status='VERIFIED'),
-                          count(*) FILTER (WHERE mapping_status='OUT_OF_SCOPE')
-                   FROM hme_store_mapping WHERE active""")
-    verified_n, oos_n = cur.fetchone()
+    # store_count / verified_store_count / out_of_scope_store_count on
+    # hme_ingest_run are all OBSERVED counts -- what this extract actually
+    # returned. They were previously mixed: store_count came from the payload
+    # while the other two were counted from the mapper inventory, which is the
+    # EXPECTED population. That went unnoticed while every day was complete
+    # (observed == expected), and first showed up on 2026-09-18 as
+    # "33 stores = 11 verified + 23 out_of_scope", which does not add up.
+    # Expected counts live in freshness_detail->completeness.
+    def _status_of(n):
+        return (inv[n]["mapping_status"] or "").upper()
+    verified_n = sum(1 for n in payload_stores if _status_of(n) == "VERIFIED")
+    oos_n = sum(1 for n in payload_stores if _status_of(n) == "OUT_OF_SCOPE")
+    other_n = len(payload_stores) - verified_n - oos_n
+    if other_n:
+        recon["warnings"].append(
+            f"{other_n} observed store(s) have a mapping_status other than "
+            f"VERIFIED/OUT_OF_SCOPE; counted in store_count only")
 
     rows_received = sum(len(v) for v in doc["facts"].values())
     cur.execute("""
@@ -496,8 +517,11 @@ def main():
           f"written={res['rows_written']} (goal rows {res['goal_rows']})")
     c = res["completeness"]
     print(f"completeness: {'COMPLETE' if c['complete'] else 'INCOMPLETE'} "
-          f"{c['observed_store_count']}/{c['expected_store_count']} stores; "
-          f"VERIFIED {c['verified_observed_count']}/{c['verified_expected_count']}"
+          f"{c['observed_store_count']}/{c['expected_store_count']} stores "
+          f"(observed/expected); "
+          f"VERIFIED {c['verified_observed_count']}/{c['verified_expected_count']}; "
+          f"OUT_OF_SCOPE {c['out_of_scope_observed_count']}"
+          f"/{c['out_of_scope_expected_count']}"
           + (f"; missing {c['missing_store_numbers']} {c['missing_store_names']} "
              f"{c['missing_mapping_statuses']}" if not c['complete'] else ""))
     print(f"goals: {res['goal_stats']}")

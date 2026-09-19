@@ -1262,6 +1262,99 @@ finally:
     conn14.close()
 
 # ---------------------------------------------------------------------------
+print("\n== run counts are OBSERVED and internally consistent ==")
+# hme_ingest_run.store_count / verified_store_count / out_of_scope_store_count
+# are all OBSERVED. They were previously mixed -- store_count from the payload,
+# the other two from the mapper inventory -- which was invisible while every day
+# was complete and produced "33 = 11 + 23" on the first partial day.
+INCOMPLETE18 = "/var/lib/laynes/hme/raw/2026-09-18/querydata-facts.json"
+if os.path.exists(INCOMPLETE18):
+    with open(INCOMPLETE18) as fh:
+        doc18b = json.load(fh)
+    conn15 = hme_load.connect()
+    try:
+        res = hme_load.load(doc18b, conn15, dry_run=True)
+        c = res["completeness"]
+        check("observed counts add up: store_count == verified + out_of_scope",
+              c["observed_store_count"]
+              == c["verified_observed_count"] + c["out_of_scope_observed_count"],
+              f"{c['observed_store_count']} vs {c['verified_observed_count']}"
+              f"+{c['out_of_scope_observed_count']}")
+        check("2026-09-18 observed split is 33 == 11 + 22",
+              c["observed_store_count"] == 33
+              and c["verified_observed_count"] == 11
+              and c["out_of_scope_observed_count"] == 22,
+              json.dumps({k: c[k] for k in ("observed_store_count",
+                                            "verified_observed_count",
+                                            "out_of_scope_observed_count")}))
+        check("expected counts are exposed separately and still total 34",
+              c["expected_store_count"] == 34
+              and c["verified_expected_count"] == 11
+              and c["out_of_scope_expected_count"] == 23
+              and c["verified_expected_count"] + c["out_of_scope_expected_count"] == 34,
+              json.dumps({k: c[k] for k in ("expected_store_count",
+                                            "verified_expected_count",
+                                            "out_of_scope_expected_count")}))
+        check("observed out_of_scope is one fewer than expected (Frisco absent)",
+              c["out_of_scope_expected_count"] - c["out_of_scope_observed_count"] == 1)
+        conn15.rollback()
+    finally:
+        conn15.rollback()
+        conn15.close()
+else:
+    check("2026-09-18 extract present for count tests", False, INCOMPLETE18)
+
+conn16 = hme_load.connect()
+try:
+    c16 = conn16.cursor()
+    # The invariant must hold for EVERY run written under the corrected loader.
+    c16.execute("""SELECT count(*) FROM hme_ingest_run
+                   WHERE loader_version >= 'hme_load/1.4.0'
+                     AND store_count IS NOT NULL
+                     AND store_count <> verified_store_count + out_of_scope_store_count""")
+    check("no corrected-loader run violates store_count = verified + out_of_scope",
+          c16.fetchone()[0] == 0)
+    # And the stored counts must match the facts actually in the table.
+    c16.execute("""SELECT r.store_count, r.verified_store_count, r.out_of_scope_store_count
+                   FROM hme_ingest_run r
+                   WHERE r.business_date='2026-09-18' AND r.status='partial'
+                     AND r.loader_version >= 'hme_load/1.4.0'
+                   ORDER BY r.run_id DESC LIMIT 1""")
+    row = c16.fetchone()
+    if row:
+        c16.execute("""SELECT count(*),
+                              count(*) FILTER (WHERE m.mapping_status='VERIFIED'),
+                              count(*) FILTER (WHERE m.mapping_status='OUT_OF_SCOPE')
+                       FROM hme_store_daily d JOIN hme_store_mapping m USING (hme_store_number)
+                       WHERE d.business_date='2026-09-18'""")
+        facts = c16.fetchone()
+        check("run summary counts match the loaded facts exactly",
+              tuple(row) == tuple(facts), f"run={tuple(row)} facts={tuple(facts)}")
+    else:
+        check("a corrected-loader run exists for 2026-09-18", False, "none yet")
+
+    # reconciliation_ok must NOT be read as completeness
+    c16.execute("""SELECT count(*) FROM hme_ingest_run
+                   WHERE reconciliation_ok IS TRUE
+                     AND (freshness_detail->'completeness'->>'complete')::boolean IS FALSE
+                     AND status = 'succeeded'""")
+    check("a reconciled-but-incomplete run is never status=succeeded",
+          c16.fetchone()[0] == 0)
+    c16.execute("""SELECT count(*) FROM hme_ingest_run
+                   WHERE reconciliation_ok IS TRUE
+                     AND (freshness_detail->'completeness'->>'complete')::boolean IS FALSE""")
+    check("reconciliation_ok=true coexists with source_complete=false (independent axes)",
+          c16.fetchone()[0] >= 1)
+    # the cross-system view must not depend on run outcome at all
+    c16.execute("""SELECT pg_get_viewdef('v_hme_store_daily_verified'::regclass, true)""")
+    vdef = c16.fetchone()[0]
+    check("verified view is gated on mapping only, not on run status/reconciliation",
+          "hme_ingest_run" not in vdef and "reconciliation" not in vdef
+          and "mapping_status" in vdef)
+finally:
+    conn16.close()
+
+# ---------------------------------------------------------------------------
 passed = sum(1 for _, ok, _ in results if ok)
 failed = len(results) - passed
 print(f"\n{'='*66}\nHME ingestion tests: {passed} passed, {failed} failed, {len(results)} total")
