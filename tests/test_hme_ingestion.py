@@ -91,12 +91,16 @@ if HAVE_GUARD:
     except guard.TenantScopeError:
         check("foreign-brand store names rejected", True, f"rejected {names}")
 
-    # store-count mismatch (the 499-store leak signature)
+    # The 499-store leak signature. Widening is now caught by the ALLOWLIST
+    # (unknown stores), not by a raw count comparison -- count equality
+    # conflated widening with a store merely being absent, which is a different
+    # condition handled by assess_completeness.
+    leaked = set(INV) | {str(9000 + i) for i in range(465)}
     try:
-        guard.assert_store_count(499, 34, context="t")
-        check("abort when store count widens (499 vs 34)", False, "did not raise")
-    except guard.TenantScopeError:
-        check("abort when store count widens (499 vs 34)", True)
+        guard.assert_stores_in_inventory(leaked, INV, context="t")
+        check("abort when the result widens to 499 stores", False, "did not raise")
+    except guard.TenantScopeError as e:
+        check("abort when the result widens to 499 stores", "outside the maintained" in str(e))
 
     # date determinism helper
     q = {"Where": [{"c": "datetime'2026-09-14T00:00:00'"},
@@ -546,16 +550,26 @@ print("\n== automation idempotency + provenance ==")
 conn4 = hme_load.connect()
 try:
     c4 = conn4.cursor()
-    # Asserted as invariants (34 stores per day, 11 verified per day) rather
-    # than a hardcoded day count, so adding a day does not rot the test.
-    c4.execute("""SELECT count(*), count(DISTINCT business_date) FROM hme_store_daily""")
-    n, d = c4.fetchone()
-    check("hme_store_daily holds exactly 34 stores for every loaded day",
-          n == 34 * d, f"{n} rows over {d} days")
-    c4.execute("""SELECT count(*), count(DISTINCT business_date) FROM hme_outliers_daily""")
-    n2, d2 = c4.fetchone()
-    check("hme_outliers_daily holds exactly 34 for every loaded day",
-          n2 == 34 * d2 and d2 == d, f"{n2} rows over {d2} days")
+    # Invariants, not a hardcoded day count. A day may legitimately hold FEWER
+    # than 34 stores when the source omitted a non-VERIFIED store (absence is
+    # recorded as absence, never synthesised), but it must never hold more, and
+    # every loaded day must carry all 11 VERIFIED stores.
+    c4.execute("""SELECT count(*) FROM (SELECT business_date FROM hme_store_daily
+                  GROUP BY business_date HAVING count(*) > 34) x""")
+    check("no day holds more than 34 stores", c4.fetchone()[0] == 0)
+    c4.execute("""SELECT count(DISTINCT business_date) FROM hme_store_daily""")
+    d = c4.fetchone()[0]
+    c4.execute("""SELECT count(*) FROM (
+                    SELECT d.business_date FROM hme_store_daily d
+                    JOIN hme_store_mapping m USING (hme_store_number)
+                    WHERE m.mapping_status='VERIFIED'
+                    GROUP BY d.business_date HAVING count(*) <> 11) x""")
+    check("every loaded day carries all 11 VERIFIED stores", c4.fetchone()[0] == 0)
+    c4.execute("""SELECT count(*) FROM hme_store_daily""")
+    n = c4.fetchone()[0]
+    c4.execute("""SELECT count(*) FROM hme_outliers_daily""")
+    n2 = c4.fetchone()[0]
+    check("outliers rows match daily rows one-for-one", n == n2, f"{n} vs {n2}")
     c4.execute("""SELECT count(*), count(DISTINCT business_date)
                   FROM v_hme_store_daily_verified""")
     n3, d3 = c4.fetchone()
@@ -739,11 +753,10 @@ try:
                     AND d.lane_total_goal_d_seconds IS DISTINCT FROM g.goal_d_seconds""")
     check("Goal D still matches PA Threshold for every store on 2026-09-15",
           c9.fetchone()[0] == 0)
-    c9.execute("""SELECT count(*), count(DISTINCT business_date) FROM hme_store_daily""")
-    n, d8 = c9.fetchone()
-    # Invariant, not a fixed day count: 34 stores for every loaded day.
-    check("fact table holds 34 stores for every loaded day", n == 34 * d8,
-          f"{n} rows over {d8} days")
+    c9.execute("""SELECT count(*) FROM (SELECT business_date FROM hme_store_daily
+                  GROUP BY business_date HAVING count(*) > 34
+                     OR count(*) < 11) x""")
+    check("every loaded day holds between 11 and 34 stores", c9.fetchone()[0] == 0)
     c9.execute("""SELECT extractor_version FROM hme_ingest_run
                   WHERE business_date='2026-09-15' AND status='succeeded'
                   ORDER BY run_id DESC LIMIT 1""")
@@ -836,11 +849,10 @@ try:
     check("2026-09-16 network PA and Trend totals agree at 5783",
           pa == 5783 and tr == 5783, f"PA={pa} Trend={tr}")
 
-    # the corrected reload must not add rows
-    c11.execute("""SELECT count(*), count(DISTINCT business_date) FROM hme_store_daily""")
-    n, d = c11.fetchone()
-    check("corrected reload added no store/date rows (34 per day)", n == 34 * d,
-          f"{n} rows over {d} days")
+    # the corrected reload must not add rows for its own date
+    c11.execute("""SELECT count(*) FROM hme_store_daily WHERE business_date='2026-09-16'""")
+    check("corrected reload left 2026-09-16 at exactly 34 rows",
+          c11.fetchone()[0] == 34)
     c11.execute("""SELECT count(*) FROM (SELECT 1 FROM hme_store_daily
                    GROUP BY hme_store_number, business_date HAVING count(*)>1) x""")
     check("no duplicate store/date rows after the correction", c11.fetchone()[0] == 0)
@@ -1088,6 +1100,166 @@ try:
     check("the original 09-17 failure remains auditable", c12.fetchone()[0] >= 1)
 finally:
     conn12.close()
+
+# ---------------------------------------------------------------------------
+print("\n== completeness is separate from tenant security ==")
+# Tenant SECURITY is about the tenant WIDENING (an unexpected store, a foreign
+# brand, a lost user filter) -- always a hard failure. A store being ABSENT is
+# not widening, so it is graded instead: a missing VERIFIED store is a hard stop
+# (those 11 are mandatory for Laynes analytics), a missing OUT_OF_SCOPE store
+# makes the run PARTIAL. Absence is never synthesised as zero.
+INV34 = {}
+VERIFIED_SET = {"00111", "108", "1163022", "15", "16", "1",
+                "1171670", "109", "115", "26", "1158614"}
+for i in range(23):
+    INV34[f"oos{i}"] = {"hme_store_name": f"Out{i}", "mapping_status": "OUT_OF_SCOPE"}
+INV34["3"] = {"hme_store_name": "Frisco", "mapping_status": "OUT_OF_SCOPE"}
+del INV34["oos0"]
+for n in VERIFIED_SET:
+    INV34[n] = {"hme_store_name": f"V{n}", "mapping_status": "VERIFIED"}
+check("test inventory is 34 with 11 VERIFIED / 23 OUT_OF_SCOPE",
+      len(INV34) == 34
+      and sum(1 for v in INV34.values() if v["mapping_status"] == "VERIFIED") == 11
+      and sum(1 for v in INV34.values() if v["mapping_status"] == "OUT_OF_SCOPE") == 23,
+      str(len(INV34)))
+
+ALL34 = set(INV34)
+d = guard.assess_completeness(ALL34, INV34, context="t")
+check("34/34 -> complete, no missing", d["complete"] and d["missing_store_numbers"] == []
+      and d["observed_store_count"] == 34 and d["verified_observed_count"] == 11)
+
+d = guard.assess_completeness(ALL34 - {"3"}, INV34, context="t")
+check("33/34 with one missing OUT_OF_SCOPE -> allowed, marked incomplete",
+      (not d["complete"]) and d["missing_store_numbers"] == ["3"]
+      and d["missing_mapping_statuses"] == ["OUT_OF_SCOPE"]
+      and d["missing_verified"] == []
+      and d["verified_observed_count"] == 11 == d["verified_expected_count"]
+      and d["observed_store_count"] == 33 and d["expected_store_count"] == 34,
+      json.dumps(d))
+check("missing store name is reported for review", d["missing_store_names"] == ["Frisco"])
+
+try:
+    guard.assess_completeness(ALL34 - {"00111"}, INV34, context="t")
+    check("missing VERIFIED store -> hard stop", False, "did not raise")
+except guard.IncompleteSourceError as e:
+    check("missing VERIFIED store -> hard stop", "00111" in str(e))
+try:
+    guard.assess_completeness(ALL34 - {"00111", "3"}, INV34, context="t")
+    check("missing VERIFIED + OOS together -> still hard stop", False, "did not raise")
+except guard.IncompleteSourceError:
+    check("missing VERIFIED + OOS together -> still hard stop", True)
+
+# SECURITY remains strict and is unaffected by the completeness grading
+try:
+    guard.assert_stores_in_inventory(ALL34 | {"99999"}, INV34, context="t")
+    check("unexpected store -> hard fail (security)", False, "did not raise")
+except guard.TenantScopeError:
+    check("unexpected store -> hard fail (security)", True)
+try:
+    guard.assert_no_foreign_brands(["18108 Dairy Queen"], context="t")
+    check("foreign brand -> hard fail (security)", False, "did not raise")
+except guard.TenantScopeError:
+    check("foreign brand -> hard fail (security)", True)
+check("a safe subset does not trip the allowlist guard",
+      guard.assert_stores_in_inventory(ALL34 - {"3"}, INV34, context="t") is not None)
+
+# ---------------------------------------------------------------------------
+print("\n== loader: partial on incomplete source, never synthesised ==")
+INCOMPLETE = "/var/lib/laynes/hme/raw/2026-09-18/querydata-facts.json"
+if os.path.exists(INCOMPLETE):
+    with open(INCOMPLETE) as fh:
+        doc18 = json.load(fh)
+    conn13 = hme_load.connect()
+    try:
+        res = hme_load.load(doc18, conn13, dry_run=True)
+        c = res["completeness"]
+        check("incomplete-but-safe day loads as PARTIAL, not succeeded",
+              res["status"] == "partial" and res["reconciliation_ok"] is True,
+              f"status={res['status']} recon={res['reconciliation_ok']}")
+        check("loader records observed/expected store counts",
+              c["observed_store_count"] == 33 and c["expected_store_count"] == 34)
+        check("loader records the missing store, name and mapping status",
+              c["missing_store_numbers"] == ["3"]
+              and c["missing_store_names"] == ["Frisco"]
+              and c["missing_mapping_statuses"] == ["OUT_OF_SCOPE"], json.dumps(c))
+        check("loader records verified coverage 11/11",
+              c["verified_observed_count"] == 11 and c["verified_expected_count"] == 11)
+        w = " ".join(res["reconciliation"]["warnings"])
+        for frag in ("missing expected HME stores: ['3']",
+                     "missing store names: ['Frisco']",
+                     "mapping statuses: ['OUT_OF_SCOPE']",
+                     "observed_store_count: 33",
+                     "expected_store_count: 34"):
+            check(f"warning contains {frag!r}", frag in w)
+        conn13.rollback()
+
+        # a missing VERIFIED store must be refused by the loader too
+        bad = json.loads(json.dumps(doc18))
+        for k in bad["facts"]:
+            bad["facts"][k] = [r for r in bad["facts"][k]
+                               if r["hme_store_number"] != "00111"]
+        try:
+            hme_load.load(bad, conn13, dry_run=True)
+            check("loader refuses a day missing a VERIFIED store", False, "loaded")
+        except hme_load.LoadAborted as e:
+            check("loader refuses a day missing a VERIFIED store", "00111" in str(e))
+        conn13.rollback()
+
+        # an unexpected store is still fatal at the loader gate
+        bad2 = json.loads(json.dumps(doc18))
+        bad2["facts"]["store_daily"][0]["hme_store_number"] = "99999"
+        try:
+            hme_load.load(bad2, conn13, dry_run=True)
+            check("loader refuses an unexpected store (security)", False, "loaded")
+        except hme_load.LoadAborted:
+            check("loader refuses an unexpected store (security)", True)
+        conn13.rollback()
+    finally:
+        conn13.rollback()
+        conn13.close()
+else:
+    check("2026-09-18 incomplete extract present for policy tests", False, INCOMPLETE)
+
+# ---------------------------------------------------------------------------
+print("\n== 2026-09-18: absence recorded as absence ==")
+conn14 = hme_load.connect()
+try:
+    c14 = conn14.cursor()
+    c14.execute("""SELECT count(*) FROM hme_store_daily WHERE business_date='2026-09-18'""")
+    check("2026-09-18 holds 33 observed stores, not 34 synthetic", c14.fetchone()[0] == 33)
+    for tbl in ("hme_store_daily", "hme_outliers_daily"):
+        c14.execute(f"""SELECT count(*) FROM {tbl}
+                        WHERE business_date='2026-09-18' AND hme_store_number='3'""")
+        check(f"Frisco was NOT synthesised into {tbl}", c14.fetchone()[0] == 0)
+    c14.execute("""SELECT count(*) FROM v_hme_store_daily_verified
+                   WHERE business_date='2026-09-18'""")
+    check("verified view holds exactly 11 rows for 2026-09-18", c14.fetchone()[0] == 11)
+    c14.execute("""SELECT count(*) FROM v_hme_store_daily_verified
+                   WHERE business_date='2026-09-18' AND hme_store_number='3'""")
+    check("Frisco never appears in the verified view", c14.fetchone()[0] == 0)
+    c14.execute("""SELECT m.mapping_status, count(*) FROM hme_store_daily d
+                   JOIN hme_store_mapping m USING (hme_store_number)
+                   WHERE d.business_date='2026-09-18' GROUP BY 1""")
+    split = dict(c14.fetchall())
+    check("2026-09-18 split is 11 VERIFIED / 22 OUT_OF_SCOPE",
+          split.get("VERIFIED") == 11 and split.get("OUT_OF_SCOPE") == 22, str(split))
+    c14.execute("""SELECT status, tenant_scope_ok, reconciliation_ok
+                   FROM hme_ingest_run WHERE business_date='2026-09-18'
+                     AND status <> 'failed' ORDER BY run_id DESC LIMIT 1""")
+    row = c14.fetchone()
+    check("2026-09-18 recorded PARTIAL with tenant_scope_ok true",
+          row is not None and row[0] == "partial" and row[1] is True and row[2] is True,
+          str(row))
+    c14.execute("""SELECT sum(total_orders) FROM hme_store_daily
+                   WHERE business_date='2026-09-18'""")
+    check("2026-09-18 HME total across observed stores is 7077",
+          c14.fetchone()[0] == 7077)
+    c14.execute("""SELECT count(*) FROM hme_store_daily
+                   WHERE business_date='2026-09-18'
+                     AND total_orders IS DISTINCT FROM total_cars""")
+    check("reconciliation held across the observed population", c14.fetchone()[0] == 0)
+finally:
+    conn14.close()
 
 # ---------------------------------------------------------------------------
 passed = sum(1 for _, ok, _ in results if ok)

@@ -32,7 +32,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ov
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "hme_load/1.2.0"
+LOADER_VERSION = "hme_load/1.3.0"
 RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 FORBIDDEN_KEYS = ("token", "id_token", "ctx_token", "cookie", "password", "authorization")
 
@@ -283,21 +283,47 @@ def load(doc, conn, dry_run=False):
     assert_no_secrets(doc)
 
     cur = conn.cursor()
-    cur.execute("SELECT hme_store_number FROM hme_store_mapping WHERE active")
-    known = {r[0] for r in cur.fetchall()}
+    cur.execute("""SELECT hme_store_number, hme_store_name, mapping_status
+                   FROM hme_store_mapping WHERE active""")
+    inv = {r[0]: {"hme_store_name": r[1], "mapping_status": r[2]} for r in cur.fetchall()}
+    known = set(inv)
 
     payload_stores = set()
     for rows in doc["facts"].values():
         payload_stores |= {str(r["hme_store_number"]) for r in rows}
+
+    # --- SECURITY: an unexpected store is widening and is always fatal ------
     unknown = sorted(payload_stores - known)
     if unknown:
         raise LoadAborted(
             f"{len(unknown)} store(s) not in hme_store_mapping -> {unknown[:10]}; "
             f"tenant scope unproven, refusing to load")
-    if len(payload_stores) != len(known):
+
+    # --- COMPLETENESS: absence is graded, never silently accepted -----------
+    # A missing VERIFIED store means the day cannot represent Laynes coverage
+    # and is refused. Missing non-VERIFIED stores are allowed through but make
+    # the run PARTIAL. No zero rows are ever synthesised for an absent store.
+    missing = sorted(known - payload_stores)
+    missing_verified = [n for n in missing
+                        if (inv[n]["mapping_status"] or "").upper() == "VERIFIED"]
+    if missing_verified:
         raise LoadAborted(
-            f"payload has {len(payload_stores)} stores but the active mapper has "
-            f"{len(known)}; refusing a partial/widened extract")
+            f"{len(missing_verified)} VERIFIED store(s) absent from the extract "
+            f"-> {missing_verified}; refusing to load a day that cannot represent "
+            f"mapped Laynes coverage")
+    completeness = {
+        "expected_store_count": len(known),
+        "observed_store_count": len(payload_stores),
+        "missing_store_numbers": missing,
+        "missing_store_names": [inv[n]["hme_store_name"] for n in missing],
+        "missing_mapping_statuses": [inv[n]["mapping_status"] for n in missing],
+        "verified_expected_count": sum(
+            1 for v in inv.values() if (v["mapping_status"] or "").upper() == "VERIFIED"),
+        "verified_observed_count": sum(
+            1 for n in payload_stores
+            if (inv[n]["mapping_status"] or "").upper() == "VERIFIED"),
+        "complete": not missing,
+    }
 
     # The extractor's own freshness verdict is honoured here too: an incomplete
     # day must never be written as if it were final.
@@ -329,7 +355,9 @@ def load(doc, conn, dry_run=False):
           verified_n, oos_n,
           rows_received, recon_ok, json.dumps(recon), recon["warnings"],
           doc.get("extractor_version"), LOADER_VERSION, int(doc.get("attempt", 1)),
-          doc.get("freshness_ok"), json.dumps(doc.get("freshness_detail"))))
+          doc.get("freshness_ok"),
+          json.dumps({"freshness": doc.get("freshness_detail"),
+                      "completeness": completeness})))
     run_id = cur.fetchone()[0]
 
     trend = {r["hme_store_number"]: r for r in doc["facts"].get("trend_store_daily", [])}
@@ -408,11 +436,23 @@ def load(doc, conn, dry_run=False):
     #   reconciliation_ok = false -> 'partial'
     # (Previously both branches returned 'succeeded' -- a no-op conditional that
     # let the 2026-09-16 Trend/PA divergence be recorded as a clean success.)
-    final_status = "succeeded" if recon_ok else "partial"
+    final_status = "succeeded" if (recon_ok and completeness["complete"]) else "partial"
     if not recon_ok:
         failed_checks = [c["check"] for c in recon["checks"] if not c["ok"]]
         recon["warnings"].append(
             "run marked PARTIAL: reconciliation failed -> " + ", ".join(failed_checks))
+    if not completeness["complete"]:
+        # Tenant scope did NOT widen -- the source simply did not report these
+        # stores. Recorded as absence, never as zero.
+        recon["warnings"].append(
+            "run marked PARTIAL: source incomplete; "
+            f"missing expected HME stores: {completeness['missing_store_numbers']}; "
+            f"missing store names: {completeness['missing_store_names']}; "
+            f"mapping statuses: {completeness['missing_mapping_statuses']}; "
+            f"observed_store_count: {completeness['observed_store_count']}; "
+            f"expected_store_count: {completeness['expected_store_count']}; "
+            f"verified {completeness['verified_observed_count']}"
+            f"/{completeness['verified_expected_count']} present")
     cur.execute("""UPDATE hme_ingest_run SET rows_written=%s, status=%s, warnings=%s
                    WHERE run_id=%s""",
                 (written, final_status, recon["warnings"], run_id))
@@ -425,7 +465,8 @@ def load(doc, conn, dry_run=False):
     return {"run_id": run_id, "rows_received": rows_received, "rows_written": written,
             "goal_rows": goal_written, "goal_stats": goal_stats,
             "reconciliation_ok": recon_ok, "reconciliation": recon,
-            "status": final_status, "store_count": len(payload_stores)}
+            "status": final_status, "completeness": completeness,
+            "store_count": len(payload_stores)}
 
 
 def main():
@@ -453,6 +494,12 @@ def main():
     print(f"run_id={res['run_id']}  status={res['status'].upper()}  "
           f"stores={res['store_count']}  received={res['rows_received']}  "
           f"written={res['rows_written']} (goal rows {res['goal_rows']})")
+    c = res["completeness"]
+    print(f"completeness: {'COMPLETE' if c['complete'] else 'INCOMPLETE'} "
+          f"{c['observed_store_count']}/{c['expected_store_count']} stores; "
+          f"VERIFIED {c['verified_observed_count']}/{c['verified_expected_count']}"
+          + (f"; missing {c['missing_store_numbers']} {c['missing_store_names']} "
+             f"{c['missing_mapping_statuses']}" if not c['complete'] else ""))
     print(f"goals: {res['goal_stats']}")
     print(f"reconciliation_ok={res['reconciliation_ok']}")
     for c in res["reconciliation"]["checks"]:
@@ -463,8 +510,17 @@ def main():
         print(f"  warning: {w}")
     if res["status"] != "succeeded":
         # Exit non-zero so systemd and the orchestrator show a PARTIAL day as a
-        # problem rather than a clean production ingestion.
-        print(f"LOAD COMPLETED AS {res['status'].upper()}: reconciliation did not pass")
+        # problem rather than a clean production ingestion. Name the ACTUAL
+        # cause: reconciliation and completeness are independent reasons.
+        causes = []
+        if not res["reconciliation_ok"]:
+            causes.append("reconciliation did not pass")
+        if not res["completeness"]["complete"]:
+            causes.append("source incomplete "
+                          f"({res['completeness']['observed_store_count']}"
+                          f"/{res['completeness']['expected_store_count']} stores, "
+                          f"missing {res['completeness']['missing_store_numbers']})")
+        print(f"LOAD COMPLETED AS {res['status'].upper()}: " + "; ".join(causes))
         return 2
     return 0
 

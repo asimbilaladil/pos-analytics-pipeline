@@ -90,9 +90,13 @@ def refresh_tenant_inventory(conn, fh):
     path = os.environ.get("HME_TENANT_INVENTORY",
                           "/var/lib/laynes/hme/state/tenant_inventory.json")
     cur = conn.cursor()
-    cur.execute("""SELECT hme_store_number, hme_store_name
+    # mapping_status travels with the allowlist so the extractor can tell a
+    # missing VERIFIED store (hard stop) from a missing OUT_OF_SCOPE one
+    # (incomplete, but loadable).
+    cur.execute("""SELECT hme_store_number, hme_store_name, mapping_status
                    FROM hme_store_mapping WHERE active ORDER BY hme_store_number""")
-    inv = [{"hme_store_number": a, "hme_store_name": b} for a, b in cur.fetchall()]
+    inv = [{"hme_store_number": a, "hme_store_name": b, "mapping_status": c}
+           for a, b, c in cur.fetchall()]
     if not inv:
         raise SystemExit("refusing to run: hme_store_mapping has no active stores")
     tmp = path + ".tmp"
@@ -232,8 +236,21 @@ def main():
                     log(f"  warning: {w}", fh)
                 log(f"tenant inventory used: {inv_n} stores", fh)
                 if res["status"] != "succeeded":
+                    c = res.get("completeness") or {}
+                    why = []
+                    if not res["reconciliation_ok"]:
+                        why.append("not reconciled")
+                    if c and not c.get("complete"):
+                        why.append(
+                            f"source incomplete {c.get('observed_store_count')}"
+                            f"/{c.get('expected_store_count')} stores, missing "
+                            f"{c.get('missing_store_numbers')} "
+                            f"{c.get('missing_store_names')} "
+                            f"{c.get('missing_mapping_statuses')} "
+                            f"(VERIFIED {c.get('verified_observed_count')}"
+                            f"/{c.get('verified_expected_count')} present)")
                     log(f"run {res['run_id']} is PARTIAL: facts are loaded and remain "
-                        f"idempotently correctable, but the day is NOT reconciled", fh)
+                        f"idempotently correctable, but " + "; ".join(why), fh)
                     return 2
                 return 0
 
