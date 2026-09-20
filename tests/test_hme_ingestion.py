@@ -1355,6 +1355,207 @@ finally:
     conn16.close()
 
 # ---------------------------------------------------------------------------
+# SECTION 17 -- delayed reconciliation retry, eligibility and exit semantics
+#
+# The 05:30 ingest cannot wait for every HME report to settle: on 2026-09-19
+# the Outliers report lagged PA by 14 cars at one store and agreed 4h34m
+# later. The retry revisits the SAME completed day at 10:15 Chicago, but only
+# when the earlier run is provably safe and merely unreconciled. Everything
+# else -- a security failure, a missing VERIFIED store, an already-good day --
+# must be a no-op, so a retry can never launder a safety problem.
+# ---------------------------------------------------------------------------
+import hme_reconciliation_retry as retry            # noqa: E402
+import hme_daily_ingest as ingest                   # noqa: E402
+
+def _run(**kw):
+    base = {"run_id": 1, "status": "partial", "reconciliation_ok": False,
+            "tenant_scope_ok": True, "store_count": 33,
+            "verified_store_count": 11, "out_of_scope_store_count": 22,
+            "completeness_detail": {"verified_observed_count": 11,
+                                    "verified_expected_count": 11,
+                                    "observed_store_count": 33,
+                                    "expected_store_count": 34,
+                                    "missing_mapping_statuses": ["OUT_OF_SCOPE"],
+                                    "unexpected_store_count": 0}}
+    cd = kw.pop("completeness_detail", None)
+    base.update(kw)
+    if cd is not None:
+        base["completeness_detail"] = cd
+    return base
+
+# --- eligibility: the one shape that warrants a retry ----------------------
+ok, why = retry.assess_retry_eligibility(_run())
+check("partial + reconciliation_ok=false + VERIFIED complete -> retry ELIGIBLE", ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(reconciliation_ok=True))
+check("partial + reconciled + only OUT_OF_SCOPE missing -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(status="succeeded", reconciliation_ok=True))
+check("succeeded -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(
+    completeness_detail={"verified_observed_count": 10, "verified_expected_count": 11,
+                         "observed_store_count": 32, "expected_store_count": 34,
+                         "missing_mapping_statuses": ["VERIFIED"],
+                         "unexpected_store_count": 0}))
+check("missing VERIFIED store -> NO retry (needs attention, not re-extraction)", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(tenant_scope_ok=False))
+check("tenant scope failure -> NO retry, never", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(status="aborted_tenant_scope"))
+check("aborted_tenant_scope -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(status="failed"))
+check("hard failed run -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(None)
+check("no prior run for the date -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(status="weird_new_status"))
+check("unrecognised status fails closed -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(
+    completeness_detail={"verified_observed_count": 11, "verified_expected_count": 11,
+                         "observed_store_count": 33, "expected_store_count": 34,
+                         "missing_mapping_statuses": ["OUT_OF_SCOPE"],
+                         "unexpected_store_count": 2}))
+check("unexpected stores outside the allowlist -> NO retry (security)", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(
+    completeness_detail={"verified_observed_count": 11, "verified_expected_count": 11,
+                         "observed_store_count": 33, "expected_store_count": 34,
+                         "missing_mapping_statuses": ["OUT_OF_SCOPE", "PENDING"],
+                         "unexpected_store_count": 0}))
+check("missing store of unknown mapping status fails closed -> NO retry", not ok, why)
+
+ok, why = retry.assess_retry_eligibility(_run(
+    completeness_detail={"observed_store_count": 33, "expected_store_count": 34,
+                         "missing_mapping_statuses": ["OUT_OF_SCOPE"],
+                         "unexpected_store_count": 0}))
+check("unknown VERIFIED coverage fails closed -> NO retry", not ok, why)
+
+# --- exit-code contract ----------------------------------------------------
+check("exit codes are distinct and match the documented contract",
+      (ingest.EXIT_OK, ingest.EXIT_HARD_FAILURE, ingest.EXIT_RECONCILIATION_FAILED,
+       ingest.EXIT_ACCEPTED_PARTIAL, ingest.EXIT_NOOP) == (0, 1, 2, 3, 75))
+check("retry re-exports the same exit contract as the primary ingest",
+      (retry.EXIT_OK, retry.EXIT_RECONCILIATION_FAILED, retry.EXIT_ACCEPTED_PARTIAL,
+       retry.EXIT_NOOP) == (0, 2, 3, 75))
+
+def _res(recon_ok, complete_kw):
+    return {"reconciliation_ok": recon_ok, "status": "partial",
+            "completeness": complete_kw}
+
+_accepted = {"verified_observed_count": 11, "verified_expected_count": 11,
+             "missing_mapping_statuses": ["OUT_OF_SCOPE"],
+             "missing_store_numbers": ["3"], "complete": False}
+check("exit 3: reconciled + VERIFIED complete + only OUT_OF_SCOPE absent",
+      ingest.classify_partial_exit(_res(True, _accepted)) == ingest.EXIT_ACCEPTED_PARTIAL)
+check("exit 2: reconciliation failed outranks accepted partial",
+      ingest.classify_partial_exit(_res(False, _accepted)) == ingest.EXIT_RECONCILIATION_FAILED)
+check("exit 2: reconciled but a VERIFIED store is missing",
+      ingest.classify_partial_exit(_res(True, dict(_accepted, verified_observed_count=10,
+                                                   missing_mapping_statuses=["VERIFIED"])))
+      == ingest.EXIT_RECONCILIATION_FAILED)
+check("exit 2: reconciled partial with no identified missing store is escalated",
+      ingest.classify_partial_exit(_res(True, dict(_accepted, missing_mapping_statuses=[])))
+      == ingest.EXIT_RECONCILIATION_FAILED)
+check("exit 2: missing store of a non-OUT_OF_SCOPE status is escalated",
+      ingest.classify_partial_exit(_res(True, dict(_accepted,
+                                                   missing_mapping_statuses=["OUT_OF_SCOPE", "PENDING"])))
+      == ingest.EXIT_RECONCILIATION_FAILED)
+
+# --- systemd unit contract -------------------------------------------------
+import re as _re                                     # noqa: E402
+for _unit in ("systemd/hme-daily-ingest.service", "systemd/hme-reconciliation-retry.service"):
+    _txt = open(_unit).read()
+    _line = [l for l in _txt.splitlines()
+             if l.startswith("SuccessExitStatus=")]
+    check(f"{os.path.basename(_unit)} declares SuccessExitStatus exactly once",
+          len(_line) == 1, str(_line))
+    _codes = set(_line[0].split("=", 1)[1].split())
+    check(f"{os.path.basename(_unit)} SuccessExitStatus contains 0, 3 and 75",
+          {"0", "3", "75"} <= _codes, _line[0])
+    check(f"{os.path.basename(_unit)} SuccessExitStatus does NOT contain 2 "
+          "(a real reconciliation failure must stay red)",
+          "2" not in _codes, _line[0])
+
+# --- retry timer: DST, timezone-in-expression, and no schedule drift -------
+_rt = open("systemd/hme-reconciliation-retry.timer").read()
+check("retry timer puts the timezone in the OnCalendar expression",
+      "OnCalendar=*-*-* 10:15:00 America/Chicago" in _rt)
+check("retry timer does not use a bogus Timezone= key",
+      not _re.search(r"(?m)^\s*Timezone\s*=", _rt))
+check("retry timer is Persistent with a 180s randomized delay",
+      "Persistent=true" in _rt and "RandomizedDelaySec=180" in _rt)
+
+_di = open("systemd/hme-daily-ingest.timer").read()
+check("PRIMARY ingest schedule is unchanged at 05:30 America/Chicago",
+      "OnCalendar=*-*-* 05:30:00 America/Chicago" in _di)
+
+def _elapse(expr, base):
+    out = subprocess.run(["systemd-analyze", "calendar", "--iterations=1",
+                          f"--base-time={base}", expr],
+                         capture_output=True, text=True).stdout
+    m = _re.search(r"Next elapse:\s*(.+)", out)
+    return (m.group(1).strip() if m else out.strip())
+
+check("retry timer resolves to 15:15 UTC during CDT (summer)",
+      "15:15:00 UTC" in _elapse("*-*-* 10:15:00 America/Chicago", "2026-07-01 00:00:00 UTC"),
+      _elapse("*-*-* 10:15:00 America/Chicago", "2026-07-01 00:00:00 UTC"))
+check("retry timer resolves to 16:15 UTC during CST (winter)",
+      "16:15:00 UTC" in _elapse("*-*-* 10:15:00 America/Chicago", "2026-12-01 00:00:00 UTC"),
+      _elapse("*-*-* 10:15:00 America/Chicago", "2026-12-01 00:00:00 UTC"))
+check("retry timer is NOT pinned to a fixed UTC hour across DST",
+      _elapse("*-*-* 10:15:00 America/Chicago", "2026-07-01 00:00:00 UTC")
+      != _elapse("*-*-* 10:15:00 America/Chicago", "2026-12-01 00:00:00 UTC"))
+
+# --- retry outcome invariants against the live 2026-09-19 correction -------
+conn17 = hme_load.connect()
+try:
+    c17 = conn17.cursor()
+    c17.execute("""SELECT run_id, status, reconciliation_ok, store_count,
+                          verified_store_count, out_of_scope_store_count
+                     FROM hme_ingest_run WHERE business_date='2026-09-19'
+                    ORDER BY run_id""")
+    rows17 = c17.fetchall()
+    check("2026-09-19 kept its original 05:30 run as an audit record",
+          any(r[2] is False for r in rows17), str(rows17))
+    check("the corrected 2026-09-19 run is a NEW run_id, not a rewrite",
+          len(rows17) >= 2 and rows17[-1][0] > rows17[0][0], str(rows17))
+    check("the correction reconciled without inventing stores",
+          rows17[-1][2] is True and rows17[-1][3] == 33
+          and rows17[-1][4] == 11 and rows17[-1][5] == 22, str(rows17[-1]))
+    check("2026-09-19 remains status=partial while Frisco is absent",
+          rows17[-1][1] == "partial", str(rows17[-1]))
+
+    c17.execute("""SELECT count(*) FROM hme_store_daily
+                    WHERE business_date='2026-09-19' AND hme_store_number='3'""")
+    check("the retry/correction never synthesized the absent OUT_OF_SCOPE store",
+          c17.fetchone()[0] == 0)
+
+    c17.execute("""SELECT total_orders FROM hme_store_daily
+                    WHERE business_date='2026-09-19' AND hme_store_number='115'""")
+    pa115 = c17.fetchone()[0]
+    c17.execute("""SELECT car_departures FROM hme_outliers_daily
+                    WHERE business_date='2026-09-19' AND hme_store_number='115'""")
+    ou115 = c17.fetchone()[0]
+    check("Shepherd (115) PA and Outliers agree after the settled re-extract",
+          pa115 == ou115 == 338, f"PA={pa115} Outliers={ou115}")
+
+    c17.execute("""SELECT count(*) FROM (
+                     SELECT 1 FROM hme_store_daily
+                      GROUP BY hme_store_number, business_date HAVING count(*) > 1) x""")
+    check("idempotent correction created no duplicate store-day rows",
+          c17.fetchone()[0] == 0)
+    c17.execute("""SELECT count(*) FROM hme_store_daily WHERE business_date='2026-09-19'""")
+    check("2026-09-19 still holds exactly one row per observed store",
+          c17.fetchone()[0] == 33)
+finally:
+    conn17.close()
+
+# ---------------------------------------------------------------------------
 passed = sum(1 for _, ok, _ in results if ok)
 failed = len(results) - passed
 print(f"\n{'='*66}\nHME ingestion tests: {passed} passed, {failed} failed, {len(results)} total")

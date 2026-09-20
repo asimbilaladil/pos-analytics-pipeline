@@ -1,0 +1,32 @@
+[Unit]
+Description=HME delayed reconciliation retry (revisit Chicago-yesterday once sources settle)
+Documentation=file:///root/pos-analytics-pipeline/hme_reconciliation_retry.py
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline/hme_reconciliation_retry.py
+Environment=HME_ENV_FILE=/etc/laynes/hme-downloader.env
+Environment=HME_DOWNLOADER_DIR=/opt/hme-report-downloader
+Environment=HME_RAW_DIR=/var/lib/laynes/hme/raw
+Environment=HME_LOG_DIR=/var/lib/laynes/hme/logs
+TimeoutStartSec=5400
+
+# Same exit contract as hme-daily-ingest.service. 75 is the COMMON case here:
+# most mornings the 05:30 run reconciled and this job correctly does nothing.
+#   0  retry corrected the day (complete and reconciled)
+#   1  hard failure / safety abort
+#   2  still not reconciled -- genuinely needs attention
+#   3  accepted partial (reconciled; only OUT_OF_SCOPE stores absent)
+#   75 no-op: nothing eligible, or the primary ingest holds the lock
+SuccessExitStatus=0 3 75
+
+# Application output goes to the HME log directory, matching the primary
+# ingest. journald keeps only systemd's own unit messages.
+StandardOutput=append:/var/lib/laynes/hme/logs/reconciliation-retry.service.log
+StandardError=append:/var/lib/laynes/hme/logs/reconciliation-retry.service.log
+
+[Install]
+WantedBy=multi-user.target

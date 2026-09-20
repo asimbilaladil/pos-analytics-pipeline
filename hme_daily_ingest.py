@@ -41,7 +41,35 @@ RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 LOG_DIR = os.environ.get("HME_LOG_DIR", "/var/lib/laynes/hme/logs")
 LOCK_PATH = os.environ.get("HME_LOCK_PATH", "/var/lib/laynes/hme/state/ingest.lock")
 ENV_FILE = os.environ.get("HME_ENV_FILE", "/etc/laynes/hme-downloader.env")
-ORCHESTRATOR_VERSION = "hme_daily_ingest/1.1.0"
+ORCHESTRATOR_VERSION = "hme_daily_ingest/1.2.0"
+
+# --- process exit contract (shared with hme_reconciliation_retry.py) --------
+# systemd's SuccessExitStatus decides which of these light the unit red. The
+# unit lists "0 3 75" and deliberately omits 2.
+#
+#   0  complete AND reconciled -- a fully clean production day.
+#   1  hard failure: extraction exhausted, safety/tenant abort, missing
+#      VERIFIED store, unknown model/schema. Always red, never retried here.
+#   2  reconciliation FAILED. The day loaded and is idempotently correctable,
+#      but cross-source checks disagree, so it needs attention or a delayed
+#      retry once the source settles. Red on purpose.
+#   3  ACCEPTED PARTIAL: tenant security passed, all VERIFIED stores present,
+#      reconciliation passed, and the only absent stores are OUT_OF_SCOPE.
+#      This is the policy working, not a fault -- a chronically absent
+#      OUT_OF_SCOPE store (e.g. Frisco) must not leave the unit red daily,
+#      because a unit that fails every morning stops being a signal.
+#   75 EX_TEMPFAIL: harmless no-op -- another run holds the lock, or the
+#      retry found nothing eligible to do.
+#
+# The DATABASE remains authoritative for succeeded/partial. Exit 3 never means
+# "complete"; it means "safe to leave until the absent OUT_OF_SCOPE store is
+# resolved". Monitoring that cares about completeness must read
+# hme_ingest_run, not systemd.
+EXIT_OK = 0
+EXIT_HARD_FAILURE = 1
+EXIT_RECONCILIATION_FAILED = 2
+EXIT_ACCEPTED_PARTIAL = 3
+EXIT_NOOP = 75
 
 MAX_ATTEMPTS = int(os.environ.get("HME_MAX_ATTEMPTS", "3"))
 BACKOFF_SECONDS = [0, 300, 900]   # bounded: immediate, +5 min, +15 min
@@ -57,6 +85,42 @@ def chicago_target_date(now=None):
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     return now.astimezone(CHICAGO).date() - datetime.timedelta(days=1)
+
+
+def classify_partial_exit(res, log=None):
+    """Map a PARTIAL load result onto the exit contract. Fail-closed.
+
+    Only one shape earns EXIT_ACCEPTED_PARTIAL: reconciliation passed, every
+    VERIFIED store is present, and the sole reason the day is incomplete is
+    absent OUT_OF_SCOPE stores. Anything else -- a failed check, a missing
+    VERIFIED store, a missing store of unknown status -- is EXIT_RECONCILIATION_
+    FAILED, so an unfamiliar partial is escalated rather than quietly accepted.
+    """
+    say = log or (lambda m: None)
+    if not res.get("reconciliation_ok"):
+        say("exit 2: reconciliation failed -- needs attention or a delayed retry")
+        return EXIT_RECONCILIATION_FAILED
+
+    c = res.get("completeness") or {}
+    missing_statuses = set(c.get("missing_mapping_statuses") or [])
+    v_obs = c.get("verified_observed_count")
+    v_exp = c.get("verified_expected_count")
+
+    if v_obs is None or v_exp is None or v_obs != v_exp:
+        say(f"exit 2: VERIFIED coverage is {v_obs}/{v_exp}, not full")
+        return EXIT_RECONCILIATION_FAILED
+    if not missing_statuses:
+        # Reconciled and nothing identifiably missing, yet not 'succeeded'.
+        # Unexplained: escalate rather than accept.
+        say("exit 2: partial with no identified missing store -- unexplained")
+        return EXIT_RECONCILIATION_FAILED
+    if missing_statuses - {"OUT_OF_SCOPE"}:
+        say(f"exit 2: missing stores include non-OUT_OF_SCOPE {sorted(missing_statuses)}")
+        return EXIT_RECONCILIATION_FAILED
+
+    say(f"exit 3: accepted partial -- reconciled, VERIFIED {v_obs}/{v_exp} present, "
+        f"only OUT_OF_SCOPE absent {c.get('missing_store_numbers')}")
+    return EXIT_ACCEPTED_PARTIAL
 
 
 def log(msg, fh=None):
@@ -160,7 +224,7 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             log("another HME ingest run holds the lock; exiting without action", fh)
-            return 75  # EX_TEMPFAIL
+            return EXIT_NOOP
         os.chmod(LOCK_PATH, 0o600)
         lock.write(f"{os.getpid()} {target}\n")
         lock.flush()
@@ -215,15 +279,14 @@ def main():
                         extractor_version=doc.get("extractor_version"))
                     log(f"recorded failed run_id={rid} status={status}", fh)
                     conn.close()
-                    return 1   # do not retry a safety abort
+                    return EXIT_HARD_FAILURE   # do not retry a safety abort
                 finally:
                     if not conn.closed:
                         conn.close()
 
-                # A reconciliation failure is recorded as 'partial' by the
-                # loader and must NOT be announced as a successful production
-                # ingestion, nor exit 0 -- systemd only treats 0 and 75 as
-                # success, so exiting 2 makes a PARTIAL day visibly failed.
+                # A PARTIAL day is never announced as a successful production
+                # ingestion. Which flavour of partial it is decides the exit
+                # code: see classify_partial_exit and the exit contract above.
                 verdict = "SUCCESS" if res["status"] == "succeeded" else "PARTIAL"
                 log(f"{verdict} run_id={res['run_id']} status={res['status']} "
                     f"stores={res['store_count']} "
@@ -251,8 +314,8 @@ def main():
                             f"/{c.get('verified_expected_count')} present)")
                     log(f"run {res['run_id']} is PARTIAL: facts are loaded and remain "
                         f"idempotently correctable, but " + "; ".join(why), fh)
-                    return 2
-                return 0
+                    return classify_partial_exit(res, log=lambda m: log(m, fh))
+                return EXIT_OK
 
             # every attempt exhausted
             log(f"all {args.max_attempts} attempt(s) failed: {last_reason}", fh)
@@ -264,7 +327,7 @@ def main():
                 log(f"recorded failed run_id={rid} status=failed", fh)
             finally:
                 conn.close()
-            return 1
+            return EXIT_HARD_FAILURE
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
