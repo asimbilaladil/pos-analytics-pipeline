@@ -1,0 +1,32 @@
+[Unit]
+Description=Delayed HME reconciliation retry at 10:15 America/Chicago
+
+[Timer]
+# The timezone MUST be part of the OnCalendar EXPRESSION (systemd 252+).
+# A `Timezone=` key in [Timer] does not exist and is silently ignored, which
+# resolves the elapse to UTC instead -- the same trap documented in
+# hme-daily-ingest.timer.
+#
+# Verify after any change with:  systemctl list-timers hme-reconciliation-retry.timer
+#   during CDT (summer) the next elapse must read 15:15 UTC
+#   during CST (winter) the next elapse must read 16:15 UTC
+#
+# Why 10:15 Chicago
+# -----------------
+# The primary ingest stays at 05:30; this does NOT move it. On 2026-09-19 the
+# Outliers report still lagged at 05:30 (store 115 Shepherd: 324 vs PA 338,
+# global delta 14) and had settled when re-extracted at 10:04 CDT, where every
+# check passed. 10:15 sits just past that observed settle point while staying
+# clear of the 05:30 ingest and the 04:15 loyalty/labor sync.
+#
+# The settle point is bracketed, not pinpointed: unreconciled at 05:30,
+# reconciled by 10:04. If a day is still unreconciled after this retry the job
+# exits 2 and the unit goes red, so a longer lag is self-announcing rather
+# than silently accepted.
+OnCalendar=*-*-* 10:15:00 America/Chicago
+Persistent=true
+RandomizedDelaySec=180
+Unit=hme-reconciliation-retry.service
+
+[Install]
+WantedBy=timers.target

@@ -27,6 +27,21 @@ Environment=HME_LOG_DIR=/var/lib/laynes/hme/logs
 TimeoutStartSec=5400
 # A tenant-scope abort exits 1 and must stay visible as a failure.
 # 75 (EX_TEMPFAIL) means "another run held the lock" and is not a failure.
-SuccessExitStatus=0 75
+# Exit contract (see hme_daily_ingest.py for the authoritative comment):
+#   0  complete AND reconciled
+#   1  hard failure (extraction exhausted, tenant/safety abort, missing VERIFIED)
+#   2  reconciliation FAILED -- needs attention or the delayed retry
+#   3  ACCEPTED PARTIAL -- reconciled, all VERIFIED present, only OUT_OF_SCOPE absent
+#   75 harmless no-op (another run holds the lock)
+#
+# 2 is deliberately NOT listed as success: a real reconciliation problem must
+# leave the unit red. 3 IS listed, because a chronically absent OUT_OF_SCOPE
+# store (Frisco, absent since 2026-09-18) would otherwise fail this unit every
+# morning, and a unit that fails daily stops being a signal.
+#
+# The DATABASE stays authoritative for succeeded/partial: exit 3 does not mean
+# "complete". Monitoring that cares about completeness must read
+# hme_ingest_run.status / reconciliation_ok, not systemd's unit state.
+SuccessExitStatus=0 3 75
 StandardOutput=append:/var/lib/laynes/hme/logs/daily-ingest.service.log
 StandardError=append:/var/lib/laynes/hme/logs/daily-ingest.service.log
