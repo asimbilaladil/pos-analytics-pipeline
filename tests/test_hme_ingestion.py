@@ -904,8 +904,16 @@ for pg, want in (("Performance Analysis CD", True), ("Trend Dashboard CD", True)
     check(f"custom-date page match {pg!r} -> {want}", bool(cd.search(pg.strip())) == want)
 
 # The detection contract, asserted as a pure decision table mirroring the JS.
-def classify(targets, pages):
-    """Mirror of the extractor's PHASE 2 decision, for testing the contract."""
+def classify(targets, pages, cd_page_slicer_targets=None):
+    """Mirror of the extractor's PHASE 2 decision, for testing the contract.
+
+    cd_page_slicer_targets are the slicer targets readable ON the custom-date
+    page, which is a DIFFERENT surface from the report-level filters + active
+    page slicers in `targets`. Defaults to `targets` so the pre-hybrid cases
+    read unchanged.
+    """
+    if cd_page_slicer_targets is None:
+        cd_page_slicer_targets = targets
     old = any(t.startswith(x) for t in targets for x in spec["old_naming"])
     new = any(t.startswith(x) for t in targets for x in spec["new_naming"])
     cdp = next((p for p in pages if cd.search(p.strip())), None)
@@ -913,11 +921,20 @@ def classify(targets, pages):
         return "UNKNOWN"
     if old:
         ctl = next((c for c in spec["old_range_controls"] if c in targets), None)
-        return "OLD_REPORT_FILTER" if ctl else "UNKNOWN"
+        if ctl:
+            return "OLD_REPORT_FILTER"
+        # HYBRID: old fact naming, but the old date control moved onto the
+        # custom-date PAGE as a slicer. Two positive signals are required -- a
+        # custom-date page AND the control readable on it -- so a page name
+        # alone still fails closed.
+        if cdp and next((c for c in spec["old_range_controls"]
+                         if c in cd_page_slicer_targets), None):
+            return "HYBRID_PAGE_SLICER"
+        return "UNKNOWN"
     if new:
         if not cdp:
             return "UNKNOWN"
-        ctl = next((c for c in spec["new_range_controls"] if c in targets), None)
+        ctl = next((c for c in spec["new_range_controls"] if c in cd_page_slicer_targets), None)
         return "NEW_PAGE_SLICER" if ctl else "UNKNOWN"
     return "UNKNOWN"
 
@@ -958,6 +975,87 @@ check("Multi with only Dates_Filter[Start_Day] in FILTERS is UNKNOWN on filters 
 check("...but resolves once slicer targets are included",
       classify(["Dates_Filter[Start_Day]", "Dim_Date[Day_Name]", "Dates_Filter[date]"],
                ["Date Interval", "Custom Date"]) == "NEW_PAGE_SLICER")
+
+# ---------------------------------------------------------------------------
+# Observed 2026-09-20: the Multi report's THIRD state. Fact schema is still OLD
+# (Date_Table, Detector Event Data Hour, DIM User Info) but the date control
+# left the report-level filter list and now lives on the custom-date PAGES as a
+# slicer on Date_Table[Date]. Report filters carry only Dates_Filter[Start_Day]
+# -- a week-start setting, not a day selector -- so the old path had nothing to
+# bind to and the run failed closed for two days (run_id 260, 261).
+# ---------------------------------------------------------------------------
+MULTI_0920_FILTERS = ["Date_Table[Day_Name]",
+                      "Detector Event Data Hour[EventType_Name]",
+                      "DIM User Info[User_EmailAddress]",
+                      "Detector Event Data Hour[Detector]",
+                      "Dates_Filter[Start_Day]"]
+MULTI_0920_ACTIVE_SLICERS = ["Dates_Filter[Date Filter]", "Time_Format_TBL[Time Format]",
+                             "Include Pullins[Include Pullins]", "Group Levels[Level]",
+                             "DIM User Info[Groups Hierarchy]"]
+MULTI_0920_PAGES = ["Multi Store - Summary Report", "Multi Store - None CD Store",
+                    "Multi Store - Daypart DI Store Hierarchy",
+                    "Multi Store - Daypart DI Store TM",
+                    "Multi Store - Daypart CD Store Hierarchy",
+                    "Multi Store - Daypart CD Store TM",
+                    "Multi Store - Day DI Store Hierarchy",
+                    "Multi Store - Day DI Store TM",
+                    "Multi Store - Day CD Store Hierarchy",
+                    "Multi Store - Day CD Store TM"]
+MULTI_0920_CD_SLICERS = ["DIM User Info[Groups Hierarchy]", "Date_Table[Date]",
+                         "Time_Format_TBL[Time Format]",
+                         "Include Pullins[Include Pullins]", "Group Levels[Level]"]
+
+check("the 2026-09-20 Multi structure is recognised as HYBRID_PAGE_SLICER",
+      classify(MULTI_0920_FILTERS + MULTI_0920_ACTIVE_SLICERS, MULTI_0920_PAGES,
+               MULTI_0920_CD_SLICERS) == "HYBRID_PAGE_SLICER")
+check("the failing pre-fix view (no CD-page slicers visible) is UNKNOWN",
+      classify(MULTI_0920_FILTERS + MULTI_0920_ACTIVE_SLICERS, MULTI_0920_PAGES,
+               MULTI_0920_ACTIVE_SLICERS) == "UNKNOWN")
+check("old naming + custom-date page but NO old control on it -> UNKNOWN (fail closed)",
+      classify(["Date_Table[Day_Name]", "DIM User Info[User_EmailAddress]"],
+               ["Multi Store - None CD Store"],
+               ["Group Levels[Level]"]) == "UNKNOWN")
+check("old naming + old control on a CD page but NO custom-date page -> UNKNOWN",
+      classify(["Date_Table[Day_Name]", "DIM User Info[User_EmailAddress]"],
+               ["Multi Store - Summary Report", "Multi Store - Day DI Store TM"],
+               ["Date_Table[Date]"]) == "UNKNOWN")
+check("a report-level old control still wins as OLD_REPORT_FILTER, not HYBRID",
+      classify(["Date_Table[Day_Name]", "Date_Table[Date]",
+                "DIM User Info[User_EmailAddress]"],
+               ["Multi Store - None CD Store"],
+               ["Date_Table[Date]"]) == "OLD_REPORT_FILTER")
+check("hybrid does NOT fire for new naming (that stays NEW_PAGE_SLICER)",
+      classify(["Dim_Date[Day_Name]", "Dates_Filter[Start_Day]"],
+               ["Custom Date"], ["Dates_Filter[date]"]) == "NEW_PAGE_SLICER")
+check("ambiguous old+new naming is still UNKNOWN even with a usable control",
+      classify(["Date_Table[Day_Name]", "Dim_Date[Day_Name]"],
+               ["Multi Store - None CD Store"], ["Date_Table[Date]"]) == "UNKNOWN")
+
+# CD page matching had to stop anchoring "CD" at end-of-name.
+for pg, want in (("Multi Store - None CD Store", True),
+                 ("Multi Store - Day CD Store Hierarchy", True),
+                 ("Multi Store - Daypart CD Store TM", True),
+                 ("Multi Store - Summary Report", False),
+                 ("Multi Store - Day DI Store TM", False),
+                 ("Multi Store - Daypart DI Store Hierarchy", False)):
+    check(f"CD page match {pg!r} -> {want}", bool(cd.search(pg.strip())) == want)
+
+# Date-interval pages must never be chosen: they select a rolling interval.
+check("no DI page is ever treated as a custom-date page",
+      not any(cd.search(p) for p in MULTI_0920_PAGES if " DI " in p))
+# Among several CD pages the undivided store-level one is preferred, so the
+# result stays one row per store per day rather than a daypart split.
+pref = _re.compile(spec["custom_date_page_prefer_re"], _re.I)
+cd_pages = [p for p in MULTI_0920_PAGES if cd.search(p)]
+chosen = next((p for p in cd_pages if pref.search(p)), cd_pages[0] if cd_pages else None)
+check("the preferred CD page is the undivided store-level one",
+      chosen == "Multi Store - None CD Store", f"chose {chosen!r} from {cd_pages}")
+
+# Date-control structure and FACT SCHEMA stay independent: the hybrid report is
+# still OLD-schema, and the field map must be chosen on its own evidence.
+check("hybrid date control does not imply a new fact schema",
+      any(t.startswith("Detector Event Data Hour") for t in MULTI_0920_FILTERS)
+      and not any(t.startswith("Fact_Detectors_Eventdata") for t in MULTI_0920_FILTERS))
 
 # Fail-closed cases
 check("both naming families present -> UNKNOWN",
