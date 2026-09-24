@@ -329,7 +329,13 @@ try:
             check("loader aborts when business_date != requested_date", True)
         conn.rollback()
 
-    # 14. no HME relation is readable by the LLM role
+    # 14. the LLM role reads EXACTLY the four safe views and nothing else.
+    # Before enablement (migration 44) this asserted zero HME grants. The
+    # boundary moved deliberately, not the principle: every raw and internal
+    # HME relation must still be unreadable, so the assertion is now an exact
+    # set rather than emptiness -- a new raw grant still fails here.
+    SAFE_LLM_VIEWS = {"v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
+                      "v_hme_goal_history_llm", "v_hme_day_completeness_llm"}
     cur = conn.cursor()
     # Match HME relations by prefix. A substring match would also catch
     # "establis(hme)nts", which is a Revel table and is legitimately readable.
@@ -338,8 +344,11 @@ try:
                      AND (c.relname LIKE 'hme\\_%%' OR c.relname LIKE 'v\\_hme\\_%%')
                      AND c.relkind IN ('r','v','m')
                      AND has_table_privilege('laynes_ro', c.oid, 'SELECT')""")
-    leaked = [r[0] for r in cur.fetchall()]
-    check("no HME relation is granted to laynes_ro (LLM role)", not leaked, str(leaked))
+    readable = {r[0] for r in cur.fetchall()}
+    check("laynes_ro reads exactly the four safe HME views",
+          readable == SAFE_LLM_VIEWS, str(sorted(readable)))
+    check("no raw or internal HME relation is readable by laynes_ro",
+          not (readable - SAFE_LLM_VIEWS), str(sorted(readable - SAFE_LLM_VIEWS)))
 
     # goal history is observation-effective, never backdated
     cur.execute("""SELECT min(effective_from_date) FROM hme_goal_history""")
