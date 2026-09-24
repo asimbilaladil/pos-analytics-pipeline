@@ -996,6 +996,62 @@ v_labor_daily_context    — establishment_id x business_date
     break_data_status
     No employee_id anywhere. Join labour to sales by establishment_id +
     business_date (+ local_hour) — never to an individual order.
+
+HME DRIVE-THRU (migrations 43/44). Four views, VERIFIED HME->Revel stores only
+(11 of 12 establishments; LCF Downtown Houston is NOT mapped to HME).
+
+v_hme_store_daily_llm      — establishment_id x business_date
+    drive_thru_cars (LANE VEHICLE OBSERVATIONS — *not* POS orders),
+    regular_cars, disastrous_cars, disastrous_pct (0-100),
+    lane_total_avg_seconds, lane_queue_avg_seconds, lane_total_2_avg_seconds,
+    lane_total_goal_d_seconds, trend_total_cars, trend_avg_time_seconds
+    regular_cars + disastrous_cars need not equal drive_thru_cars: independent
+    source measures, small residual is a source property.
+
+v_hme_outliers_daily_llm   — establishment_id x business_date
+    all_car_records, car_departures, total_outliers, and outlier_pct,
+    pull_in_pct, pull_out_pct, max_over_delete_pct, discard_pct,
+    manual_delete_pct (all 0-100)
+
+v_hme_goal_history_llm     — EFFECTIVE-DATED goal thresholds, in SECONDS
+    establishment_id, effective_from_date, effective_to_date (NULL = in force),
+    goal_a_seconds .. goal_d_seconds
+
+v_hme_day_completeness_llm — one row per business_date
+    status, source_complete, reconciliation_ok, observed/expected_store_count,
+    verified_observed/expected_count, counts_consistent
+
+HME rules — these are not stylistic, they change what is true:
+  * HME is authoritative for drive-thru OPERATIONS (cars, timing, goals,
+    outliers). Revel is authoritative for POS sales/orders/products/payments.
+    The labour views are authoritative for staffing and labour cost.
+  * drive_thru_cars are NOT Revel POS orders. Never call them "orders", never
+    sum or equate the two. A cars-per-order ratio is fine only if labelled.
+  * Cross-system joins use establishment_id + business_date and nothing else.
+    Never join by store number, store name, or fuzzy match. hme_store_number
+    is deliberately not exposed.
+  * There is NO store x hour HME fact. If asked for drive-thru by hour or
+    daypart, say that store-hour HME data is unavailable. Do not approximate
+    it from daily figures.
+  * A missing HME row is UNKNOWN / unavailable — never zero. An absent store
+    is not a store with no cars.
+  * Goal comparisons must pick the period in force for the business_date:
+      business_date >= effective_from_date
+      AND (effective_to_date IS NULL OR business_date <= effective_to_date)
+    Never use today's goal for an older date, and make no goal claim for a
+    date before the first effective_from_date — answer "unavailable".
+  * When a date's status = 'partial', say the HME source day was partial where
+    that matters. When reconciliation_ok = false, surface that warning.
+    source_complete and reconciliation_ok are INDEPENDENT: reconciled never
+    implies complete.
+  * source_complete = false while every store you were asked about is present
+    is still usable at store level — but do not call the network source
+    complete.
+  * Correlation is not causation. With daily observational data and no
+    intervention, say "associated with" or "coincided with". Do not write
+    "low staffing caused slower drive-thru" or similar.
+  * A store with no VERIFIED HME mapping has no HME data at all. Say it is not
+    mapped to HME — not that it had zero cars or poor performance.
 {GLOSSARY}
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
@@ -1149,6 +1205,15 @@ _ALLOWED_RELATIONS = frozenset({
     # timesheet_entries_v2 stay denied to laynes_ro. No loyalty key hash, no
     # employee_id, no customer_id, no PII crosses this boundary.
     "v_order_loyalty_context", "v_labor_hourly_context", "v_labor_daily_context",
+    # HME drive-thru (migrations 43/44). All four are VERIFIED-mapping-gated
+    # views over tables laynes_ro cannot read: hme_store_daily,
+    # hme_outliers_daily, hme_goal_history, hme_ingest_run, hme_store_mapping,
+    # hme_goal_conflict and the internal v_hme_store_daily_verified all stay
+    # denied. hme_store_number never crosses this boundary, so a numeric or
+    # name-based HME<->Revel join is not expressible. Percentages are 0-100;
+    # drive_thru_cars are lane vehicle observations, NEVER POS orders.
+    "v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
+    "v_hme_goal_history_llm", "v_hme_day_completeness_llm",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1758,6 +1823,109 @@ def _suspected_non_individual_ids() -> list[int]:
     return ids
 
 
+_HME_DAYS_SQL = """
+SELECT business_date, status, source_complete, reconciliation_ok,
+       observed_store_count, expected_store_count,
+       verified_observed_count, verified_expected_count, counts_consistent
+  FROM v_hme_day_completeness_llm
+ WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+ ORDER BY business_date
+"""
+
+_HME_SCOPE_SQL = """
+SELECT (SELECT count(DISTINCT establishment_id) FROM v_hme_store_daily_llm)   AS verified_mapped,
+       (SELECT max(business_date) FROM v_hme_store_daily_llm)                 AS latest_business_date,
+       (SELECT count(*) FROM v_hme_store_daily_llm
+         WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+           AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int))     AS rows_in_scope,
+       (SELECT count(DISTINCT establishment_id) FROM v_hme_store_daily_llm
+         WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+           AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int))     AS stores_in_scope
+"""
+
+
+def _hme_block(cur, establishment_id, period_start, period_end):
+    """HME completeness/trust profile for one analysis scope.
+
+    Reads ONLY the allowlisted _llm views as the read-only role. Raw hme_*
+    tables are not granted to laynes_ro and are never referenced here.
+
+    The block's job is to let the assistant refuse or qualify rather than
+    guess: missing_verified_stores is the hard gate (a VERIFIED store absent
+    for a date means store-level answers for it are not trustworthy), and
+    metric_availability states plainly what does not exist so an unsupported
+    question is declined instead of approximated.
+    """
+    params = {"est": establishment_id, "start": period_start, "end": period_end}
+    cur.execute(_HME_SCOPE_SQL, params)
+    scope = dict(cur.fetchone())
+    cur.execute(_HME_DAYS_SQL, params)
+    days = [dict(r) for r in cur.fetchall()]
+
+    # Revel establishments in scope vs those with no VERIFIED HME mapping at
+    # all. LCF Downtown Houston (48) is the standing example: it must read as
+    # "not mapped to HME", never as zero cars.
+    cur.execute("""SELECT id FROM establishments
+                    WHERE (%(est)s::int IS NULL OR id = %(est)s::int)
+                    ORDER BY id""", params)
+    revel_ids = [r["id"] for r in cur.fetchall()]
+    cur.execute("""SELECT DISTINCT establishment_id FROM v_hme_store_daily_llm""")
+    mapped_ids = {r["establishment_id"] for r in cur.fetchall()}
+    unmapped = [i for i in revel_ids if i not in mapped_ids]
+
+    latest = scope["latest_business_date"]
+    lag = None
+    if latest is not None:
+        lag = (datetime.now(ZoneInfo("America/Chicago")).date() - latest).days
+
+    per_day = [{
+        "business_date": d["business_date"].isoformat(),
+        "status": d["status"],
+        "source_complete": d["source_complete"],
+        "reconciliation_ok": d["reconciliation_ok"],
+        "observed_store_count": d["observed_store_count"],
+        "expected_store_count": d["expected_store_count"],
+        "verified_observed_count": d["verified_observed_count"],
+        "verified_expected_count": d["verified_expected_count"],
+        "counts_consistent": d["counts_consistent"],
+    } for d in days]
+
+    missing_verified = [
+        d["business_date"] for d in per_day
+        if (d["verified_expected_count"] or 0) > (d["verified_observed_count"] or 0)]
+
+    return {
+        "available": bool(scope["rows_in_scope"]),
+        "source": ("v_hme_store_daily_llm / v_hme_outliers_daily_llm / "
+                   "v_hme_goal_history_llm / v_hme_day_completeness_llm "
+                   "(VERIFIED HME->Revel mappings only)"),
+        "latest_business_date": latest.isoformat() if latest else None,
+        "freshness_lag_days": lag,
+        "mapped_store_coverage": {
+            "verified_mapped": scope["verified_mapped"],
+            "revel_establishments_in_scope": len(revel_ids),
+            "hme_stores_with_data_in_scope": scope["stores_in_scope"],
+            "unmapped_establishments": unmapped,
+        },
+        "per_day": per_day,
+        "incomplete_days": [d["business_date"] for d in per_day
+                            if d["source_complete"] is False],
+        "unreconciled_days": [d["business_date"] for d in per_day
+                              if d["reconciliation_ok"] is False],
+        "missing_verified_stores": missing_verified,
+        "metric_availability": {
+            "store_daily": True,
+            "outliers": True,
+            "goals": True,
+            # Extracted into the facts file but never persisted canonically, so
+            # it cannot be served. Advertised false rather than attempted.
+            "total_cars_goal_a_e": False,
+            # No store x hour HME fact exists at all.
+            "hourly_or_daypart": False,
+        },
+    }
+
+
 def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
     """Structured completeness/trust profile for one analysis scope.
 
@@ -1810,6 +1978,15 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 deep.update(dict(cur.fetchone()))
 
             _cohort_block = _cohort_context(establishment_id)
+            try:
+                _hme = _hme_block(cur, establishment_id, period_start, period_end)
+            except Exception as e:
+                # HME is additive context: if it cannot be read, the rest of the
+                # profile must still be produced. Never silently claim HME is
+                # absent -- say the status is unknown.
+                _hme = {"available": None, "status": "unavailable",
+                        "reason": f"{type(e).__name__}", "per_day": [],
+                        "missing_verified_stores": None}
             if establishment_id is None:
                 store = "ALL STORES"
             else:
@@ -2242,6 +2419,7 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
         "unavailable_metrics": UNAVAILABLE_METRIC_KEYS,
         "warnings": [],
     }
+    meta["hme"] = _hme
     return _reconcile(meta)
 
 
