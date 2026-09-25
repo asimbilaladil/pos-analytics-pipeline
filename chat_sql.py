@@ -2676,6 +2676,59 @@ _REFERENCE_RELATIONS = frozenset({
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def blocked_domain_context(meta: dict, question_domains) -> dict:
+    """Structured summary of what CAN and cannot be answered, for one final call.
+
+    When a required domain fails its own trust gate the comparison is dead: no
+    amount of further SQL will make an untrusted source trustworthy. The
+    observed failure mode was the model probing scope after scope hunting for a
+    usable one -- 12 check_data calls, zero run_sql, 146 s. This hands it the
+    verdict once, with the trusted side preserved so the answer is still useful.
+    """
+    doms = sorted(normalise_domains(question_domains))
+    out = {"question_domains": doms, "blocked": True,
+           "blocking_reasons": list(meta.get("blocking_reasons") or []),
+           "warnings": list(meta.get("warnings") or []),
+           "scope": meta.get("scope"),
+           "instruction": (
+               "A required data source failed its trust gate. Do NOT run further "
+               "SQL and do NOT retry other stores or dates -- the same gate "
+               "applies to every scope for this source. Explain which source is "
+               "unusable and why, report whatever the TRUSTED sources below can "
+               "still tell the user, and stop.")}
+
+    if DOMAIN_HME in doms:
+        h = meta.get("hme") or {}
+        hme_failed = any("HME" in r for r in out["blocking_reasons"])
+        out["hme"] = {
+            "trusted": not hme_failed and bool(h.get("available")),
+            "latest_business_date": h.get("latest_business_date"),
+            "freshness_lag_days": h.get("freshness_lag_days"),
+            "per_day": h.get("per_day"),
+            "incomplete_days": h.get("incomplete_days"),
+            "unreconciled_days": h.get("unreconciled_days"),
+            "missing_verified_stores": h.get("missing_verified_stores"),
+        }
+    if DOMAIN_REVEL in doms:
+        rec = meta.get("reconciliation") or {}
+        fresh = meta.get("freshness") or {}
+        revel_reasons = [r for r in out["blocking_reasons"] if "HME" not in r]
+        out["revel"] = {
+            "trusted": not revel_reasons,
+            "reason": revel_reasons[0] if revel_reasons else None,
+            "reconciliation_delta_pct": rec.get("delta_pct"),
+            "reconciliation_status": rec.get("status"),
+            "freshness_lag_hours": fresh.get("source_lag_hours"),
+            "order_rows": (meta.get("volumes") or {}).get("order_rows"),
+        }
+    if DOMAIN_LABOR in doms:
+        lab = meta.get("labor") or {}
+        out["labor"] = {"trusted": bool(lab.get("available")),
+                        "store_day_rows": lab.get("store_day_rows"),
+                        "labor_hours": lab.get("labor_hours")}
+    return out
+
+
 def _light_scope(cur, establishment_id, period_start, period_end) -> dict:
     """Minimal scope validity for a question that touches no Revel sales data.
 
@@ -3072,6 +3125,10 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     # never shared between requests or users, so it cannot serve stale or
     # cross-tenant metadata.
     scope_cache: dict = {}                  # one profile per (scope, domains) per turn
+    # Set once a required domain fails its own gate. The loop then makes ONE
+    # more model call, without tools, to explain the verdict -- instead of
+    # letting the model probe scope after scope for a usable one.
+    blocked: dict | None = None
     last_meta: list[dict] = []              # first gated scope, for the answer
 
     system = [
@@ -3131,6 +3188,10 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     _timing(timings, "check_data["
                             + ",".join(meta.get("domains") or []) + ","
                             + str(meta.get("_cache")) + "]", step["seconds"])
+                    if not meta["analysis_permitted"] and blocked is None:
+                        blocked = blocked_domain_context(
+                            meta, block.input.get("domains") or meta.get("domains"))
+                        step["short_circuit"] = True
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": json.dumps(meta, default=str,
@@ -3195,6 +3256,15 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 # a sound one is legitimate; it cannot skip the gate, because
                 # enforce_scope runs again for the new scope.
                 step["error"] = str(e).strip()
+                if blocked is None:
+                    _gm = scope_cache.get(
+                        (block.input.get("establishment_id"),
+                         block.input.get("period_start"),
+                         block.input.get("period_end_exclusive"),
+                         tuple(sorted(domains_for_relations(_relations_in(sql))))))
+                    if _gm is not None:
+                        blocked = blocked_domain_context(_gm, _gm.get("domains"))
+                        step["short_circuit"] = True
                 tool_results.append({
                     "type": "tool_result", "tool_use_id": block.id,
                     "content": f"REJECTED BEFORE EXECUTION: {step['error']}",
@@ -3210,6 +3280,28 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 })
             steps.append(step)
         messages.append({"role": "user", "content": tool_results})
+
+        if blocked is not None:
+            # Deterministic verdict reached: a required source is untrusted.
+            # One more call, WITHOUT tools, so the model can only explain -- it
+            # cannot spend further round-trips hunting for a usable scope.
+            messages.append({"role": "user", "content": (
+                "DATA TRUST VERDICT (authoritative, do not re-check):\n"
+                + json.dumps(blocked, default=str, separators=(",", ":"))
+                + "\n\nCompose the final answer now. State plainly which source "
+                  "is unusable and why, give the user whatever the trusted "
+                  "source(s) above still support, and do not attempt the "
+                  "comparison that the untrusted source would have required.")})
+            _t = time.perf_counter()
+            resp = client.messages.create(
+                model=model, max_tokens=4096, system=system, messages=messages)
+            _timing(timings, "anthropic.final_blocked",
+                    time.perf_counter() - _t)
+            final_text = "".join(b.text for b in resp.content if b.type == "text")
+            steps.append({"sql": None, "row_count": None, "error": None,
+                          "short_circuit": True, "blocked_domains": blocked.get(
+                              "question_domains")})
+            break
     else:
         final_text = ("I wasn't able to get to a clean answer within a few tries. "
                       "Try rephrasing, or narrow the question to one location / date range.")

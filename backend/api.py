@@ -25,6 +25,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from . import chat as chat_svc
+
+# uvicorn configures its own loggers and leaves the root logger at WARNING, so
+# the chat timing line (logger "laynes.chat") was emitted and then dropped --
+# the instrumentation existed but never reached the journal. Attach it to
+# uvicorn's handlers explicitly so a slow request stays diagnosable from logs.
+import logging as _logging
+
+_chat_log = _logging.getLogger("laynes.chat")
+_chat_log.setLevel(_logging.INFO)
+if not _chat_log.handlers:
+    _uv = _logging.getLogger("uvicorn")
+    for _h in _uv.handlers:
+        _chat_log.addHandler(_h)
+    if not _uv.handlers:                      # uvicorn not configured (tests)
+        _chat_log.addHandler(_logging.StreamHandler())
+_chat_log.propagate = False
 from . import conversations as convo
 from .auth import (SESSION_COOKIE, clear_cookie, create_session, current_user,
                    delete_session, set_cookie, verify_login)
