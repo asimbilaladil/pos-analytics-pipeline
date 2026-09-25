@@ -19,6 +19,7 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [failed, setFailed] = useState<{ question: string; retryable: boolean } | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -98,12 +99,28 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
       setMessages((prev) => [...prev, { role: 'user', content: shown },
                                        { role: 'assistant', content: res.answer }])
       setActiveId(res.conversation_id)
+      setFailed(null)
       refreshList()
     } catch (e) {
+      // The composer clears itself on send, so without this the question is
+      // simply gone and the user has to retype it after a timeout. Files cannot
+      // be re-sent (the File handles are not retained), so retry is offered for
+      // text-only turns and the question text is preserved either way.
+      setFailed({ question, retryable: files.length === 0 })
       handleError(e)
     } finally {
+      // Always clears the "Analyzing your data..." state -- on success, on any
+      // HTTP error, on a non-JSON gateway response, on an aborted request and
+      // on a transport failure.
       setPending(null)
     }
+  }
+
+  const retry = () => {
+    const q = failed?.question
+    if (!q) return
+    setFailed(null)
+    send(q)
   }
 
   const remove = async (id: number) => {
@@ -159,8 +176,23 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
                        border-amber-200/80 bg-amber-50 px-4 py-3 text-[13px] text-amber-900
                        shadow-card">
             <AlertCircle size={15} className="mt-px shrink-0" />
-            <span className="flex-1">{error}</span>
-            <button onClick={() => setError(null)} aria-label="Dismiss"><X size={14} /></button>
+            <div className="flex-1">
+              <span>{error}</span>
+              {failed && (
+                <div className="mt-1.5 text-[12.5px] text-amber-800">
+                  <span className="opacity-80">Your question was kept: </span>
+                  <span className="italic">“{failed.question}”</span>
+                  {failed.retryable && (
+                    <button
+                      onClick={retry}
+                      className="ml-2 rounded-md border border-amber-300 bg-white px-2 py-0.5
+                                 font-medium text-amber-900 hover:bg-amber-100"
+                    >Retry</button>
+                  )}
+                </div>
+              )}
+            </div>
+            <button onClick={() => { setError(null); setFailed(null) }} aria-label="Dismiss"><X size={14} /></button>
           </div>
         )}
 

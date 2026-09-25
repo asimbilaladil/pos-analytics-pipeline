@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import decimal
 import json
+import logging
 import os
 import time
 from datetime import date, datetime, timedelta
@@ -33,6 +34,7 @@ from pglast import ast, parse_sql
 from pglast.parser import ParseError
 
 MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5")
+log = logging.getLogger("laynes.chat")
 
 # Models selectable per-conversation from the chat UI. Keep in sync with
 # whatever Claude models are actually available to this API key.
@@ -1410,6 +1412,22 @@ CHECK_DATA_TOOL = {
                 "type": "string",
                 "description": "End business date, EXCLUSIVE, YYYY-MM-DD.",
             },
+            "domains": {
+                "type": "array",
+                "items": {"type": "string",
+                          "enum": ["revel", "hme", "labor", "identity"]},
+                "description": (
+                    "Which data sources the question actually needs. Pass only "
+                    "these, because each one's checks are run and applied: "
+                    "'revel' for POS sales/orders/products/payments, 'hme' for "
+                    "drive-thru cars/timing/goals/outliers, 'labor' for "
+                    "staffing/hours, 'identity' for customer/loyalty context. A "
+                    "drive-thru question needs ['hme'] alone and is NOT blocked "
+                    "by Revel sales reconciliation; 'compare drive-thru with "
+                    "sales' needs ['hme','revel']. Omitting this runs every "
+                    "check, which is slower and can block on an unrelated "
+                    "source."),
+            },
         },
         "required": ["establishment_id", "period_start", "period_end"],
         "additionalProperties": False,
@@ -1793,6 +1811,80 @@ _NONIND_TTL_SECONDS = 3600
 _nonind_cache: dict = {"ids": None, "at": 0.0}
 
 
+# ── data domains ────────────────────────────────────────────────────────────
+# A question about drive-thru lane times must not be blocked because Revel's
+# sales reconciliation failed for the same date: the two sources are
+# independent, and an HME-only answer does not depend on POS totals. Each
+# domain keeps its OWN checks in full; the change is only that an unrelated
+# domain can no longer veto an unrelated question.
+DOMAIN_REVEL = "revel"
+DOMAIN_HME = "hme"
+DOMAIN_LABOR = "labor"
+DOMAIN_IDENTITY = "identity"
+ALL_DOMAINS = (DOMAIN_REVEL, DOMAIN_HME, DOMAIN_LABOR, DOMAIN_IDENTITY)
+
+# Which domain each allowlisted relation belongs to. Derived from the relations
+# a statement actually references, so gating is decided by the SQL rather than
+# by the model's own claim about what it needs -- a claim could be wrong or
+# self-serving, the parse tree cannot.
+_RELATION_DOMAIN = {
+    "v_hme_store_daily_llm": DOMAIN_HME,
+    "v_hme_outliers_daily_llm": DOMAIN_HME,
+    "v_hme_goal_history_llm": DOMAIN_HME,
+    "v_hme_day_completeness_llm": DOMAIN_HME,
+    "v_labor_hourly_context": DOMAIN_LABOR,
+    "v_labor_daily_context": DOMAIN_LABOR,
+    "v_order_identity_context": DOMAIN_IDENTITY,
+    "v_identity_profile": DOMAIN_IDENTITY,
+    "v_order_loyalty_context": DOMAIN_IDENTITY,
+    # establishments is a shared dimension and implies no domain of its own:
+    # joining it to name a store must not drag in the Revel sales gate.
+    "establishments": None,
+    "weather_daily": None,
+}
+
+
+def domains_for_relations(relations) -> set:
+    """Domains implied by a set of relation names. Unknown -> REVEL.
+
+    Defaulting unknown relations to REVEL is deliberate: every legacy analytics
+    relation is Revel-derived, so an unrecognised name keeps the strict
+    pre-existing gate rather than silently escaping it.
+    """
+    out = set()
+    for rel in relations:
+        d = _RELATION_DOMAIN.get(rel, DOMAIN_REVEL)
+        if d is not None:
+            out.add(d)
+    if DOMAIN_IDENTITY in out:
+        out.add(DOMAIN_REVEL)   # see normalise_domains: identity implies revel
+    return out
+
+
+def normalise_domains(domains) -> set:
+    """Accept a list/set/None and return a valid domain set.
+
+    None or empty means "unknown", which maps to the full strict set so an
+    omission can never widen what is permitted.
+
+    IDENTITY IMPLIES REVEL. Customer/loyalty context is derived from POS orders
+    and payments, so an identity answer is only as trustworthy as the Revel
+    figures underneath it; it also lives inside the full Revel profile, which is
+    where identity metadata is computed. Treating identity as independent would
+    both skip its metadata and let it escape the sales gate it depends on.
+    """
+    if not domains:
+        return set(ALL_DOMAINS)
+    out = {str(d).strip().lower() for d in domains}
+    unknown = out - set(ALL_DOMAINS)
+    if unknown:
+        # An unrecognised domain name is treated as "everything", never ignored.
+        return set(ALL_DOMAINS)
+    if DOMAIN_IDENTITY in out:
+        out.add(DOMAIN_REVEL)
+    return out
+
+
 def _suspected_non_individual_ids() -> list[int]:
     now = time.time()
     if (_nonind_cache["ids"] is not None
@@ -1803,10 +1895,25 @@ def _suspected_non_individual_ids() -> list[int]:
         conn.set_session(readonly=True, autocommit=False)
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            # Equivalent to the previous "FROM v_orders_classified WHERE
+            # txn_class = 'REAL'" formulation, expanded so the planner can use a
+            # semi-join instead of the view's correlated per-order aggregate.
+            # txn_class = 'REAL' is exactly: not deleted, final_total > 0, and at
+            # least one live line item. Verified against the view: 111,758 =
+            # 111,758 rows, and the HAVING result sets match with symmetric
+            # difference 0. With migration 45's partial indexes this runs in
+            # ~0.8 s; the old form hit the 15 s statement timeout every call.
+            # Identity semantics are unchanged -- only the access path is.
             cur.execute("""
                 SELECT o.customer_id
-                FROM v_orders_classified o
-                WHERE o.txn_class = 'REAL' AND o.customer_id IS NOT NULL
+                FROM orders_v2 o
+                WHERE o.customer_id IS NOT NULL
+                  AND o.deleted IS NOT TRUE
+                  AND o.final_total > 0
+                  AND EXISTS (SELECT 1 FROM order_items_v2 oi
+                               WHERE oi.order_id = o.id
+                                 AND oi.deleted IS NOT TRUE
+                                 AND oi.is_voided IS NOT TRUE)
                 GROUP BY o.customer_id
                 HAVING (COUNT(DISTINCT o.establishment_id) >= 6
                         AND 100.0 * COUNT(*) FILTER (WHERE o.web_order)
@@ -1815,6 +1922,12 @@ def _suspected_non_individual_ids() -> list[int]:
             """)
             ids = [r[0] for r in cur.fetchall()]
     except psycopg2.Error:
+        # A failure here previously returned [] WITHOUT caching, so every
+        # request re-ran the timing-out query and silently behaved as if no
+        # non-individual account existed. Still fail open (identity context is
+        # advisory), but record the degradation so it is visible rather than
+        # indistinguishable from "none found".
+        _nonind_cache.update({"ids": None, "at": now, "degraded": True})
         return []
     finally:
         conn.rollback()
@@ -2563,6 +2676,191 @@ _REFERENCE_RELATIONS = frozenset({
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _light_scope(cur, establishment_id, period_start, period_end) -> dict:
+    """Minimal scope validity for a question that touches no Revel sales data.
+
+    Deliberately cheap: it establishes that the store and dates are real and
+    that the period is not in the future. It does NOT compute sales volumes,
+    reconciliation, integrity, channel, category or loyalty blocks -- those are
+    Revel-domain concerns and cost ~38 s, which is what made an HME-only
+    question outlive nginx.
+    """
+    if establishment_id is None:
+        store = "ALL STORES"
+    else:
+        cur.execute("SELECT name FROM establishments WHERE id = %s", (establishment_id,))
+        row = cur.fetchone()
+        store = (row["name"] if row else f"unknown ({establishment_id})")
+    chicago_today = datetime.now(ZoneInfo("America/Chicago")).date()
+    start_d = date.fromisoformat(period_start)
+    end_d = date.fromisoformat(period_end)
+    return {
+        "scope": {"establishment_id": establishment_id, "store": store,
+                  "period_start": period_start, "period_end_exclusive": period_end,
+                  "days": max(0, (end_d - start_d).days)},
+        "scope_valid": start_d < end_d,
+        "period_starts_in_future": start_d > chicago_today,
+    }
+
+
+def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list]:
+    """HME's own trust gate. Returns (fails, warns).
+
+    This is the HME domain's full check -- nothing here is weakened. What
+    changed is only that it is applied INSTEAD of, not on top of, the Revel
+    sales gate when the question touches no Revel data.
+    """
+    fails, warns = [], []
+    if not hme or hme.get("available") is None:
+        fails.append("HME availability could not be determined for this period")
+        return fails, warns
+    if not hme.get("available"):
+        fails.append("no HME drive-thru data exists for this store and period "
+                     "(a store with no VERIFIED HME mapping has none at all)")
+        return fails, warns
+
+    days = hme.get("per_day") or []
+    requested = {d["business_date"] for d in days}
+    # A VERIFIED store absent for a date makes store-level answers for that date
+    # untrustworthy: that is a FAIL, not a warning.
+    missing_verified = hme.get("missing_verified_stores") or []
+    if missing_verified:
+        fails.append("HME is missing one or more VERIFIED stores on "
+                     + ", ".join(missing_verified)
+                     + "; store-level drive-thru answers for those dates are not "
+                       "trustworthy")
+    unreconciled = hme.get("unreconciled_days") or []
+    if unreconciled:
+        fails.append("HME cross-source reconciliation failed on "
+                     + ", ".join(unreconciled)
+                     + "; drive-thru figures for those dates are not reconciled")
+    # Absent OUT_OF_SCOPE stores are a known, accepted condition: the mapped
+    # stores are still complete, so this warns rather than blocks.
+    incomplete = hme.get("incomplete_days") or []
+    if incomplete:
+        warns.append("the HME source day was INCOMPLETE on "
+                     + ", ".join(incomplete)
+                     + " (expected stores absent). Mapped-store figures are "
+                       "usable, but do not describe the HME source as complete")
+    if not requested:
+        fails.append("no HME business dates fall inside the requested period")
+    return fails, warns
+
+
+def _labor_gate(establishment_id, period_start, period_end) -> tuple[dict, list, list]:
+    """Labour availability for the scope. Advisory, as it has always been."""
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute("""
+                SELECT count(*) AS day_rows,
+                       count(DISTINCT establishment_id) AS stores,
+                       sum(labor_hours) AS labor_hours
+                  FROM v_labor_daily_context
+                 WHERE business_date >= %(start)s::date
+                   AND business_date <  %(end)s::date
+                   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)""",
+                        {"est": establishment_id, "start": period_start,
+                         "end": period_end})
+            row = dict(cur.fetchone())
+    finally:
+        conn.rollback()
+        conn.close()
+    block = {
+        "available": bool(row["day_rows"]),
+        "source": "v_labor_daily_context (no employee identity)",
+        "store_day_rows": int(row["day_rows"] or 0),
+        "stores_with_labor": int(row["stores"] or 0),
+        "labor_hours": (None if row["labor_hours"] is None
+                        else float(row["labor_hours"])),
+        "limitations": ("labor_hours is elapsed clocked time and INCLUDES unpaid "
+                        "breaks; estimated cost is hours x wage and is NOT "
+                        "payroll. Advisory only."),
+    }
+    fails = [] if block["available"] else [
+        "no labour records exist for this store and period"]
+    return block, fails, []
+
+
+def meta_profile(establishment_id, period_start: str, period_end: str,
+                 domains=None, cache=None) -> dict:
+    """Domain-aware completeness/trust profile.
+
+    Computes ONLY the blocks the requested domains need, and applies only those
+    domains' gates. A Revel-inclusive question keeps the full existing profile
+    and the full existing gate, unchanged.
+
+    `cache` is a request-scoped dict supplied by answer_question. It is keyed by
+    scope AND domain set, so a second identical call inside one answer reuses
+    the result instead of paying for it again, while a different date, store or
+    domain set still computes fresh. It is created per request and discarded
+    with it -- there is no cross-request or cross-user reuse.
+    """
+    doms = normalise_domains(domains)
+    key = (establishment_id, period_start, period_end, tuple(sorted(doms)))
+    if cache is not None and key in cache:
+        meta = dict(cache[key])
+        meta["_cache"] = "reused"
+        return meta
+
+    t0 = time.perf_counter()
+    if DOMAIN_REVEL in doms:
+        # Full legacy path: every Revel check, unchanged.
+        meta = meta_extract(establishment_id, period_start, period_end)
+        fails = list(meta.get("blocking_reasons") or [])
+        warns = list(meta.get("warnings") or [])
+    else:
+        conn = _ro_conn()
+        try:
+            conn.set_session(readonly=True, autocommit=False)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                meta = _light_scope(cur, establishment_id, period_start, period_end)
+                if DOMAIN_HME in doms:
+                    meta["hme"] = _hme_block(cur, establishment_id,
+                                             period_start, period_end)
+        finally:
+            conn.rollback()
+            conn.close()
+        fails, warns = [], []
+        if not meta.get("scope_valid"):
+            fails.append("the requested period is empty or inverted")
+
+    if DOMAIN_HME in doms:
+        if meta.get("hme") is None:
+            conn = _ro_conn()
+            try:
+                conn.set_session(readonly=True, autocommit=False)
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                    meta["hme"] = _hme_block(cur, establishment_id,
+                                             period_start, period_end)
+            finally:
+                conn.rollback()
+                conn.close()
+        hf, hw = _hme_gate(meta["hme"], period_start, period_end)
+        fails += hf
+        warns += hw
+
+    if DOMAIN_LABOR in doms and DOMAIN_REVEL not in doms:
+        lb, lf, lw = _labor_gate(establishment_id, period_start, period_end)
+        meta["labor"] = lb
+        fails += lf
+        warns += lw
+
+    meta["domains"] = sorted(doms)
+    meta["blocking_reasons"] = fails
+    meta["warnings"] = warns
+    meta["analysis_permitted"] = not fails
+    meta["_profile_seconds"] = round(time.perf_counter() - t0, 3)
+    meta["_cache"] = "computed"
+    if cache is not None:
+        cache[key] = meta
+    return meta
+
+
 def _scope_facts(stmt) -> dict:
     """Date literals, establishment_id literals and relative-date use in a query."""
     dates: set[str] = set()
@@ -2670,19 +2968,21 @@ def enforce_scope(sql: str, establishment_id, period_start, period_end,
                 "no establishment_id filter, so it would read every store. Add "
                 "the filter, or declare establishment_id null for a network query.")
 
-    key = (establishment_id, period_start, period_end)
-    if cache is not None and key in cache:
-        meta = cache[key]
-    else:
-        meta = meta_extract(establishment_id, period_start, period_end)
-        if cache is not None:
-            cache[key] = meta
+    # Gate on the domains this STATEMENT actually reads, taken from the parse
+    # tree rather than from anything the model asserted. An HME-only query is
+    # therefore held to HME's checks and is not vetoed by Revel's sales
+    # reconciliation; a query that does touch Revel still gets the full Revel
+    # gate, unchanged.
+    doms = domains_for_relations(business)
+    meta = meta_profile(establishment_id, period_start, period_end,
+                        domains=doms, cache=cache)
 
     if not meta["analysis_permitted"]:
         raise ScopeError(
-            "the data for this scope did not pass the reconciliation gate, so "
-            "the query was not run: " + "; ".join(meta["blocking_reasons"]) +
-            ". Report this to the user and stop -- do not analyse this period.")
+            "the data for this scope did not pass the "
+            + "/".join(sorted(doms)) + " trust gate, so the query was not run: "
+            + "; ".join(meta["blocking_reasons"])
+            + ". Report this to the user and stop -- do not analyse this period.")
     return meta
 
 
@@ -2690,6 +2990,55 @@ class ChatResult:
     def __init__(self, answer: str, steps: list[dict]):
         self.answer = answer
         self.steps = steps  # [{sql, row_count, error}]
+
+
+# ── request bounds and timing ───────────────────────────────────────────────
+# nginx gives the upstream 300 s (proxy_read_timeout). The application must
+# therefore fail on its OWN terms comfortably before that, so the user gets a
+# structured JSON error instead of nginx's HTML 504 -- which the frontend could
+# not parse and which left the spinner running forever.
+#
+# Measured after the domain-aware refactor: an HME-only answer is ~10-20 s and a
+# Revel answer ~40-60 s, dominated by Anthropic round-trips. The values below
+# sit well above normal behaviour and well below nginx:
+#
+#   REQUEST_DEADLINE_SECONDS 240  < nginx 300, leaving 60 s of headroom for the
+#                                 response to be written and proxied back.
+#   ANTHROPIC_TIMEOUT_SECONDS 90  replaces the SDK default of 600 s read. No
+#                                 observed call exceeded ~16 s, so 90 s is ~5x
+#                                 headroom while making a hung call recoverable
+#                                 inside the deadline.
+#   ANTHROPIC_MAX_RETRIES 1       the SDK default of 2 means a stuck call could
+#                                 consume 3 x timeout silently. One retry still
+#                                 absorbs a transient 429/5xx.
+#
+# Worst case is therefore 2 attempts x 90 s = 180 s for a single call, and the
+# deadline check between loop iterations stops further work after 240 s.
+REQUEST_DEADLINE_SECONDS = float(os.getenv("CHAT_REQUEST_DEADLINE_SECONDS", "240"))
+ANTHROPIC_TIMEOUT_SECONDS = float(os.getenv("CHAT_ANTHROPIC_TIMEOUT_SECONDS", "90"))
+ANTHROPIC_MAX_RETRIES = int(os.getenv("CHAT_ANTHROPIC_MAX_RETRIES", "1"))
+
+
+class ChatTimeout(Exception):
+    """The request exceeded its own deadline. Surfaced as a structured error."""
+
+
+def _log_timings(timings: list, model: str, aborted: bool = False) -> None:
+    """Emit one structured, payload-free timing line per request."""
+    total = sum(d for _, d in timings)
+    parts = " ".join(f"{lbl}={d:.2f}s" for lbl, d in timings)
+    log.info("chat_timing model=%s aborted=%s stages=%d measured_total=%.2fs %s",
+             model, aborted, len(timings), total, parts)
+
+
+def _timing(timings: list, label: str, seconds: float) -> None:
+    """Record one stage duration. Durations only -- never payloads.
+
+    Nothing here logs SQL text, result rows, credentials, tokens or user
+    content: a future slow request must be diagnosable from the log without the
+    log itself becoming a data-exfiltration surface.
+    """
+    timings.append((label, round(seconds, 3)))
 
 
 def answer_question(history: list[dict], question: str, model: str | None = None,
@@ -2701,7 +3050,10 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         this question only; they are not replayed on later turns.
     Returns ChatResult(answer, steps). Raises anthropic.APIError on API failure.
     """
-    client = anthropic.Anthropic()  # ANTHROPIC_API_KEY from env
+    # Explicit bounds: the SDK defaults (600 s read, 2 retries) can outlive
+    # nginx several times over without the application noticing.
+    client = anthropic.Anthropic(  # ANTHROPIC_API_KEY from env
+        timeout=ANTHROPIC_TIMEOUT_SECONDS, max_retries=ANTHROPIC_MAX_RETRIES)
     model = model or MODEL
     messages: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history
@@ -2714,7 +3066,12 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
     steps: list[dict] = []
     final_text = ""
-    scope_cache: dict = {}                  # one meta_extract per scope per turn
+    timings: list = []
+    t_request = time.perf_counter()
+    # Request-scoped only: created here, discarded when this call returns. It is
+    # never shared between requests or users, so it cannot serve stale or
+    # cross-tenant metadata.
+    scope_cache: dict = {}                  # one profile per (scope, domains) per turn
     last_meta: list[dict] = []              # first gated scope, for the answer
 
     system = [
@@ -2722,7 +3079,15 @@ def answer_question(history: list[dict], question: str, model: str | None = None
          "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": _system_today()},
     ]
-    for _ in range(MAX_LOOPS):
+    for _loop in range(MAX_LOOPS):
+        elapsed = time.perf_counter() - t_request
+        if elapsed > REQUEST_DEADLINE_SECONDS:
+            _timing(timings, "deadline_exceeded", elapsed)
+            _log_timings(timings, model, aborted=True)
+            raise ChatTimeout(
+                f"analysis exceeded {REQUEST_DEADLINE_SECONDS:.0f}s after "
+                f"{_loop} tool round-trip(s)")
+        _t = time.perf_counter()
         resp = client.messages.create(
             model=model,
             max_tokens=4096,
@@ -2730,6 +3095,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
             tools=[CHECK_DATA_TOOL, RUN_SQL_TOOL],
             messages=messages,
         )
+        _timing(timings, f"anthropic.messages.create[{_loop}]",
+                time.perf_counter() - _t)
 
         if resp.stop_reason != "tool_use":
             final_text = "".join(b.text for b in resp.content if b.type == "text")
@@ -2745,12 +3112,25 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 step = {"sql": None, "row_count": None, "error": None,
                         "check": dict(block.input)}
                 try:
-                    ck = (block.input.get("establishment_id"),
-                          block.input["period_start"], block.input["period_end"])
-                    meta = scope_cache.get(ck) or meta_extract(*ck)
-                    scope_cache[ck] = meta
+                    _t = time.perf_counter()
+                    meta = meta_profile(block.input.get("establishment_id"),
+                                        block.input["period_start"],
+                                        block.input["period_end"],
+                                        domains=block.input.get("domains"),
+                                        cache=scope_cache)
                     step["meta"] = meta
-                    step["status"] = meta["reconciliation"]["status"]
+                    step["domains"] = meta.get("domains")
+                    step["cache"] = meta.get("_cache")
+                    step["seconds"] = round(time.perf_counter() - _t, 3)
+                    # A non-Revel profile has no Revel reconciliation block; the
+                    # domain gate's own verdict is what matters there.
+                    step["status"] = (meta["reconciliation"]["status"]
+                                      if "reconciliation" in meta
+                                      else ("PASS" if meta["analysis_permitted"]
+                                            else "FAIL"))
+                    _timing(timings, "check_data["
+                            + ",".join(meta.get("domains") or []) + ","
+                            + str(meta.get("_cache")) + "]", step["seconds"])
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": json.dumps(meta, default=str,
@@ -2770,6 +3150,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
             sql = block.input.get("sql", "")
             step = {"sql": sql, "row_count": None, "error": None}
+            _t_sql = time.perf_counter()
             try:
                 # A12: the server reconciles the declared scope itself, before
                 # the SQL reaches the database. This does not depend on the
@@ -2781,11 +3162,20 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     block.input.get("period_end_exclusive"),
                     cache=scope_cache,
                 )
+                _timing(timings, "enforce_scope", time.perf_counter() - _t_sql)
                 if gate_meta is not None:
-                    step["gate"] = gate_meta["reconciliation"]["status"]
+                    step["gate"] = (gate_meta["reconciliation"]["status"]
+                                    if "reconciliation" in gate_meta
+                                    else ("PASS" if gate_meta["analysis_permitted"]
+                                          else "FAIL"))
+                    step["domains"] = gate_meta.get("domains")
+                    step["gate_cache"] = gate_meta.get("_cache")
                     if not last_meta:
                         last_meta.append(gate_meta)
+                _t_exec = time.perf_counter()
                 out = run_sql(sql)
+                step["sql_seconds"] = round(time.perf_counter() - _t_exec, 3)
+                _timing(timings, "run_sql", time.perf_counter() - _t_exec)
                 step["row_count"] = out["row_count"]
                 payload = json.dumps(out, separators=(",", ":"))
                 # keep tool payload bounded
@@ -2824,4 +3214,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         final_text = ("I wasn't able to get to a clean answer within a few tries. "
                       "Try rephrasing, or narrow the question to one location / date range.")
 
-    return ChatResult(final_text.strip(), steps)
+    _timing(timings, "TOTAL", time.perf_counter() - t_request)
+    _log_timings(timings, model)
+    result = ChatResult(final_text.strip(), steps)
+    result.timings = timings
+    return result

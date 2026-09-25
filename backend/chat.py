@@ -41,11 +41,19 @@ def ask(history, question: str, model: str, attachments: list[dict] | None = Non
         result = chat_sql.answer_question(history, question, model=model,
                                           attachments=attachments)
         answer, steps = result.answer, result.steps
+    except chat_sql.ChatTimeout as exc:
+        # The application gives up on its OWN deadline (240 s), comfortably
+        # inside nginx's 300 s proxy_read_timeout, so the browser receives this
+        # JSON answer instead of nginx's HTML 504 -- which the UI could not
+        # parse and which left the spinner running indefinitely.
+        error = f"ChatTimeout: {exc}"
+        answer = "That request took too long. Please try again."
+        steps = []
     except Exception as exc:                      # noqa: BLE001
         # The class name is safe to record; the message may carry internals, so
         # it is logged server-side and never returned to the browser verbatim.
         error = f"{type(exc).__name__}: {exc}"
-        answer = ("Something went wrong reaching the assistant. "
-                  "Please try again in a moment.")
+        answer = ("Something went wrong while analyzing the data. "
+                  "Please try again.")
         steps = []
     return answer, steps, int((time.time() - started) * 1000), error
