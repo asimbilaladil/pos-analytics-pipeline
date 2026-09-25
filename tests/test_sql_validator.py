@@ -24,6 +24,22 @@ from chat_sql import SqlError, _validate  # noqa: E402
 
 # ── must be accepted ───────────────────────────────────────────────────────
 ALLOW = [
+    # HME drive-thru safe views (migrations 43/44). Allowlisted at enablement;
+    # the raw hme_* relations below stay denied.
+    ("hme_llm_daily",         "SELECT * FROM v_hme_store_daily_llm"),
+    ("hme_llm_outliers",      "SELECT * FROM v_hme_outliers_daily_llm"),
+    ("hme_llm_goals",         "SELECT * FROM v_hme_goal_history_llm"),
+    ("hme_llm_completeness",  "SELECT * FROM v_hme_day_completeness_llm"),
+    ("hme_llm_join_revel",    "SELECT h.establishment_id, h.drive_thru_cars, e.name "
+                              "FROM v_hme_store_daily_llm h "
+                              "JOIN establishments e ON e.id = h.establishment_id"),
+    ("hme_llm_goal_effective", "SELECT d.establishment_id FROM v_hme_store_daily_llm d "
+                               "JOIN v_hme_goal_history_llm g "
+                               "ON g.establishment_id = d.establishment_id "
+                               "AND d.business_date >= g.effective_from_date "
+                               "AND (g.effective_to_date IS NULL "
+                               "OR d.business_date <= g.effective_to_date)"),
+
     # Function-call syntax that spells an argument with FROM/IN. These are not
     # clauses, and reading them as one made the validator reject legitimate
     # date logic -- EXTRACT(dow FROM current_date) failed as "relation
@@ -72,6 +88,30 @@ ALLOW = [
 
 # ── must be rejected ───────────────────────────────────────────────────────
 DENY = [
+    # ---- HME (migrations 43/44) ------------------------------------------
+    # The raw HME tables are never allowlisted. They carry all 34 tenant
+    # stores including the 23 OUT_OF_SCOPE ones, plus hme_store_number, which
+    # is HME-internal identity and NOT the Revel establishment_id -- exposing
+    # it is what would make a bogus numeric cross-system join expressible.
+    # The assistant reads HME only through the four VERIFIED-gated _llm views.
+    ("hme_store_daily_direct",    "SELECT * FROM hme_store_daily"),
+    ("hme_outliers_direct",       "SELECT * FROM hme_outliers_daily"),
+    ("hme_goal_history_direct",   "SELECT * FROM hme_goal_history"),
+    ("hme_ingest_run_direct",     "SELECT * FROM hme_ingest_run"),
+    ("hme_store_mapping_direct",  "SELECT * FROM hme_store_mapping"),
+    ("hme_goal_conflict_direct",  "SELECT * FROM hme_goal_conflict"),
+    # The internal verified view is NOT the LLM view: it exposes
+    # hme_store_number and is deliberately denied as well.
+    ("hme_verified_view_direct",  "SELECT * FROM v_hme_store_daily_verified"),
+    ("hme_quoted",                'SELECT * FROM "hme_store_daily"'),
+    ("hme_schema_qualified",      "SELECT * FROM public.hme_store_daily"),
+    ("hme_implicit_join",         "SELECT * FROM orders_v2 o, hme_store_daily h"),
+    ("hme_alias",                 "SELECT * FROM hme_store_daily AS d"),
+    ("hme_cte_table",             "WITH x AS (TABLE hme_store_daily) SELECT * FROM x"),
+    ("hme_join_to_revel",         "SELECT * FROM orders_v2 o "
+                                  "JOIN hme_store_daily h ON TRUE"),
+    ("hme_subquery",              "SELECT (SELECT count(*) FROM hme_store_daily)"),
+    # ----------------------------------------------------------------------
     ("app_users_direct",          "SELECT * FROM app_users"),
     ("app_users_columns",         "SELECT email, password_hash FROM app_users"),
     ("app_users_join",            "SELECT * FROM orders_v2 o JOIN app_users u ON TRUE"),
