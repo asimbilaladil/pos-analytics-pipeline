@@ -220,6 +220,99 @@ for forbidden in ("sql", "rows", "answer", "question", "api_key", "token"):
     check(f"the timing log never emits {forbidden!r}",
           f'"{forbidden}"' not in body and f"%({forbidden})" not in body)
 
+
+# ---------------------------------------------------------------------------
+# 8 -- early short-circuit on a failed required domain
+#
+# The 2026-09-25 request "Compare drive-thru performance with sales yesterday"
+# took 146.6 s: 12 check_data calls, zero run_sql, every one a cache MISS
+# because the model kept probing a different scope hunting for a usable Revel
+# window. No scope could succeed -- the source itself was untrusted.
+# ---------------------------------------------------------------------------
+_S, _E = "2026-09-24", "2026-09-25"
+
+_hme_ok = {"available": True, "latest_business_date": "2026-09-24",
+           "freshness_lag_days": 1, "per_day": [{"business_date": "2026-09-24"}],
+           "incomplete_days": [], "unreconciled_days": [],
+           "missing_verified_stores": []}
+
+
+def _meta(doms, fails, **extra):
+    m = {"domains": sorted(D.normalise_domains(doms)),
+         "blocking_reasons": fails, "warnings": [],
+         "analysis_permitted": not fails,
+         "scope": {"establishment_id": None, "period_start": _S}}
+    m.update(extra)
+    return m
+
+
+# HME PASS + Revel FAIL -> blocked, but the HME side stays usable
+ctx = D.blocked_domain_context(
+    _meta(["hme", "revel"], ["sales reconciliation is off by -3.74%"],
+          hme=_hme_ok, reconciliation={"delta_pct": -3.74, "status": "FAIL"},
+          freshness={"source_lag_hours": 31.3}, volumes={"order_rows": 86}),
+    ["hme", "revel"])
+check("HME PASS + Revel FAIL is reported as blocked", ctx["blocked"] is True)
+check("the trusted HME side is preserved for the answer",
+      ctx["hme"]["trusted"] is True and ctx["hme"]["latest_business_date"] == "2026-09-24")
+check("the Revel side is marked untrusted with its reason",
+      ctx["revel"]["trusted"] is False and "-3.74" in ctx["revel"]["reason"])
+check("the numeric reconciliation delta is carried through",
+      ctx["revel"]["reconciliation_delta_pct"] == -3.74)
+check("the freshness lag is carried through",
+      ctx["revel"]["freshness_lag_hours"] == 31.3)
+check("the model is told not to retry other scopes",
+      "do NOT retry other stores or dates" in ctx["instruction"])
+check("the model is told not to run further SQL",
+      "Do NOT run further SQL" in ctx["instruction"])
+
+# HME FAIL + Revel PASS -> same principle, mirrored
+ctx2 = D.blocked_domain_context(
+    _meta(["hme", "revel"], ["HME cross-source reconciliation failed on 2026-09-24"],
+          hme=dict(_hme_ok, unreconciled_days=["2026-09-24"]),
+          reconciliation={"delta_pct": 0.01, "status": "PASS"},
+          freshness={"source_lag_hours": 2.0}, volumes={"order_rows": 6000}),
+    ["hme", "revel"])
+check("HME FAIL + Revel PASS is also blocked", ctx2["blocked"] is True)
+check("the HME side is marked untrusted when HME is the failure",
+      ctx2["hme"]["trusted"] is False)
+check("the Revel side stays trusted when only HME failed",
+      ctx2["revel"]["trusted"] is True, str(ctx2["revel"]))
+
+# HME + Labor with labour failing
+ctx3 = D.blocked_domain_context(
+    _meta(["hme", "labor"], ["no labour records exist for this store and period"],
+          hme=_hme_ok, labor={"available": False, "store_day_rows": 0}),
+    ["hme", "labor"])
+check("HME + labour with labour absent is blocked", ctx3["blocked"] is True)
+check("the labour side is marked untrusted", ctx3["labor"]["trusted"] is False)
+check("the HME side survives a labour failure", ctx3["hme"]["trusted"] is True)
+
+# HME PASS + Revel PASS -> nothing to short-circuit
+_ok = D.meta_profile(None, "2026-09-23", "2026-09-24", domains=["hme"])
+check("a passing profile permits analysis (no short circuit)",
+      _ok["analysis_permitted"] is True)
+
+# The live case must actually trip the gate
+_live = D.meta_profile(None, _S, _E, domains=["hme", "revel"])
+check("the live HME+Revel scope is genuinely blocked (precondition)",
+      not _live["analysis_permitted"])
+_live_ctx = D.blocked_domain_context(_live, ["hme", "revel"])
+check("the live blocked context still reports HME as trusted",
+      _live_ctx["hme"]["trusted"] is True, str(_live_ctx["hme"])[:120])
+check("the live blocked context names Revel as the failure",
+      _live_ctx["revel"]["trusted"] is False)
+
+# The wiring itself: one final tool-free call, and the loop stops.
+_src = open("chat_sql.py").read()
+check("the short circuit makes a final model call WITHOUT tools",
+      "anthropic.final_blocked" in _src
+      and "model=model, max_tokens=4096, system=system, messages=messages)" in _src)
+check("the short circuit breaks the tool loop",
+      _src.index("anthropic.final_blocked") < _src.index("break", _src.index("anthropic.final_blocked")))
+check("the verdict is marked authoritative so the model does not re-check",
+      "DATA TRUST VERDICT (authoritative, do not re-check)" in _src)
+
 # ---------------------------------------------------------------------------
 passed = sum(1 for _, ok, _ in results if ok)
 failed = len(results) - passed
