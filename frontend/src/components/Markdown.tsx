@@ -32,18 +32,25 @@ export function Markdown({ children }: { children: string }) {
             <blockquote className="mb-3 border-l-2 border-line pl-3 text-ink-500" {...p} />
           ),
           hr: () => <hr className="my-5 border-line" />,
+          // `w-full` (width:100%) pinned the table to the container, so the
+          // wrapper's overflow-x-auto could never engage: with nowrap headers
+          // the browser squeezed the columns until the header labels ran
+          // together ("StoreLane avg timeDisastrous %..."). `w-max` lets the
+          // table take its natural width and actually scroll, while
+          // `min-w-full` keeps a narrow table filling the card as before.
           table: (p) => (
             <div className="mb-4 max-w-full overflow-x-auto rounded-xl border border-line scroll-thin">
-              <table className="w-full border-collapse text-[13.5px]" {...p} />
+              <table className="w-max min-w-full border-collapse text-[13.5px]" {...p} />
             </div>
           ),
           thead: (p) => <thead className="bg-app" {...p} />,
           th: (p) => (
-            <th className="whitespace-nowrap border-b border-line px-3 py-2 text-left text-[11px]
-                           font-semibold uppercase tracking-wide text-ink-500" {...p} />
+            <th className="whitespace-nowrap border-b border-r border-line px-3 py-2 text-left
+                           text-[11px] font-semibold uppercase tracking-wide text-ink-500
+                           last:border-r-0" {...p} />
           ),
           td: (p) => (
-            <td className="border-b border-line/70 px-3 py-2 align-top tabular-nums
+            <td className="border-b border-r border-line/70 px-3 py-2 align-top tabular-nums
                            last:border-r-0 [tr:last-child_&]:border-b-0" {...p} />
           ),
           code: ({ className, children, ...rest }) => {
