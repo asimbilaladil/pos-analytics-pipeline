@@ -50,14 +50,25 @@ def main() -> int:
           and meta["scope"]["period_start"] == JUN_A)
     check("status computed without any check_data call",
           ok and meta["reconciliation"]["status"] == "PASS")
-    check("scope cached for the turn", (NED, JUN_A, JUN_B) in cache)
+    # The request-scoped cache key gained a DOMAIN component, so an HME-only
+    # question cannot reuse a profile computed under the Revel gate (and vice
+    # versa). Scope is still the first three elements.
+    check("scope cached for the turn",
+          any(k[:3] == (NED, JUN_A, JUN_B) for k in cache))
+    check("the cache key carries the domain set",
+          all(len(k) == 4 and isinstance(k[3], tuple) for k in cache),
+          str(list(cache.keys()))[:120])
 
     print("=== B. failing scope is blocked BEFORE execution ===")
     bea_sql = ("SELECT COUNT(*) FROM v_orders_classified WHERE establishment_id = 14 "
                "AND business_date >= '2026-09-01' AND business_date < '2026-10-01'")
     ok, err = allowed(bea_sql, BEA, SEP_A, SEP_B, cache)
     check("Beaumont September rejected", not ok)
-    check("rejection names the gate", not ok and "reconciliation gate" in err)
+    # The message now names the DOMAIN whose gate refused, so a user can tell
+    # "Revel sales did not reconcile" from "HME did not reconcile" instead of
+    # seeing one undifferentiated failure.
+    check("rejection names the gate",
+          not ok and "trust gate" in err and "revel" in err, err[:110])
     check("rejection carries blocking reasons",
           not ok and ("incomplete" in err or "business days" in err))
 
@@ -166,8 +177,10 @@ def main() -> int:
     # B. the failed scope stays failed
     ok, err = allowed(bea_sep, BEA, SEP_A, SEP_B, turn)
     check("B. repeating the failed September scope is still blocked", not ok)
+    _bea = [v for k, v in turn.items() if k[:3] == (BEA, SEP_A, SEP_B)]
     check("B. failed scope cached as failed",
-          turn[(BEA, SEP_A, SEP_B)]["analysis_permitted"] is False)
+          bool(_bea) and all(v["analysis_permitted"] is False for v in _bea),
+          str(list(turn.keys()))[:120])
 
     # C. a different store is judged independently
     ok, meta = allowed(NED_JUNE_SQL, NED, JUN_A, JUN_B, turn)
@@ -176,17 +189,24 @@ def main() -> int:
     # D. every distinct scope gets its own reconciliation entry
     check("D. each scope cached separately",
           {(BEA, SEP_A, SEP_B), (BEA, "2026-08-01", "2026-09-01"),
-           (NED, JUN_A, JUN_B)} <= set(turn),
+           (NED, JUN_A, JUN_B)} <= {k[:3] for k in turn},
           f"{len(turn)} scopes cached")
     narrower = ("SELECT SUM(final_total) FROM v_orders_classified "
                 "WHERE establishment_id = 14 AND business_date >= '2026-08-01' "
                 "AND business_date < '2026-08-15'")
     ok, meta = allowed(narrower, BEA, "2026-08-01", "2026-08-15", turn)
+    def _cached(est, a, b):
+        """Look a scope up regardless of the domain component of the key."""
+        hits = [v for k, v in turn.items() if k[:3] == (est, a, b)]
+        return hits[0] if hits else None
+
     check("D. narrower scope reconciled separately",
-          ok and (BEA, "2026-08-01", "2026-08-15") in turn)
+          ok and _cached(BEA, "2026-08-01", "2026-08-15") is not None)
+    _aug = _cached(BEA, "2026-08-01", "2026-09-01")
     check("D. narrower scope has its own totals",
-          ok and meta["reconciliation"]["computed_total"]
-          != turn[(BEA, "2026-08-01", "2026-09-01")]["reconciliation"]["computed_total"])
+          ok and _aug is not None
+          and meta["reconciliation"]["computed_total"]
+          != _aug["reconciliation"]["computed_total"])
 
     # E. changing scope is not a way around the gate
     ok, err = allowed(bea_sep, None, None, None, turn)
