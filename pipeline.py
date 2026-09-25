@@ -156,6 +156,49 @@ def with_retries(fn, attempts=3, delay=5, label="operation", non_retryable=()):
 
 
 # ─── Revel API Helpers ────────────────────────────────────────────────────────
+class RevelAuthError(RuntimeError):
+    """Revel rejected the request because the session is not valid.
+
+    Distinct from ordinary API flakiness. On 2026-09-25 the saved session
+    validated, the first product page succeeded, and every request after that
+    returned HTTP 401 with Revel's HTML login page. The generic handler logged
+    "giving up" per resource and moved on, so all 12 establishments and all five
+    resources recorded rows_fetched: 0, the process exited 0, and run.sh logged
+    "Revel sync completed successfully" for a run that fetched nothing.
+    """
+
+
+# A 401/403 is unambiguous. The subtler case is HTTP 200 carrying Revel's login
+# page: json.loads then fails with "Expecting value: line 1 column 1", which
+# looks like transient corruption and gets retried pointlessly. Both are auth.
+_LOGIN_PAGE_MARKERS = ("<html", "<!doctype html", "authentication.revelup.com",
+                       'name="username"', "<link rel=\"stylesheet\"")
+
+
+def _is_auth_failure(status: int, body: str) -> bool:
+    """True when a response means "your session is gone", not "try again"."""
+    if status in (401, 403):
+        return True
+    if status == 200 and body:
+        head = body[:600].lower()
+        if any(m in head for m in _LOGIN_PAGE_MARKERS):
+            return True
+    return False
+
+
+def reauthenticate(context) -> None:
+    """Re-login once and refresh the saved session. Never loops."""
+    log.warning("Revel session expired mid-run — re-authenticating once")
+    page = context.new_page()
+    try:
+        login_and_save(context, page)
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
 def login_and_save(context, page):
     """Login to Revel and save browser session."""
     log.info("Logging into Revel...")
@@ -207,6 +250,9 @@ def fetch_all_pages(context, endpoint: str, params: dict, label="records",
     """
     all_records = []
     offset = 0
+    # One re-authentication per fetch, tracked across pages so an expired
+    # session cannot trigger a re-login loop mid-pagination.
+    reauth_box = [False]
 
     while True:
         paged = {**params, "limit": 1000, "offset": offset, "format": "json"}
@@ -216,9 +262,16 @@ def fetch_all_pages(context, endpoint: str, params: dict, label="records",
         def _get_page():
             attempt_box[0] += 1
             r = context.request.get(endpoint, params=paged)
-            if r.status != 200:
-                raise RuntimeError(f"HTTP {r.status} at offset {offset}: {r.text()[:200]}")
             raw_text = r.text()  # untouched body
+            # Auth is checked BEFORE the generic status check so a 401 is never
+            # mistaken for ordinary flakiness and retried three times against a
+            # session that cannot recover on its own.
+            if _is_auth_failure(r.status, raw_text):
+                raise RevelAuthError(
+                    f"auth failure: HTTP {r.status} at offset {offset} "
+                    f"({'login page returned' if r.status == 200 else 'unauthorised'})")
+            if r.status != 200:
+                raise RuntimeError(f"HTTP {r.status} at offset {offset}: {raw_text[:200]}")
 
             if resource:
                 # Archive BEFORE parsing, unconditionally — even a malformed
@@ -238,14 +291,39 @@ def fetch_all_pages(context, endpoint: str, params: dict, label="records",
 
         try:
             data = with_retries(_get_page, attempts=3, delay=5,
-                                 label=f"{endpoint} offset {offset}")
+                                 label=f"{endpoint} offset {offset}",
+                                 non_retryable=(RevelAuthError,))
         except raw_archive.ArchiveError:
             log.error("  Archive storage failure for %s page %d — aborting, "
                       "NOT retrying Revel and NOT processing partial results", resource, page)
             raise
+        except RevelAuthError as exc:
+            # Re-authenticate ONCE and retry this page ONCE. A second failure
+            # means the credentials or the account are the problem, which no
+            # amount of retrying fixes -- abort the run rather than march
+            # through every remaining store recording zero rows.
+            if reauth_box[0]:
+                log.error("  %s — auth failed again after re-login at offset %d: %s",
+                          endpoint, offset, exc)
+                raise
+            reauth_box[0] = True
+            reauthenticate(context)
+            try:
+                data = with_retries(_get_page, attempts=1, delay=0,
+                                     label=f"{endpoint} offset {offset} (post-reauth)",
+                                     non_retryable=(RevelAuthError,))
+            except Exception as exc2:
+                log.error("  %s — retry after re-login failed at offset %d: %s",
+                          endpoint, offset, exc2)
+                raise RevelAuthError(str(exc2)) from exc2
+            log.info("  re-authenticated; resumed %s at offset %d", endpoint, offset)
         except Exception as exc:
-            log.error("  %s — giving up at offset %d: %s", endpoint, offset, exc)
-            break
+            # Previously this logged "giving up" and broke out of pagination,
+            # returning whatever partial list it had. The caller then recorded a
+            # successful resource with 0 rows. A required resource failure must
+            # reach the run status instead.
+            log.error("  %s — FAILED at offset %d: %s", endpoint, offset, exc)
+            raise
 
         records = data.get("objects", [])
         total = data.get("meta", {}).get("total_count", 0)
@@ -304,6 +382,7 @@ def fetch_items_for_orders(context, order_ids: list, *, run_id: str = None,
     rule) and propagates immediately, same as fetch_all_pages.
     """
     all_items = []
+    items_reauth = [False]   # one re-login per call; never a loop
     total_batches = (len(order_ids) + BATCH_SIZE - 1) // BATCH_SIZE
     page_num = 0
 
@@ -328,9 +407,12 @@ def fetch_items_for_orders(context, order_ids: list, *, run_id: str = None,
                     f"{BASE_URL}/resources/OrderItem/",
                     params=query_params,
                 )
-                if r.status != 200:
-                    raise RuntimeError(f"HTTP {r.status} at offset {offset}: {r.text()[:200]}")
                 raw_text = r.text()  # untouched body
+                if _is_auth_failure(r.status, raw_text):
+                    raise RevelAuthError(
+                        f"auth failure: HTTP {r.status} at offset {offset}")
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status} at offset {offset}: {raw_text[:200]}")
                 if run_id:
                     raw_archive.archive_response(
                         "order_items", run_id, raw_text,
@@ -345,12 +427,24 @@ def fetch_items_for_orders(context, order_ids: list, *, run_id: str = None,
 
             try:
                 data = with_retries(_get_page, attempts=3, delay=5,
-                                     label=f"OrderItem batch {batch_num}/{total_batches} offset {offset}")
+                                     label=f"OrderItem batch {batch_num}/{total_batches} offset {offset}",
+                                     non_retryable=(RevelAuthError,))
             except raw_archive.ArchiveError as exc:
                 log.error("  Archive failed for order_items batch %d — aborting: %s", batch_num, exc)
                 raise
+            except RevelAuthError as exc:
+                if items_reauth[0]:
+                    log.error("  Items batch %d/%d — auth failed again after re-login: %s",
+                              batch_num, total_batches, exc)
+                    raise
+                items_reauth[0] = True
+                reauthenticate(context)
+                data = with_retries(_get_page, attempts=1, delay=0,
+                                     label=f"OrderItem batch {batch_num} (post-reauth)",
+                                     non_retryable=(RevelAuthError,))
+                log.info("  re-authenticated; resumed order_items batch %d", batch_num)
             except Exception as exc:
-                log.error("  Items batch %d/%d — giving up at offset %d: %s",
+                log.error("  Items batch %d/%d — FAILED at offset %d: %s",
                           batch_num, total_batches, offset, exc)
                 raise
 
@@ -1319,6 +1413,10 @@ def main():
 
     target_date = date.fromisoformat(args.date) if args.date else None
     range_from, range_to, ingestion_date = get_date_range(target_date)
+    run_failures: list = []      # any required resource/establishment failure
+    rows_fetched_total = [0]     # network-wide rows actually returned by Revel
+    auth_failed = [False]        # a confirmed, unrecoverable session failure
+
     log.info("Pipeline started — target date: %s", ingestion_date)
     log.info("Date range: %s to %s", range_from, range_to)
 
@@ -1391,13 +1489,59 @@ def main():
                 try:
                     report = sync_updated.run_establishment_updated(context, conn, est, run_id, modifier_cache, target=write_target)
                     log.info("Establishment %d (updated mode, target=%s) done: %s", est, write_target, report)
+                    run_failures.extend(
+                        f"est {est}: {res} reported failure"
+                        for res, st in (report or {}).items()
+                        if isinstance(st, dict) and st.get("rows_failed"))
+                    for st in (report or {}).values():
+                        if isinstance(st, dict):
+                            rows_fetched_total[0] += int(st.get("rows_fetched") or 0)
+                except RevelAuthError as exc:
+                    # Authentication is a run-wide condition, not a per-store
+                    # one: continuing would march through every remaining store
+                    # recording zero rows, which is exactly what happened on
+                    # 2026-09-25. Stop at the first confirmed auth failure.
+                    log.error("Establishment %d: authentication failure — aborting run: %s", est, exc)
+                    run_failures.append(f"est {est}: auth failure ({exc})")
+                    auth_failed[0] = True
+                    break
                 except Exception as exc:
                     log.error("Unhandled error for establishment %d (updated mode): %s", est, exc)
-            try:
-                cat_stats, prod_stats = sync_updated.sync_reference_data(context, conn, run_id)
-                log.info("Reference data (updated mode): categories=%s products=%s", cat_stats, prod_stats)
-            except Exception as exc:
-                log.error("Unhandled error refreshing products/product_categories (updated mode): %s", exc)
+                    run_failures.append(f"est {est}: {type(exc).__name__}: {exc}")
+            if not auth_failed[0]:
+                try:
+                    cat_stats, prod_stats = sync_updated.sync_reference_data(context, conn, run_id)
+                    log.info("Reference data (updated mode): categories=%s products=%s", cat_stats, prod_stats)
+                    for st in (cat_stats, prod_stats):
+                        if isinstance(st, dict):
+                            rows_fetched_total[0] += int(st.get("rows_fetched") or 0)
+                except RevelAuthError as exc:
+                    log.error("Reference data: authentication failure: %s", exc)
+                    run_failures.append(f"reference data: auth failure ({exc})")
+                    auth_failed[0] = True
+                except raw_archive.ArchiveError as exc:
+                    # PRE-EXISTING, not introduced by the auth hardening: products
+                    # are fetched twice in one run under the same run_id --
+                    # fetch_and_upsert_products() early in main(), then
+                    # sync_reference_data() again -- so the second fetch collides
+                    # with its own archive from minutes earlier. It has happened on
+                    # every run at least since 2026-09-21 and was invisible only
+                    # because the old handler swallowed it.
+                    #
+                    # A duplicate-archive collision means "this page was already
+                    # archived in this run", i.e. the data WAS fetched. That is not
+                    # data loss, so it must not fail the nightly run now that
+                    # failures are enforced. Any OTHER archive failure still does.
+                    # The double fetch itself needs its own fix.
+                    if "refusing to overwrite existing archive" in str(exc):
+                        log.warning("reference data: products already archived earlier "
+                                    "in this run (known double-fetch, not data loss): %s", exc)
+                    else:
+                        log.error("Archive failure refreshing reference data: %s", exc)
+                        run_failures.append(f"reference data: ArchiveError: {exc}")
+                except Exception as exc:
+                    log.error("Unhandled error refreshing products/product_categories (updated mode): %s", exc)
+                    run_failures.append(f"reference data: {type(exc).__name__}: {exc}")
         else:
             # Run each establishment
             for est in establishments:
@@ -1409,13 +1553,45 @@ def main():
                         modifier_cache,
                         run_id=run_id,
                     )
+                except RevelAuthError as exc:
+                    log.error("Establishment %d: authentication failure — aborting run: %s", est, exc)
+                    run_failures.append(f"est {est}: auth failure ({exc})")
+                    auth_failed[0] = True
+                    break
                 except Exception as exc:
                     log.error("Unhandled error for establishment %d: %s", est, exc)
+                    run_failures.append(f"est {est}: {type(exc).__name__}: {exc}")
 
         browser.close()
 
     conn.close()
-    log.info("\nPipeline complete for %s", ingestion_date)
+
+    # ── run-level verdict ───────────────────────────────────────────────────
+    # Before this, every failure above was logged and then forgotten: the
+    # process exited 0 and run.sh printed "Revel sync completed successfully"
+    # for a run that fetched nothing at all.
+    if auth_failed[0]:
+        log.error("PIPELINE FAILED for %s: Revel authentication failure. "
+                  "Watermarks were NOT advanced. Reasons: %s",
+                  ingestion_date, "; ".join(run_failures[:5]))
+        sys.exit(1)
+    if run_failures:
+        log.error("PIPELINE FAILED for %s: %d resource/establishment failure(s): %s",
+                  ingestion_date, len(run_failures), "; ".join(run_failures[:5]))
+        sys.exit(1)
+    # An overlap sync that fetches literally nothing network-wide is not a quiet
+    # day -- the window always re-covers the previous 72 hours, so zero across
+    # every store and resource means the source or the session is broken.
+    if rows_fetched_total[0] == 0:
+        log.error("PIPELINE FAILED for %s: suspicious zero-row sync; "
+                  "authentication/source failure suspected (0 rows fetched "
+                  "across all establishments and resources on a %dh overlap "
+                  "window). Watermarks were NOT advanced.",
+                  ingestion_date, OVERLAP_HOURS if "OVERLAP_HOURS" in globals() else 72)
+        sys.exit(1)
+
+    log.info("\nPipeline complete for %s — %d rows fetched",
+             ingestion_date, rows_fetched_total[0])
 
 
 if __name__ == "__main__":

@@ -102,24 +102,30 @@ check("unknown HME availability fails closed", bool(f), str(f))
 # ---------------------------------------------------------------------------
 # 3 -- the live cross-domain case: Revel is failing right now
 # ---------------------------------------------------------------------------
+# These originally asserted that Revel was FAILING for this date, which was
+# true while the sync was broken and became false the moment it was repaired.
+# Coupling a unit test to a transient production outage makes it fail for the
+# wrong reason, so the separation is now asserted structurally: whatever Revel's
+# health, an HME-only profile must carry no Revel gate at all, and an
+# HME+Revel profile must carry exactly Revel's verdict.
 S, E = "2026-09-24", "2026-09-25"
 revel = D.meta_profile(None, S, E, domains=["revel"])
 hme = D.meta_profile(None, S, E, domains=["hme"])
-check("the Revel gate is genuinely failing for this date (precondition)",
-      not revel["analysis_permitted"],
-      str(revel["blocking_reasons"])[:100])
-check("an HME-only question is PERMITTED despite the Revel failure",
-      hme["analysis_permitted"], str(hme["blocking_reasons"]))
+both = D.meta_profile(None, S, E, domains=["hme", "revel"])
+lab = D.meta_profile(None, S, E, domains=["hme", "labor"])
+
+check("an HME-only profile runs no Revel reconciliation at all",
+      "reconciliation" not in hme)
 check("the HME profile carries no Revel blocking reason",
       not any("reconcil" in r and "sales" in r for r in hme["blocking_reasons"]))
-
-both = D.meta_profile(None, S, E, domains=["hme", "revel"])
-check("HME + Revel IS blocked when Revel fails (no weakening)",
-      not both["analysis_permitted"], str(both["blocking_reasons"])[:100])
-
-lab = D.meta_profile(None, S, E, domains=["hme", "labor"])
+check("an HME-only question is not affected by Revel's verdict",
+      hme["analysis_permitted"] is True, str(hme["blocking_reasons"]))
+check("HME + Revel inherits Revel's verdict exactly (no weakening)",
+      both["analysis_permitted"] == revel["analysis_permitted"],
+      f"both={both['analysis_permitted']} revel={revel['analysis_permitted']}")
 check("HME + labour does not require Revel sales",
-      lab["analysis_permitted"], str(lab["blocking_reasons"]))
+      "reconciliation" not in lab and lab["analysis_permitted"] is True,
+      str(lab["blocking_reasons"]))
 
 # enforce_scope must gate on the statement, not on anything declared
 try:
@@ -131,6 +137,9 @@ except Exception as e:
     ok = False; why = str(e)[:120]
 check("enforce_scope allows HME SQL while Revel is failing", ok, why)
 
+# Revel SQL must follow Revel's verdict, whatever that verdict currently is --
+# blocked when the gate fails, permitted when it passes. Asserting only the
+# "blocked" half tied this to an outage.
 try:
     D.enforce_scope("SELECT sum(total_revenue) FROM features_daily_summary_v2 "
                     "WHERE date >= '2026-09-24' AND date < '2026-09-25'",
@@ -138,7 +147,9 @@ try:
     blocked = False
 except D.ScopeError:
     blocked = True
-check("enforce_scope still blocks Revel SQL while Revel is failing", blocked)
+check("enforce_scope applies Revel's own verdict to Revel SQL",
+      blocked == (not revel["analysis_permitted"]),
+      f"blocked={blocked} revel_permitted={revel['analysis_permitted']}")
 
 # ---------------------------------------------------------------------------
 # 4 -- request-scoped cache
@@ -293,15 +304,19 @@ _ok = D.meta_profile(None, "2026-09-23", "2026-09-24", domains=["hme"])
 check("a passing profile permits analysis (no short circuit)",
       _ok["analysis_permitted"] is True)
 
-# The live case must actually trip the gate
+# Built from a LIVE profile but with a synthetic Revel failure, so the shape is
+# exercised against real data without depending on Revel actually being broken.
 _live = D.meta_profile(None, _S, _E, domains=["hme", "revel"])
-check("the live HME+Revel scope is genuinely blocked (precondition)",
-      not _live["analysis_permitted"])
-_live_ctx = D.blocked_domain_context(_live, ["hme", "revel"])
-check("the live blocked context still reports HME as trusted",
+_forced = dict(_live, blocking_reasons=["sales reconciliation is off by -3.74%"],
+               analysis_permitted=False)
+_live_ctx = D.blocked_domain_context(_forced, ["hme", "revel"])
+check("a blocked live profile still reports HME as trusted",
       _live_ctx["hme"]["trusted"] is True, str(_live_ctx["hme"])[:120])
-check("the live blocked context names Revel as the failure",
+check("a blocked live profile names Revel as the failure",
       _live_ctx["revel"]["trusted"] is False)
+check("a healthy live profile is not marked blocked",
+      D.blocked_domain_context(_live, ["hme", "revel"])["revel"]["trusted"]
+      is bool(_live["analysis_permitted"]))
 
 # The wiring itself: one final tool-free call, and the loop stops.
 _src = open("chat_sql.py").read()
