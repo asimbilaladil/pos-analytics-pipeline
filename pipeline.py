@@ -1457,6 +1457,13 @@ def main():
 
         page.close()
 
+        # Task 07 — opt-in update-aware sync. Read BEFORE reference data because
+        # the two modes load products differently (see below).
+        sync_mode = os.getenv("REVEL_SYNC_MODE", "created")
+        log.info("REVEL_SYNC_MODE=%s", sync_mode)
+        if sync_mode == "updated":
+            import sync_updated  # deferred: avoids a circular import at module load
+
         # Fetch reference data once — products and modifiers shared across all establishments
         if args.skip_reference:
             log.info("--skip-reference: loading modifier cache from DB (skipping Revel fetch)")
@@ -1464,21 +1471,42 @@ def main():
                 cur.execute("SELECT id, name FROM modifiers")
                 modifier_cache = {row[0]: row[1] for row in cur.fetchall()}
             log.info("Modifier cache loaded from DB: %d modifiers", len(modifier_cache))
+        elif sync_mode == "updated":
+            # ONE Product fetch per run. Both loaders hit the same endpoint with
+            # the same params, but sync_reference_data() is the superset: it
+            # upserts product_categories first and is the only place
+            # products.category_id is populated. Calling both fetched
+            # /resources/Product/ twice under one run_id, which collided with
+            # the raw archive on every run since at least 2026-09-21.
+            #
+            # It runs HERE, before the establishment loop, because
+            # order_items_v2.product_id has an FK to products(id): a product
+            # first seen today must exist before that store's items are
+            # inserted. That ordering is exactly what the old early
+            # fetch_and_upsert_products() call was protecting, and it is
+            # preserved -- only the redundant second fetch is gone.
+            cat_stats, prod_stats = with_retries(
+                lambda: sync_updated.sync_reference_data(context, conn, run_id),
+                attempts=2, delay=10, label="sync_reference_data")
+            log.info("Reference data (updated mode): categories=%s products=%s",
+                     cat_stats, prod_stats)
+            for st in (cat_stats, prod_stats):
+                if isinstance(st, dict):
+                    rows_fetched_total[0] += int(st.get("rows_fetched") or 0)
+            modifier_cache = with_retries(lambda: fetch_and_upsert_modifiers(context, conn), attempts=2, delay=10,
+                                           label="fetch_and_upsert_modifiers")
         else:
+            # created-mode path, unchanged: sync_reference_data() never runs
+            # here, so this remains the only product loader for that mode.
             with_retries(lambda: fetch_and_upsert_products(context, conn, run_id=run_id), attempts=2, delay=10,
                          label="fetch_and_upsert_products")
             modifier_cache = with_retries(lambda: fetch_and_upsert_modifiers(context, conn), attempts=2, delay=10,
                                            label="fetch_and_upsert_modifiers")
 
-        # Task 07 — opt-in update-aware sync. Default (unset or "created")
-        # runs the exact same loop as always; the else branch below is
-        # untouched. "updated" is a separate, additive path — never wired
-        # in as the default, per Task 07's requirement.
-        sync_mode = os.getenv("REVEL_SYNC_MODE", "created")
-        log.info("REVEL_SYNC_MODE=%s", sync_mode)
-
+        # Default (unset or "created") runs the exact same loop as always; the
+        # else branch below is untouched. "updated" is a separate, additive
+        # path — never wired in as the default, per Task 07's requirement.
         if sync_mode == "updated":
-            import sync_updated  # deferred: sync_updated imports pipeline, avoids a circular import at module load
             # Task 16 prerequisite: REVEL_WRITE_TARGET is a separate opt-in
             # flag from REVEL_SYNC_MODE, same reasoning -- default "production"
             # is byte-for-byte the pre-existing behavior; not set in .env yet,
@@ -1508,40 +1536,6 @@ def main():
                 except Exception as exc:
                     log.error("Unhandled error for establishment %d (updated mode): %s", est, exc)
                     run_failures.append(f"est {est}: {type(exc).__name__}: {exc}")
-            if not auth_failed[0]:
-                try:
-                    cat_stats, prod_stats = sync_updated.sync_reference_data(context, conn, run_id)
-                    log.info("Reference data (updated mode): categories=%s products=%s", cat_stats, prod_stats)
-                    for st in (cat_stats, prod_stats):
-                        if isinstance(st, dict):
-                            rows_fetched_total[0] += int(st.get("rows_fetched") or 0)
-                except RevelAuthError as exc:
-                    log.error("Reference data: authentication failure: %s", exc)
-                    run_failures.append(f"reference data: auth failure ({exc})")
-                    auth_failed[0] = True
-                except raw_archive.ArchiveError as exc:
-                    # PRE-EXISTING, not introduced by the auth hardening: products
-                    # are fetched twice in one run under the same run_id --
-                    # fetch_and_upsert_products() early in main(), then
-                    # sync_reference_data() again -- so the second fetch collides
-                    # with its own archive from minutes earlier. It has happened on
-                    # every run at least since 2026-09-21 and was invisible only
-                    # because the old handler swallowed it.
-                    #
-                    # A duplicate-archive collision means "this page was already
-                    # archived in this run", i.e. the data WAS fetched. That is not
-                    # data loss, so it must not fail the nightly run now that
-                    # failures are enforced. Any OTHER archive failure still does.
-                    # The double fetch itself needs its own fix.
-                    if "refusing to overwrite existing archive" in str(exc):
-                        log.warning("reference data: products already archived earlier "
-                                    "in this run (known double-fetch, not data loss): %s", exc)
-                    else:
-                        log.error("Archive failure refreshing reference data: %s", exc)
-                        run_failures.append(f"reference data: ArchiveError: {exc}")
-                except Exception as exc:
-                    log.error("Unhandled error refreshing products/product_categories (updated mode): %s", exc)
-                    run_failures.append(f"reference data: {type(exc).__name__}: {exc}")
         else:
             # Run each establishment
             for est in establishments:
