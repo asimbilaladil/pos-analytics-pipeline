@@ -1,0 +1,27 @@
+[Unit]
+Description=Revel daily sync at 09:00 America/Chicago
+
+[Timer]
+# The timezone MUST be part of the OnCalendar EXPRESSION. This replaces a cron
+# entry that carried `TZ=America/Chicago`, which Debian/Vixie cron accepts as an
+# environment variable for the JOB but ignores when evaluating the SCHEDULE --
+# its own crontab(5) says it "does not support per-user timezones ... even if a
+# user specifies the TZ themselves". The host is Etc/UTC, so `0 9 * * *` fired
+# at 09:00 UTC (04:00 Chicago) while run.sh's own `date` printed 04:00, which is
+# exactly how the discrepancy hid in plain sight.
+#
+# Verify after any change with:  systemctl list-timers revel-daily-sync.timer
+#   during CDT (summer) the next elapse must read 14:00 UTC
+#   during CST (winter) the next elapse must read 15:00 UTC
+OnCalendar=*-*-* 09:00:00 America/Chicago
+# A missed elapse (host down, reboot) is replayed on the next boot. The sync is
+# an idempotent upsert over a 72h overlap window, so a late run re-covers the
+# gap rather than skipping a day.
+Persistent=true
+# No RandomizedDelaySec: this is the only job at 09:00 Chicago, it contends with
+# nothing, and a deterministic start time makes "did the sync run?" answerable
+# from the log timestamp alone.
+Unit=revel-daily-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Revel daily sync (updated-mode -> shadow_v2, then v2 feature aggregation)
+Documentation=file:///root/pos-analytics-pipeline/run.sh
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline
+# Calls the EXISTING entry point unchanged. The pipeline sequence lives in
+# run.sh and is not duplicated here; this unit only replaces the schedule.
+ExecStart=/root/pos-analytics-pipeline/run.sh
+# run.sh is `set -euo pipefail` and exits 1 when pipeline.py fails, which since
+# the auth hardening includes an expired Revel session, any required-resource
+# failure, and a suspicious zero-row run. Nothing is listed as a success
+# exit status, so every one of those leaves the unit failed and visible.
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target
