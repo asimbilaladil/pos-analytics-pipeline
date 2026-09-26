@@ -1054,6 +1054,23 @@ HME rules — these are not stylistic, they change what is true:
     "low staffing caused slower drive-thru" or similar.
   * A store with no VERIFIED HME mapping has no HME data at all. Say it is not
     mapped to HME — not that it had zero cars or poor performance.
+  * HME FRESHNESS IS SCHEDULE-BASED, NOT CALENDAR-BASED. business_date is the
+    previous COMPLETED Chicago day and is ingested the NEXT morning at 05:30
+    America/Chicago, so being one day behind is structural and two days behind
+    is normal before that run. Read freshness_status, never a day count:
+      CURRENT       the latest EXPECTED business date is loaded and trusted
+      PENDING       today's scheduled ingest has not completed yet
+      RETRY_PENDING loaded but unreconciled; the 10:15 retry has not run yet
+      LATE          the primary window passed and the date is still missing
+      STALE         the retry window passed and it is still unavailable
+    When a requested date simply has not reached its ingestion window, say so
+    and give the window — e.g. "HME data for Sep 25 has not been ingested yet;
+    the daily HME import runs around 05:30 America/Chicago". Do NOT call it a
+    2-day lag, and do NOT describe the source as stale or late. Only LATE and
+    STALE justify that language.
+  * This never relaxes availability: if the user asked about a date that is not
+    loaded, the analysis is still blocked. Only the EXPLANATION changes —
+    "awaiting its scheduled ingestion" rather than "the source is stale".
 {GLOSSARY}
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
@@ -1957,6 +1974,129 @@ SELECT (SELECT count(DISTINCT establishment_id) FROM v_hme_store_daily_llm)   AS
 """
 
 
+# ── HME ingestion schedule (mirrors the systemd units) ──────────────────────
+# HME's canonical business_date is the most recent COMPLETED Chicago calendar
+# date, and it is ingested the FOLLOWING morning. So a lag of one calendar day
+# is the floor, and two is normal before the morning run has happened.
+#
+# The previous freshness figure was a bare subtraction:
+#     lag = Chicago_today - max(business_date)
+# which on 2026-09-26 at 04:00, with Sep 24 loaded and Sep 25 not yet due,
+# reported a "2-day freshness lag" and read as staleness. Nothing was late: the
+# 05:30 run for Sep 25 simply had not fired yet.
+#
+# These mirror systemd/hme-daily-ingest.timer and
+# systemd/hme-reconciliation-retry.timer; a test asserts they stay in step.
+HME_PRIMARY_HOUR, HME_PRIMARY_MINUTE = 5, 30      # OnCalendar 05:30 America/Chicago
+HME_RETRY_HOUR, HME_RETRY_MINUTE = 10, 15         # OnCalendar 10:15 America/Chicago
+# RandomizedDelaySec=180 on both timers, plus the orchestrator's own bounded
+# retries (3 attempts, backoff 0/300/900s) around a ~6 minute run. Worst case
+# is roughly 3 + 6 + 5 + 6 + 15 + 6 = 41 minutes, so 45 gives headroom without
+# declaring data late while a legitimate slow run is still in progress.
+HME_WINDOW_GRACE_MINUTES = 45
+
+HME_FRESHNESS_STATES = ("CURRENT", "PENDING", "LATE", "RETRY_PENDING", "STALE")
+
+
+def hme_expected_business_date(now=None):
+    """The latest business_date that SHOULD be loaded at this moment.
+
+    Chicago business time, never the server's UTC date. Before today's primary
+    window has had time to complete, yesterday's date is not yet due, so the
+    expectation is still the day before.
+    """
+    now = now or datetime.now(ZoneInfo("America/Chicago"))
+    now = now.astimezone(ZoneInfo("America/Chicago"))
+    deadline = now.replace(hour=HME_PRIMARY_HOUR, minute=HME_PRIMARY_MINUTE,
+                           second=0, microsecond=0) + timedelta(
+                               minutes=HME_WINDOW_GRACE_MINUTES)
+    today = now.date()
+    return today - timedelta(days=1 if now >= deadline else 2)
+
+
+def hme_freshness(latest_business_date, per_day=None, now=None) -> dict:
+    """Schedule-aware freshness. Pure function so it can be tested at any clock.
+
+    Distinguishes "not due yet" from "overdue", which a calendar subtraction
+    cannot. per_day is the completeness rows, used to tell a primary run that
+    produced a retry-eligible partial from one that produced nothing.
+    """
+    tz = ZoneInfo("America/Chicago")
+    now = (now or datetime.now(tz)).astimezone(tz)
+    today = now.date()
+    expected = hme_expected_business_date(now)
+    next_expected = today - timedelta(days=1)
+
+    primary = now.replace(hour=HME_PRIMARY_HOUR, minute=HME_PRIMARY_MINUTE,
+                          second=0, microsecond=0)
+    retry = now.replace(hour=HME_RETRY_HOUR, minute=HME_RETRY_MINUTE,
+                        second=0, microsecond=0)
+    grace = timedelta(minutes=HME_WINDOW_GRACE_MINUTES)
+    before_primary = now < primary + grace
+    before_retry = now < retry + grace
+
+    rows = {d["business_date"]: d for d in (per_day or [])}
+    exp_iso = expected.isoformat()
+
+    if latest_business_date is None:
+        status, reason = "STALE", "no HME business dates are loaded at all"
+    elif latest_business_date >= expected:
+        # The expected date is present. Is it also trustworthy?
+        row = rows.get(exp_iso)
+        if row and row.get("reconciliation_ok") is False and before_retry:
+            status = "RETRY_PENDING"
+            reason = (f"{exp_iso} loaded but did not reconcile; the "
+                      f"{HME_RETRY_HOUR:02d}:{HME_RETRY_MINUTE:02d} America/Chicago "
+                      "reconciliation retry has not run yet")
+        elif row and row.get("reconciliation_ok") is False:
+            status = "STALE"
+            reason = (f"{exp_iso} still does not reconcile after the retry "
+                      "window; it needs attention")
+        else:
+            status = "CURRENT"
+            reason = f"{exp_iso} is the latest expected business date and it is loaded"
+    elif before_primary:
+        # Should not normally happen: the expectation already accounts for the
+        # window. Reaching here means an OLDER date is missing.
+        status = "PENDING"
+        reason = (f"{exp_iso} is not loaded yet; today's "
+                  f"{HME_PRIMARY_HOUR:02d}:{HME_PRIMARY_MINUTE:02d} "
+                  "America/Chicago ingest has not completed")
+    elif before_retry:
+        status = "LATE"
+        reason = (f"today's {HME_PRIMARY_HOUR:02d}:{HME_PRIMARY_MINUTE:02d} "
+                  f"America/Chicago ingest has passed but {exp_iso} is still "
+                  f"absent; the {HME_RETRY_HOUR:02d}:{HME_RETRY_MINUTE:02d} "
+                  "retry may still recover it")
+    else:
+        status = "STALE"
+        reason = (f"both the primary and retry windows have passed and "
+                  f"{exp_iso} is still unavailable")
+
+    nxt = now.replace(hour=HME_PRIMARY_HOUR, minute=HME_PRIMARY_MINUTE,
+                      second=0, microsecond=0)
+    if now >= nxt:
+        nxt += timedelta(days=1)
+
+    return {
+        "freshness_status": status,
+        "freshness_reason": reason,
+        "expected_business_date": exp_iso,
+        "next_expected_business_date": next_expected.isoformat(),
+        "next_ingest_window": nxt.strftime("%Y-%m-%d %H:%M America/Chicago"),
+        "primary_ingest": f"{HME_PRIMARY_HOUR:02d}:{HME_PRIMARY_MINUTE:02d} America/Chicago",
+        "reconciliation_retry": f"{HME_RETRY_HOUR:02d}:{HME_RETRY_MINUTE:02d} America/Chicago",
+        # Kept for continuity, but explicitly labelled so it is never read as
+        # "staleness": one day is the structural floor.
+        "calendar_days_behind_today": (
+            None if latest_business_date is None else (today - latest_business_date).days),
+        "calendar_lag_note": (
+            "HME business_date is the previous COMPLETED Chicago day, ingested the "
+            "next morning, so 1 is the structural minimum and 2 is normal before "
+            "the daily run. Use freshness_status, not this number."),
+    }
+
+
 def _hme_block(cur, establishment_id, period_start, period_end):
     """HME completeness/trust profile for one analysis scope.
 
@@ -1987,9 +2127,6 @@ def _hme_block(cur, establishment_id, period_start, period_end):
     unmapped = [i for i in revel_ids if i not in mapped_ids]
 
     latest = scope["latest_business_date"]
-    lag = None
-    if latest is not None:
-        lag = (datetime.now(ZoneInfo("America/Chicago")).date() - latest).days
 
     per_day = [{
         "business_date": d["business_date"].isoformat(),
@@ -2007,13 +2144,26 @@ def _hme_block(cur, establishment_id, period_start, period_end):
         d["business_date"] for d in per_day
         if (d["verified_expected_count"] or 0) > (d["verified_observed_count"] or 0)]
 
+    # Freshness is judged against the INGESTION SCHEDULE, not the calendar. A
+    # full-history view is used rather than the requested window, because a
+    # question about last week must not make today's data look overdue.
+    cur.execute("""SELECT business_date, reconciliation_ok, status,
+                          source_complete
+                     FROM v_hme_day_completeness_llm
+                    ORDER BY business_date DESC LIMIT 7""")
+    recent = [{"business_date": r["business_date"].isoformat(),
+               "reconciliation_ok": r["reconciliation_ok"],
+               "status": r["status"],
+               "source_complete": r["source_complete"]} for r in cur.fetchall()]
+    freshness = hme_freshness(latest, per_day=recent)
+
     return {
         "available": bool(scope["rows_in_scope"]),
         "source": ("v_hme_store_daily_llm / v_hme_outliers_daily_llm / "
                    "v_hme_goal_history_llm / v_hme_day_completeness_llm "
                    "(VERIFIED HME->Revel mappings only)"),
         "latest_business_date": latest.isoformat() if latest else None,
-        "freshness_lag_days": lag,
+        **freshness,
         "mapped_store_coverage": {
             "verified_mapped": scope["verified_mapped"],
             "revel_establishments_in_scope": len(revel_ids),
@@ -2703,7 +2853,11 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
         out["hme"] = {
             "trusted": not hme_failed and bool(h.get("available")),
             "latest_business_date": h.get("latest_business_date"),
-            "freshness_lag_days": h.get("freshness_lag_days"),
+            "freshness_status": h.get("freshness_status"),
+            "freshness_reason": h.get("freshness_reason"),
+            "expected_business_date": h.get("expected_business_date"),
+            "next_expected_business_date": h.get("next_expected_business_date"),
+            "next_ingest_window": h.get("next_ingest_window"),
             "per_day": h.get("per_day"),
             "incomplete_days": h.get("incomplete_days"),
             "unreconciled_days": h.get("unreconciled_days"),
