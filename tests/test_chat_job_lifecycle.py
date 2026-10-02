@@ -276,9 +276,20 @@ try:
     # K -- observability
     # -----------------------------------------------------------------------
     for ev in ("chat_job created", "chat_job started", "chat_job reuse",
-               "chat_job swept"):
+               "chat_job completed", "chat_job failed", "chat_job swept"):
         check(f"K. logs {ev!r}", ev in jobs_src)
     check("K. logs carry job_id and conversation_id", "job_id=%s" in jobs_src)
+    # The terminal markers live inside mark_completed/mark_failed, not at the
+    # call site: a caller omitted them once and the log went silent on the two
+    # events that matter most for diagnosing a stuck job.
+    _mc = jobs_src[jobs_src.index("def mark_completed"):jobs_src.index("def mark_failed")]
+    _mf = jobs_src[jobs_src.index("def mark_failed"):jobs_src.index("def sweep_interrupted")]
+    check("K. the completed marker is emitted by mark_completed itself",
+          "chat_job completed" in _mc)
+    check("K. the failed marker is emitted by mark_failed itself",
+          "chat_job failed" in _mf)
+    check("K. the failure log records error_code, not the user-facing text",
+          "error_code=%s" in _mf)
     check("K. the log does not dump question text",
           "question=%s" not in jobs_src and "content=%s" not in jobs_src)
 

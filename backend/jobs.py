@@ -127,6 +127,10 @@ def mark_completed(job_id: str, assistant_message_id: int | None,
     query("UPDATE chat_jobs SET status='completed', assistant_message_id=%s, "
           "duration_ms=%s, completed_at=now() WHERE job_id=%s",
           (assistant_message_id, duration_ms, job_id), fetch=None, commit=True)
+    # Logged HERE rather than at the call site so the terminal marker cannot be
+    # lost by a caller forgetting it -- which is exactly what happened once.
+    log.info("chat_job completed job_id=%s assistant_message_id=%s duration_ms=%s",
+             job_id, assistant_message_id, duration_ms)
 
 
 def mark_failed(job_id: str, code: str, message: str,
@@ -135,6 +139,10 @@ def mark_failed(job_id: str, code: str, message: str,
     query("UPDATE chat_jobs SET status='failed', error_code=%s, error_message=%s, "
           "duration_ms=%s, completed_at=now() WHERE job_id=%s",
           (code, message[:500], duration_ms, job_id), fetch=None, commit=True)
+    # error_code only: the message is user-facing text, not a diagnostic, and
+    # the real detail is already in the service log from chat_svc.
+    log.info("chat_job failed job_id=%s error_code=%s duration_ms=%s",
+             job_id, code, duration_ms)
 
 
 def sweep_interrupted() -> int:
