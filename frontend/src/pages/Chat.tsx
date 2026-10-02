@@ -7,7 +7,7 @@ import { WelcomeState } from '../components/WelcomeState'
 import { Header } from '../components/Header'
 import { MessageList, ThinkingMessage, UserMessage } from '../components/ChatMessage'
 import { Sidebar } from '../components/Sidebar'
-import type { Conversation, Message, User } from '../types'
+import type { ChatJob, Conversation, Message, User } from '../types'
 
 export function Chat({ user, onSignedOut, onOpenAdmin }: {
   user: User; onSignedOut: () => void; onOpenAdmin?: () => void
@@ -19,10 +19,17 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [failed, setFailed] = useState<{ question: string; retryable: boolean } | null>(null)
+  const [failed, setFailed] = useState<{ question: string; retryable: boolean; key?: string } | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // The job this page is waiting on. Held in a ref as well so the visibility
+  // listener and the poll timer always see the current value without being
+  // re-registered on every render.
+  const [job, setJob] = useState<ChatJob | null>(null)
+  const jobRef = useRef<ChatJob | null>(null)
+  const pollRef = useRef<number | null>(null)
+  jobRef.current = job
 
   const handleError = useCallback((err: unknown) => {
     if (err instanceof ApiError && err.status === 401) { onSignedOut(); return }
@@ -69,6 +76,66 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, pending, scrollToBottom])
 
+  const stopPolling = useCallback(() => {
+    if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null }
+  }, [])
+
+  // One place that turns a finished job into UI. Reloads the transcript from
+  // the server rather than trusting anything the client kept, so the answer
+  // shown is exactly what was persisted.
+  const settleJob = useCallback(async (j: ChatJob) => {
+    stopPolling()
+    setJob(null)
+    setPending(null)
+    try {
+      const d = await api.conversation(j.conversation_id)
+      setActiveId(d.id); setMessages(d.messages)
+      refreshList()
+    } catch (e) { handleError(e) }
+    if (j.status === 'failed') {
+      setError(j.error_message || 'Something went wrong while analyzing the data. Please try again.')
+    }
+  }, [handleError, refreshList, stopPolling])
+
+  const checkJob = useCallback(async () => {
+    const current = jobRef.current
+    if (!current) return
+    try {
+      const j = await api.job(current.job_id)
+      setJob(j)
+      if (j.status === 'completed' || j.status === 'failed') await settleJob(j)
+    } catch (e) {
+      // A polling hiccup must not discard the job: the answer is still being
+      // generated server-side and the next tick can pick it up. Only a 404
+      // (job genuinely gone) stops the watch.
+      if (e instanceof ApiError && e.status === 404) { stopPolling(); setJob(null); setPending(null) }
+    }
+  }, [settleJob, stopPolling])
+
+  const startPolling = useCallback((j: ChatJob) => {
+    setJob(j)
+    jobRef.current = j
+    stopPolling()
+    if (document.visibilityState === 'visible') {
+      pollRef.current = window.setInterval(checkJob, 2500)
+    }
+  }, [checkJob, stopPolling])
+
+  // Backgrounding the tab pauses POLLING only. The server job is untouched --
+  // that is the whole point: on mobile the socket dies when the user switches
+  // apps, and the answer must still be waiting when they come back.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (jobRef.current) { checkJob(); startPolling(jobRef.current) }
+      } else {
+        stopPolling()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { document.removeEventListener('visibilitychange', onVisibility); stopPolling() }
+  }, [checkJob, startPolling, stopPolling])
+
   const openConversation = async (id: number) => {
     setSidebarOpen(false)
     try {
@@ -78,49 +145,69 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
       // A freshly opened conversation always starts at its newest message.
       setAtBottom(true)
       requestAnimationFrame(() => scrollToBottom('auto'))
+      // Reattach to any answer still being generated for this conversation, so
+      // a reload (or a different device) picks the question back up instead of
+      // losing it. No client state is required for this to work.
+      const activeJob = await api.activeJob(id)
+      if (activeJob) {
+        setPending(null)
+        startPolling(activeJob)
+      } else {
+        stopPolling(); setJob(null)
+      }
     } catch (e) { handleError(e) }
   }
 
   const newChat = () => {
+    stopPolling(); setJob(null)
     setActiveId(null); setMessages([]); setPending(null)
-    setError(null); setSidebarOpen(false); setAtBottom(true)
+    setError(null); setFailed(null); setSidebarOpen(false); setAtBottom(true)
   }
 
-  const send = async (question: string, files: File[] = []) => {
+  const send = async (question: string, files: File[] = [], reuseKey?: string) => {
     // Mirrors how the server stores the turn, so a reload looks the same.
-    const shown = question + files.map((f) => `\n📎 ${f.name}`).join('')
+    const shown = question + files.map((f) => `\n\u{1F4CE} ${f.name}`).join('')
     setError(null); setPending(shown)
     // Sending is an explicit action, so it always returns you to the end.
     setAtBottom(true)
+    // One key per logical submission. A double-tapped Send reuses it and the
+    // server hands back the SAME job instead of generating twice. A deliberate
+    // Retry after a real failure passes the old key too, which the server
+    // treats as a new attempt because the previous job is no longer active.
+    const key = reuseKey
+      ?? (crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`)
     try {
       const res = files.length
         ? await api.askWithFiles(activeId ?? 0, question, model, files)
-        : await api.ask(activeId ?? 0, question, model)
-      setMessages((prev) => [...prev, { role: 'user', content: shown },
-                                       { role: 'assistant', content: res.answer }])
+        : await api.ask(activeId ?? 0, question, model, key)
+      // Show the question immediately and start watching the job. The answer
+      // arrives through the job, so this request completing or not is no longer
+      // what determines whether the user gets an answer.
       setActiveId(res.conversation_id)
+      setMessages((prev) => [...prev, { role: 'user', content: shown }])
+      setPending(null)
       setFailed(null)
       refreshList()
+      startPolling({
+        job_id: res.job_id, conversation_id: res.conversation_id,
+        status: res.status, attempt: 1, created_at: null, completed_at: null,
+        duration_ms: null, error_code: null, error_message: null,
+      })
     } catch (e) {
-      // The composer clears itself on send, so without this the question is
-      // simply gone and the user has to retype it after a timeout. Files cannot
-      // be re-sent (the File handles are not retained), so retry is offered for
-      // text-only turns and the question text is preserved either way.
-      setFailed({ question, retryable: files.length === 0 })
-      handleError(e)
-    } finally {
-      // Always clears the "Analyzing your data..." state -- on success, on any
-      // HTTP error, on a non-JSON gateway response, on an aborted request and
-      // on a transport failure.
+      // Only the SUBMISSION failed here, so nothing is generating and the
+      // question is genuinely lost unless we keep it.
       setPending(null)
+      setFailed({ question, retryable: files.length === 0, key })
+      handleError(e)
     }
   }
 
   const retry = () => {
     const q = failed?.question
     if (!q) return
+    const k = failed?.key
     setFailed(null)
-    send(q)
+    send(q, [], k)
   }
 
   const remove = async (id: number) => {
@@ -215,12 +302,18 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
               ) : (
                 <div className="space-y-7 py-8">
                   <MessageList messages={messages} />
+                  {/* `pending` covers the brief moment before the submission
+                      is accepted, when the question is not yet in `messages`.
+                      Once a job is being watched the question has already been
+                      persisted and rendered, so only the thinking indicator
+                      belongs here. */}
                   {pending && (
                     <>
                       <UserMessage content={pending} />
                       <ThinkingMessage />
                     </>
                   )}
+                  {!pending && job && <ThinkingMessage />}
                 </div>
               )}
             </div>

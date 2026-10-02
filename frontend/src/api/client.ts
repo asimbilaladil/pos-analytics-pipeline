@@ -1,4 +1,4 @@
-import type { AdminUser, AskResponse, Conversation, ConversationDetail, User } from '../types'
+import type { AdminUser, AskAccepted, ChatJob, Conversation, ConversationDetail, User } from '../types'
 
 /**
  * Every call is credentialed so the HttpOnly session cookie travels with it.
@@ -14,12 +14,12 @@ export class ApiError extends Error {
 }
 
 /**
- * Client-side ceiling for a long analysis call. The backend gives up on its own
- * deadline at 240s and nginx at 300s, so 250s sits between them: normally the
- * server answers first, and if the connection itself stalls the request still
- * ends with a real error instead of hanging forever behind a spinner.
+ * Ceiling for the SUBMISSION request only.
  */
-const ASK_TIMEOUT_MS = 250_000
+// The submission is now a short write, so this is a network backstop rather
+// than a generation budget. Generation itself is bounded server-side and is no
+// longer tied to any browser connection staying alive.
+const SUBMIT_TIMEOUT_MS = 30_000
 
 async function request<T>(path: string, init: RequestInit = {},
                           timeoutMs?: number): Promise<T> {
@@ -91,20 +91,31 @@ export const api = {
   deleteConversation: (id: number) =>
     request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
 
-  ask: (id: number, question: string, model: string) =>
-    request<AskResponse>(`/api/conversations/${id}/messages`, {
-      method: 'POST', body: JSON.stringify({ question, model }),
-    }, ASK_TIMEOUT_MS),
+  ask: (id: number, question: string, model: string, idempotencyKey: string) =>
+    // Submission returns in well under a second now: it persists the question,
+    // creates the job and detaches. The long ceiling below stays only as a
+    // backstop for a pathologically slow network, NOT as a generation budget.
+    request<AskAccepted>(`/api/conversations/${id}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ question, model, idempotency_key: idempotencyKey }),
+    }, SUBMIT_TIMEOUT_MS),
 
   askWithFiles: (id: number, question: string, model: string, files: File[]) => {
     const fd = new FormData()
     fd.append('question', question)
     fd.append('model', model)
     files.forEach((f) => fd.append('files', f))
-    return request<AskResponse>(`/api/conversations/${id}/messages/upload`, {
+    return request<AskAccepted>(`/api/conversations/${id}/messages/upload`, {
       method: 'POST', body: fd,
-    }, ASK_TIMEOUT_MS)
+    }, SUBMIT_TIMEOUT_MS)
   },
+
+  // Cheap: reads persisted job state only. Never re-runs generation.
+  job: (jobId: string) => request<ChatJob>(`/api/chat/jobs/${jobId}`),
+
+  // Lets a reloaded page discover its own pending answer with no client state.
+  activeJob: (conversationId: number) =>
+    request<ChatJob | null>(`/api/conversations/${conversationId}/active-job`),
 
   importConversation: (file: File) => {
     const fd = new FormData()

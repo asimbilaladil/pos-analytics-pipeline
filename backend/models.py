@@ -51,6 +51,38 @@ class NewConversationIn(BaseModel):
 class AskIn(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     model: str | None = None
+    # Per-submission key from the client. A double-tapped Send or a reconnect
+    # that resubmits reuses the key and is handed the SAME in-flight job back
+    # instead of starting a second generation.
+    idempotency_key: str | None = Field(default=None, max_length=100)
+
+
+class JobOut(BaseModel):
+    """What the client polls. Deliberately carries no question text."""
+    job_id: str
+    conversation_id: int
+    status: str
+    attempt: int = 1
+    created_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class AskAcceptedOut(BaseModel):
+    """Returned immediately by the messages endpoint.
+
+    The answer is NOT here: generation outlives this response, and the client
+    reaches the result through job_id. conversation_id is returned up front so a
+    new conversation is addressable even if this response is the last thing the
+    client ever receives.
+    """
+    conversation_id: int
+    title: str
+    job_id: str
+    status: str
+    user_message_id: int | None = None
 
 
 class AskOut(BaseModel):

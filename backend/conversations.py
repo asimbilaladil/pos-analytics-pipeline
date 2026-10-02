@@ -57,6 +57,21 @@ def add_message(conversation_id, role, content):
           (conversation_id, role, content[:MAX_MESSAGE_CHARS]), fetch=None, commit=True)
 
 
+def add_message_returning_id(conversation_id, role, content) -> int:
+    """add_message, but hands back the row id.
+
+    Chat jobs reference the user and assistant messages they produced, so a
+    client reattaching after a dropped connection can be pointed at the exact
+    persisted answer instead of guessing the latest row.
+    """
+    row = query(
+        "INSERT INTO chat_messages (conversation_id, role, content) "
+        "VALUES (%s,%s,%s) RETURNING id",
+        (conversation_id, role, content[:MAX_MESSAGE_CHARS]),
+        fetch="one", commit=True)
+    return int(row["id"])
+
+
 def touch(conversation_id, title=None):
     if title is not None:
         query("UPDATE chat_conversations SET updated_at = NOW(), title = %s WHERE id = %s",
