@@ -1,0 +1,11 @@
+-- 50: grant laynes_ro SELECT on the approved period-calendar view ONLY.
+--
+-- Grants live in their own migration so the privilege surface stays reviewable
+-- on its own -- the convention set by 43/44 and 47/48. Migration 47 shipped
+-- without its grant and every chat query against that view failed "permission
+-- denied for view", so the pairing matters.
+--
+-- Scope: the safe view only. The underlying ayg_business_periods table is NOT
+-- granted -- chat reads the view, which carries the derived status and elapsed
+-- days and nothing else.
+GRANT SELECT ON v_ayg_business_periods_llm TO laynes_ro;
