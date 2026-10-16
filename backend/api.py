@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 import base64
+import hashlib
 
 from fastapi import (Cookie, Depends, FastAPI, File, Form, HTTPException, Response,
                      UploadFile, status)
@@ -25,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from . import chat as chat_svc
+from . import jobs as jobs_svc
 
 # uvicorn configures its own loggers and leaves the root logger at WARNING, so
 # the chat timing line (logger "laynes.chat") was emitted and then dropped --
@@ -41,10 +43,13 @@ if not _chat_log.handlers:
     if not _uv.handlers:                      # uvicorn not configured (tests)
         _chat_log.addHandler(_logging.StreamHandler())
 _chat_log.propagate = False
+log = _chat_log
 from . import conversations as convo
 from .auth import (SESSION_COOKIE, clear_cookie, create_session, current_user,
                    delete_session, set_cookie, verify_login)
-from .models import (AdminUserOut, AskIn, AskOut, ConversationDetail, ConversationOut, ImportIn,
+from .models import (
+    JobOut,
+    AskAcceptedOut,AdminUserOut, AskIn, AskOut, ConversationDetail, ConversationOut, ImportIn,
                      LoginIn, MessageOut, ModelsOut, NewConversationIn, UserOut)
 
 app = FastAPI(title="Laynes Intelligence API", docs_url=None, redoc_url=None)
@@ -137,14 +142,16 @@ def delete_conversation(cid: int, user=Depends(current_user)):
 
 
 # ── chat ────────────────────────────────────────────────────────────────────
-@app.post("/api/conversations/{cid}/messages", response_model=AskOut)
+@app.post("/api/conversations/{cid}/messages", response_model=AskAcceptedOut,
+          status_code=202)
 def ask(cid: int, body: AskIn, user=Depends(current_user)):
     """Ask a question. cid = 0 starts a new conversation.
 
     A12 is NOT re-implemented here: chat_sql.answer_question runs the same gate
     it always has, server-side, before any transactional business SQL.
     """
-    return _ask(cid, body.question, body.model, user)
+    return _ask(cid, body.question, body.model, user,
+                idempotency_key=body.idempotency_key)
 
 
 # Images and PDFs go to the model natively; text-like files are inlined.
@@ -180,7 +187,8 @@ async def _to_block(f: UploadFile) -> dict:
         detail=f"{name}: unsupported type. Use an image, PDF, or text/CSV file.")
 
 
-@app.post("/api/conversations/{cid}/messages/upload", response_model=AskOut)
+@app.post("/api/conversations/{cid}/messages/upload",
+          response_model=AskAcceptedOut, status_code=202)
 async def ask_with_files(cid: int, question: str = Form(...),
                          model: str | None = Form(default=None),
                          files: list[UploadFile] = File(default=[]),
@@ -194,7 +202,8 @@ async def ask_with_files(cid: int, question: str = Form(...),
 
 
 def _ask(cid: int, question: str, model: str | None, user,
-         attachments: list[dict] | None = None, names: list[str] | None = None):
+         attachments: list[dict] | None = None, names: list[str] | None = None,
+         idempotency_key: str | None = None):
     if not chat_svc.assistant_configured():
         raise HTTPException(status_code=503,
                             detail="The assistant is not configured on the server.")
@@ -215,19 +224,100 @@ def _ask(cid: int, question: str, model: str | None, user,
 
     history = convo.messages(cid, user["id"]) or []
     # File bytes are not stored; the transcript records which files were sent.
-    stored = question + ("".join(f"\n📎 {n}" for n in names) if names else "")
-    convo.add_message(cid, "user", stored)
+    stored = question + ("".join(f"\n\U0001F4CE {n}" for n in names) if names else "")
 
-    answer, steps, dur, error = chat_svc.ask(history, question, model, attachments)
+    # One logical submission -> at most one generation. Without a client key we
+    # derive a stable one from (conversation, model, text) so even a client that
+    # cannot send a key is protected against a double-tapped Send.
+    key = idempotency_key or hashlib.sha256(
+        f"{cid}|{model}|{stored}".encode()).hexdigest()[:64]
 
-    convo.add_message(cid, "assistant", answer)
-    convo.touch(cid, title=convo.auto_title(question) if is_new else None)
-    convo.log_query(user["id"], question, steps, answer, error, dur,
-                    conversation_id=cid, model=model)
-
+    job, created = jobs_svc.create_or_reuse(
+        conversation_id=cid, user_id=user["id"], question=question, model=model,
+        idempotency_key=key, user_message_id=None)
     row = convo.owned(cid, user["id"])
-    return AskOut(conversation_id=cid, title=row["title"], answer=answer,
-                  duration_ms=dur)
+    if not created:
+        # This exact submission is already generating. Hand back the SAME job:
+        # no duplicate user message, no second model run.
+        return AskAcceptedOut(conversation_id=cid, title=row["title"],
+                              job_id=str(job["job_id"]), status=job["status"],
+                              user_message_id=job.get("user_message_id"))
+
+    user_message_id = convo.add_message_returning_id(cid, "user", stored)
+    jobs_svc.attach_user_message(str(job["job_id"]), user_message_id)
+    convo.touch(cid, title=convo.auto_title(question) if is_new else None)
+
+    job_id = str(job["job_id"])
+    uid = user["id"]
+
+    def _run():
+        """Detached: the HTTP response for this submission has already gone.
+
+        Every existing gate still applies -- chat_svc.ask calls the same
+        chat_sql.answer_question, so source-aware gating, the SQL validator,
+        HME safety, reconciliation blocking, timing instrumentation and the
+        per-call Anthropic bounds are untouched.
+        """
+        answer, steps, dur, error = chat_svc.ask(history, question, model, attachments)
+        assistant_id = convo.add_message_returning_id(cid, "assistant", answer)
+        convo.touch(cid)
+        convo.log_query(uid, question, steps, answer, error, dur,
+                        conversation_id=cid, model=model)
+        if error:
+            # chat_svc.ask never raises: it returns a user-safe answer plus an
+            # error string meant for the log. Record the failure so the client
+            # clears its spinner and offers Retry; the answer text is still
+            # persisted and readable in the transcript.
+            jobs_svc.mark_failed(job_id, "generation_error", answer, dur)
+        else:
+            jobs_svc.mark_completed(job_id, assistant_id, dur)
+
+    jobs_svc.spawn(job_id, _run)
+    return AskAcceptedOut(conversation_id=cid, title=row["title"],
+                          job_id=job_id, status="queued",
+                          user_message_id=user_message_id)
+
+
+# ── chat jobs: recovering an answer after the connection drops ──────────────
+# The browser does not need to stay connected for its own answer. It polls here,
+# which only READS persisted state -- no metadata extraction, no reconciliation,
+# no SQL, no Anthropic call. That is what makes polling cheap enough to do every
+# couple of seconds while the tab is visible.
+@app.get("/api/chat/jobs/{job_id}", response_model=JobOut)
+def chat_job(job_id: str, user=Depends(current_user)):
+    job = jobs_svc.get(job_id, user["id"])
+    if not job:
+        # Scoped by user_id in SQL, so another user's job is indistinguishable
+        # from one that does not exist.
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobOut(**jobs_svc.to_public(job))
+
+
+@app.get("/api/conversations/{cid}/active-job", response_model=JobOut | None)
+def conversation_active_job(cid: int, user=Depends(current_user)):
+    """Lets a reloaded page reattach without the client having kept any state.
+
+    This is the path that fixes "I reloaded and my question vanished": the
+    pending job is discoverable from the conversation alone.
+    """
+    if not convo.owned(cid, user["id"]):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    job = jobs_svc.active_for_conversation(cid, user["id"])
+    return JobOut(**jobs_svc.to_public(job)) if job else None
+
+
+@app.on_event("startup")
+def _sweep_interrupted_jobs():
+    """Generation runs in-process, so a restart orphans in-flight jobs.
+
+    They must not poll as 'processing' forever -- that is the stuck spinner this
+    whole change exists to remove. Failing them with error_code='interrupted'
+    surfaces the normal Retry affordance instead.
+    """
+    try:
+        jobs_svc.sweep_interrupted()
+    except Exception:                                  # noqa: BLE001
+        log.exception("chat_job startup sweep failed")
 
 
 # ── super admin: read other users' chats ────────────────────────────────────

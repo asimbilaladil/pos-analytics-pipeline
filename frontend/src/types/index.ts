@@ -36,9 +36,30 @@ export interface AdminUser {
   last_chat_at: string | null
 }
 
-export interface AskResponse {
+/**
+ * The submission is ACCEPTED, not answered. Generation outlives the HTTP
+ * request that started it, so the answer arrives via the job, not this
+ * response. conversation_id comes back up front so a brand-new conversation is
+ * addressable even if this is the last response the client ever receives.
+ */
+export interface AskAccepted {
   conversation_id: number
   title: string
-  answer: string
-  duration_ms: number
+  job_id: string
+  status: JobStatus
+  user_message_id: number | null
+}
+
+export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed'
+
+export interface ChatJob {
+  job_id: string
+  conversation_id: number
+  status: JobStatus
+  attempt: number
+  created_at: string | null
+  completed_at: string | null
+  duration_ms: number | null
+  error_code: string | null
+  error_message: string | null
 }
