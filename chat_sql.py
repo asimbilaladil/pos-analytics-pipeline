@@ -1129,7 +1129,7 @@ CROSS-SOURCE — join only on establishment_id, never on store name.
 
 
 R365_FINANCIAL_GUIDANCE = """\
-R365 FINANCIAL (GL / P&L) DATA (migrations 56/57). Approved general-ledger
+R365 FINANCIAL (GL / P&L) DATA (migrations 56-60). Approved general-ledger
 expenses from Restaurant365, published by the R365 source system and refreshed
 here daily at 07:00 America/Chicago (after the source's 06:00 sync). TWO
 GRAINS (migrations 56-59):
@@ -1151,7 +1151,9 @@ v_r365_financial_coverage_llm — one row per loaded fiscal period x VERIFIED
     source_last_sync_at, latest_refresh_failed. Reference data: no scope needed.
 v_r365_financial_account_llm  — the chart of accounts: account_number,
     account_name, account_type, analytics_category, mapping_status (VERIFIED /
-    CANDIDATE / UNMAPPED), category_trusted. Metadata only, no amounts.
+    CANDIDATE / UNMAPPED), category_trusted, mapping_source (SOURCE = verified
+    by the R365 source, LOCAL = verified here from GL evidence),
+    source_mapping_status. Metadata only, no amounts.
     Reference data: no scope needed.
 v_r365_financial_transaction_llm — APPROVED GL detail lines, VERIFIED stores:
     establishment_id, store_name, accounting_date, fiscal_year, period_number,
@@ -1175,15 +1177,34 @@ SOURCE AUTHORITY — which source answers what:
   orders, cars or labour data.
 
 TRUSTED CATEGORIES ONLY. analytics_category in v_r365_financial_period_llm
-holds VERIFIED categories only (today: ELECTRICITY, from GL account 6200-03
-Electric). Gas, water, telephone, cable/internet and waste removal are
-CANDIDATE accounts and are NOT electricity: never add them to ELECTRICITY or
-present them as a utility total. For an expense category that is not VERIFIED
-(e.g. rent, repairs, insurance, food cost, gas, water), look it up in
+holds VERIFIED categories only. Today (filter on these exact values):
+  ELECTRICITY          6200-03 Electric
+  GAS                  6200-01 Gas (the gas utility bill -- NOT vehicle fuel,
+                       which is T&E 6600-01)
+  WATER                6200-02 Water ("water", "water & sewer")
+  RENT                 7500-11 Rent - Restaurant ONLY ("rent", "occupancy
+                       rent"). NOT 7500-09 Rent - Storage or 7500-13 Rent -
+                       Equipment (CANDIDATE, excluded), and NOT CAM, property
+                       tax, insurance or management fees.
+  REPAIRS_MAINTENANCE  the R&M accounts under 6150: 6000-01 Electrical, 6000-02
+                       Plumbing, 6000-11 Building, 6000-13 Equipment, 6000-14
+                       HVAC, 6000-20 Landscaping, 6000-31 Signs and Lighting
+                       ("repairs", "maintenance", "R&M"). NOT pest control,
+                       grease trap, fire safety or other contract services.
+                       Per-account split: GROUP BY gl_account_number in
+                       v_r365_financial_transaction_llm.
+Telephone, cable/internet and waste removal are CANDIDATE (UTILITIES_OTHER):
+never add them to a VERIFIED category. Never add categories together and call
+the result "utilities" or "occupancy" -- report each VERIFIED category
+separately (a sum of named categories, labelled as exactly that, only if
+asked). For an expense category that is not VERIFIED (e.g. insurance, food
+cost, telephone, waste removal, storage rent), look it up in
 v_r365_financial_account_llm and say that the accounting data exists in R365
 (name the accounts and their mapping_status) but no VERIFIED <category>
 category is available yet, so no trusted figure can be given. Do NOT estimate
-or approximate it, and do not offer a number from any other source.
+or approximate it, and do not offer a number from any other source. Never
+build a category from account names yourself: a category is exactly the
+analytics_category value.
 
 MISSING IS NOT ZERO. A row with has_posting = false (data_status =
 'NO_ACTIVITY', expense_amount NULL) means NO POSTING for that store in that
@@ -1200,10 +1221,19 @@ Always:
     expense_amount; SUM ignores the NULLs);
   * never average with them counted as 0.
 
-UTILITY POSTING SEMANTICS (electricity and any utility account):
+UTILITY POSTING SEMANTICS (electricity, and the same for GAS, WATER and RENT --
+replace "electricity" / 'ELECTRICITY' with the category asked about; see
+REPAIRS & MAINTENANCE below for R&M):
   * WORDING. GL data records POSTINGS: "electricity expense posted in the
     period", "electricity posting(s)". Never call it consumption, usage, meter
     reading or the service period's usage -- the source has none of those.
+  * RENT is fixed and paid about monthly, usually on the 1st-5th, but a
+    month's rent sometimes posts at the end of the previous month (e.g. the
+    April rent of most stores posted in late March), so one fiscal period can
+    hold two rent postings and another none. Some stores have a second
+    recurring line in 7500-11 (e.g. Shepherd $541.25, Mission Bend about
+    $3,000): report it as part of RENT and never guess what it is (no CAM,
+    tax, landlord or lease-term claims) -- the GL carries no description.
   * BILLING CADENCE vs FISCAL PERIODS. AYG has 13 fiscal periods of 28 days a
     year; most stores get about one electricity bill per calendar month, and
     some get two charges a month (a main bill plus a small one). So a store
@@ -1241,12 +1271,13 @@ UTILITY POSTING SEMANTICS (electricity and any utility account):
     (CADENCE query below: days_since_latest > longest_gap_days) shows the
     posting would normally be there by now; otherwise just state the latest
     posting date.
-  * NO IDENTIFIABLE POSTING. If a store has NO electricity line in the whole
-    loaded history (check the transaction view from '2024-04-07'; today: LCF
-    Downtown Houston), say exactly: "No identifiable electricity posting was
-    found in R365 for <store>." Do NOT say its electricity is $0, bundled into
-    rent, paid by the landlord, included in CAM or common-area charges, or on
-    another account -- none of that is proven by the GL. Do not offer those as
+  * NO IDENTIFIABLE POSTING. If a store has NO line of the category in the
+    whole loaded history (check the transaction view from '2024-04-07'; today:
+    LCF Downtown Houston for ELECTRICITY and WATER), say exactly: "No
+    identifiable electricity posting was found in R365 for <store>." (or
+    "No identifiable water posting ..."). Do NOT say its electricity is $0,
+    bundled into rent, paid by the landlord, included in CAM or common-area
+    charges, or on another account -- none of that is proven by the GL. Do not offer those as
     possible explanations either, not even as an "e.g." of what you cannot
     say: give no reason at all, and do not list, hint at or rule out any
     candidate reason, confirmed or not. Exclude it from rankings and averages and
@@ -1298,6 +1329,16 @@ UTILITY POSTING SEMANTICS (electricity and any utility account):
     charges a month -- say so when postings are frequent. These figures
     DESCRIBE past postings; never use them to predict a bill, to estimate an
     expense for a no-posting period, or to fill a gap.
+
+REPAIRS & MAINTENANCE (REPAIRS_MAINTENANCE) is not a monthly bill: it is many
+irregular invoices and card/bank expenses, and refunds post as credits
+(negative expense_amount) that reduce the total. A store with NO POSTING in a
+period had no R&M expense POSTED in that period -- say exactly that ("no
+repairs & maintenance posting in P10"), never "$0" or "nothing was repaired".
+Period-to-period swings reflect when work was done and booked; do not apply
+the monthly-billing caveat to R&M and never call it a trend from one period.
+FY2026 P1-P3 R&M is migrated history held on only 6000-11 and 6000-13, so a
+per-account split is only meaningful from P4 (2026-03-26).
 
 NO HOURS, NO USAGE TIMES. Summaries exist per fiscal period; detail lines
 carry an ACCOUNTING DATE (when the bill or entry was booked), never a time of
@@ -1401,18 +1442,20 @@ fiscal period also filter fiscal_year and period_number):
     real finding, not missing data.
   * UNVERIFIED ACCOUNTS. Lines exist for every GL account, mapped or not.
     - A "how much / total / spend" question for an unverified category (e.g.
-      "how much did we spend on rent in P10?") is NOT a drill-down request:
+      "how much did we spend on insurance in P10?") is NOT a drill-down request:
       answer it exactly as TRUSTED CATEGORIES ONLY says -- the accounting data
       exists, no VERIFIED category exists, NO dollar figure -- and offer to
       show the account-level GL entries if they want them.
     - Only when the user EXPLICITLY asks for entries / lines / transactions
-      ("show rent GL entries", "transactions for account 7500-01") may you list
-      those lines and their SQL total. Name the exact accounts used (an
+      ("show insurance GL entries", "transactions for account 7500-01") may you
+      list those lines and their SQL total. Name the exact accounts used (an
       account the user named, or accounts whose gl_account_name starts with
-      the word they used, e.g. 'Rent'), say their mapping_status is
+      the word they used, e.g. 'Insurance'), say their mapping_status is
       UNMAPPED/CANDIDATE, and say this is account-level accounting data, NOT a
-      VERIFIED <category> figure. Never call it "rent expense" as a trusted
-      category total, and never fold candidate accounts into ELECTRICITY.
+      VERIFIED <category> figure. Never call it "insurance expense" as a trusted
+      category total, and never fold candidate accounts into a VERIFIED
+      category. For a VERIFIED category ("show rent entries", "repair
+      transactions") filter on analytics_category, never on account names.
     analytics_category is NULL on unverified lines by design. If an account
     has no lines in the range, say so plainly and mention which related
     accounts did, if any (e.g. 7500-01 "Rent" has no lines at all in the
@@ -3181,8 +3224,9 @@ R365_FIN_SEMANTICS = [
     "expense_amount is approved GL expense in dollars for a whole fiscal period.",
     "has_posting = false / data_status NO_ACTIVITY means NO POSTING in the period: "
     "NEVER $0 and not missing source data. List those stores separately.",
-    "Only VERIFIED categories appear; CANDIDATE/UNMAPPED accounts (gas, water, "
-    "rent, ...) have no trusted category figure.",
+    "Only VERIFIED categories appear (ELECTRICITY, GAS, WATER, RENT, "
+    "REPAIRS_MAINTENANCE); CANDIDATE/UNMAPPED accounts (telephone, waste, "
+    "insurance, storage rent, ...) have no trusted category figure.",
     "Period grain only: never split a period figure into days, weeks or hours.",
     "A CURRENT period (source_data_status PARTIAL) is incomplete; never compare "
     "it with a closed period's total.",
@@ -3282,25 +3326,48 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
     }
 
 
-def r365_fin_result_note(gate_meta) -> str | None:
+R365_FIN_CATEGORY_WORDS = {"ELECTRICITY": "electricity", "GAS": "gas", "WATER": "water",
+                           "RENT": "rent", "REPAIRS_MAINTENANCE": "repairs & maintenance"}
+
+
+def r365_fin_category_word(category: str) -> str:
+    return R365_FIN_CATEGORY_WORDS.get(category, category.lower().replace("_", " "))
+
+
+def _split_store_category(entry: str) -> tuple[str, str]:
+    """'LCF Downtown Houston WATER' -> ('LCF Downtown Houston', 'WATER')."""
+    store, _, category = entry.rpartition(" ")
+    return store, category
+
+
+def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
     """A short R365 FINANCIAL note attached to a run_sql result. PURE.
 
     The gate's warnings only reach the model through check_data, which a plain
     period question may skip; the no-posting distinction must not depend on
     that. Stores with no line of the category in the whole loaded history get
     the "no identifiable posting" wording instead of the billing-timing caveat.
+    When the SQL names categories ('GAS', ...), only those are listed.
     """
     f = (gate_meta or {}).get("r365_financial") or {}
-    if not f.get("no_posting_in_scope"):
+    no_posting = list(f.get("no_posting_in_scope") or [])
+    no_ident = list(f.get("no_identifiable_posting") or [])
+    named = {c for c in f.get("verified_categories") or [] if sql and f"'{c}'" in sql}
+    if named:
+        no_posting = [e for e in no_posting if _split_store_category(e)[1] in named]
+        no_ident = [e for e in no_ident if _split_store_category(e)[1] in named]
+    if not no_posting:
         return None
     note = ("NO POSTING (never $0, not missing source data) for: "
-            + "; ".join(f["no_posting_in_scope"]) + ". Posting timing CAN explain a "
+            + "; ".join(no_posting) + ". Posting timing CAN explain a "
             "gap; call a specific store's gap timing only after querying its posting "
             "dates -- never \"likely\" without them.")
-    if f.get("no_identifiable_posting"):
+    if no_ident:
+        sentences = " ".join(
+            f"\"No identifiable {r365_fin_category_word(c)} posting was found in R365 "
+            f"for {st}.\"" for st, c in map(_split_store_category, no_ident))
         note += (" Of these, NO IDENTIFIABLE POSTING in the whole loaded GL history: "
-                 + "; ".join(f["no_identifiable_posting"]) + " -- say \"No identifiable "
-                 "electricity posting was found in R365 for <store>.\", give no reason, "
+                 + "; ".join(no_ident) + " -- say " + sentences + " Give no reason, "
                  "and do NOT apply the posting-timing caveat to it.")
     return note
 
@@ -3346,9 +3413,10 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
     if f.get("no_identifiable_posting"):
         warns.append("R365 FINANCIAL has NO IDENTIFIABLE POSTING in the whole loaded GL "
                      "history for: " + "; ".join(f["no_identifiable_posting"]) + ". Say "
-                     "\"No identifiable electricity posting was found in R365 for <store>.\" "
-                     "-- do NOT attribute it to billing timing, and give no reason (not $0, "
-                     "not rent, landlord or CAM)")
+                     "\"No identifiable <category> posting was found in R365 for <store>.\" "
+                     "(e.g. \"No identifiable electricity posting ...\") -- do NOT "
+                     "attribute it to billing timing, and give no reason (not $0, not "
+                     "rent, landlord or CAM)")
     failed = sorted({f"FY{p['fiscal_year']} {p['period_label']}"
                      for p in f.get("periods_in_scope") or [] if p["latest_refresh_failed"]})
     if failed:
@@ -4781,7 +4849,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 step["sql_seconds"] = round(time.perf_counter() - _t_exec, 3)
                 _timing(timings, "run_sql", time.perf_counter() - _t_exec)
                 step["row_count"] = out["row_count"]
-                _fin_note = r365_fin_result_note(gate_meta)
+                _fin_note = r365_fin_result_note(gate_meta, sql)
                 if _fin_note:
                     out["r365_financial_note"] = _fin_note
                 payload = json.dumps(out, separators=(",", ":"))
