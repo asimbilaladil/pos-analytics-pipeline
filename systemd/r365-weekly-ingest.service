@@ -1,0 +1,32 @@
+[Unit]
+Description=R365 weekly canonical ingest (weekly-report API -> PostgreSQL)
+Documentation=file:///root/pos-analytics-pipeline/migrations/54_r365_canonical.sql
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline
+# All logic lives in the orchestrator: Chicago week targeting (latest TWO
+# completed Thursday->Wednesday weeks), flock, bounded HTTP retries, verbatim
+# raw archive, validation, idempotent upsert and the r365_ingest_run record.
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline/r365_weekly_ingest.py
+# The orchestrator reads the token from this root-only 0600 file itself.
+# Deliberately NOT EnvironmentFile=, so the token never appears in
+# `systemctl show` or the journal.
+Environment=R365_ENV_FILE=/etc/laynes/r365.env
+Environment=R365_RAW_DIR=/var/lib/laynes/r365/raw
+Environment=R365_LOCK_PATH=/var/lib/laynes/r365/state/ingest.lock
+# Two weeks, the latest fetched live from R365 (~8 s observed), plus up to two
+# backoff retries each (30 s, 120 s) on a 300 s read timeout.
+TimeoutStartSec=1800
+# Exit contract (see r365_weekly_ingest.py):
+#   0  every week COMPLETE
+#   1  a week FAILED (or configuration error)       -- red
+#   2  a week PARTIAL (incomplete or unreconciled)  -- red on purpose: all 12
+#      stores are VERIFIED, so a gap is new and needs a look
+#   75 another run holds the lock                   -- harmless
+# The DATABASE is authoritative for COMPLETE/PARTIAL; read r365_ingest_run.
+SuccessExitStatus=0 75
+StandardOutput=append:/var/lib/laynes/r365/logs/weekly-ingest.service.log
+StandardError=append:/var/lib/laynes/r365/logs/weekly-ingest.service.log
