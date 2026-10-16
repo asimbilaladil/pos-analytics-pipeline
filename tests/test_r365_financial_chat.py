@@ -496,7 +496,7 @@ for needle, what in [
          "Nederland October wording"),
         ('not "late", "overdue" or "missed bill"', "no late/overdue claims"),
         ('not even as an "e.g." of what you cannot say', "no example speculation"),
-        ('never "likely" / "very likely" on no evidence', "no unsupported 'likely' timing claims"),
+        ('Never call unchecked timing "likely", "very likely"', "no unsupported 'likely' timing claims"),
         ("Never apply the timing caveat to a store with NO IDENTIFIABLE POSTING",
          "timing caveat not applied to Downtown"),
         ("do NOT rank on one 28-day fiscal period", "rankings use a longer window"),
@@ -808,6 +808,74 @@ for needle, what in [
         ("NOT vehicle fuel", "gas is not fuel"),
         ("never add them to a VERIFIED category", "candidates never folded in")]:
     check(f"guidance: {what}", needle in G)
+
+# ---------------------------------------------------------------------------
+print("15. evidence rule: no speculation about timing or low amounts")
+from r365_fin_wording import unsupported_claims  # noqa: E402
+
+G = C.R365_FINANCIAL_GUIDANCE
+for needle, what in [
+        ("EVIDENCE RULE (every R365 FINANCIAL category", "evidence rule covers every category"),
+        ("Keep OBSERVATION apart from EXPLANATION", "observation vs explanation"),
+        ("do not list possibilities you cannot\n    confirm", "no list of unconfirmed causes"),
+        ("The difference may reflect posting timing, but that is not established\n"
+         "    from this result alone.", "unchecked-timing sentence"),
+        ("Posting timing\n    is one possibility, but I have not verified the adjacent bill dates.",
+         "alternative unchecked-timing sentence"),
+        ("Never call unchecked timing \"likely\", \"very likely\",\n    \"plausible\", \"very plausible\"",
+         "bans likely / plausible timing"),
+        ("The available\n    accounting data does not establish why the amount is lower than other\n    stores.",
+         "low-amount wording"),
+        ("Never infer a partial-period bill, partial invoice, true or low\n    usage, billing error, catch-up bill or estimated bill",
+         "bans unverified low-amount theories"),
+        ("so P10 fell between those two\n    postings.", "evidence-based Shepherd example kept"),
+        ("never say the drop IS (or is mostly, likely, plausibly) timing", "period comparison guard")]:
+    check(f"guidance: {what}", needle in G)
+check("guidance still says NO POSTING is never $0", "never \"$0\", \"zero expense\"" in G)
+note = C.r365_fin_result_note({"r365_financial": {"no_posting_in_scope": ["LCF Shepherd P10 GAS"],
+                                                  "verified_categories": ["GAS"]}})
+check("run_sql note calls timing a possibility, not a finding, and bans likely/plausible",
+      "one possibility, not a finding" in note and "\"plausible\"" in note
+      and "CAN explain" not in note, note)
+
+LOOKUP = [{"sql": "SELECT store_name, accounting_date, period_label, expense_amount "
+                  "FROM v_r365_financial_transaction_llm WHERE analytics_category = 'ELECTRICITY' "
+                  "AND establishment_id = 15 AND accounting_date BETWEEN '2026-08-13' AND '2026-10-16'"}]
+NO_LOOKUP = [{"sql": "SELECT period_label, SUM(expense_amount) FROM v_r365_financial_period_llm "
+                     "WHERE analytics_category = 'GAS' AND period_start IN ('2026-08-13', '2026-09-10') "
+                     "GROUP BY 1"}]
+bad = {
+    "very plausible explanation": "this is a very plausible explanation for the P10 gaps above",
+    "likely posting timing": "The drop is likely posting timing.",
+    "probably because": "Gas fell, probably because bills landed in P11.",
+    "partial-period posting": "Mission Bend's low figure could be a partial-period posting.",
+    "true low usage": "rather than true low usage",
+    "most of the drop is timing": "most of that network drop is driven by which stores billed",
+}
+for what, text in bad.items():
+    check(f"guard rejects unsupported '{what}' without a posting-date lookup",
+          unsupported_claims(text, NO_LOOKUP), text)
+check("A. gas P9 vs P10 without a lookup: figures + 'not established' wording passes",
+      not unsupported_claims("Gas fell from $7,161.56 (11 of 12 stores) to $4,864.82 (7 of 12). "
+                             "The difference may reflect posting timing, but that is not "
+                             "established from this result alone.", NO_LOOKUP))
+check("B. Mission Bend: observed amount + 'does not establish why' passes",
+      not unsupported_claims("Mission Bend posted $412.58 of electricity expense in P10. The "
+                             "available accounting data does not establish why the amount is "
+                             "lower than other stores.", NO_LOOKUP))
+check("C. Shepherd after the adjacent-date lookup: evidence-based timing explanation allowed",
+      not unsupported_claims("Shepherd had no P10 electricity posting. Its previous posting was "
+                             "Sep 9 in P9 and its next posting was Oct 9 in P11, so P10 fell "
+                             "between those two postings, likely posting timing.", LOOKUP))
+check("'overdue' and bill-pairing / usage claims are rejected even after a lookup",
+      unsupported_claims("the next bill looks overdue", LOOKUP)
+      and unsupported_claims("P10 only captured the smaller companion charge", LOOKUP)
+      and unsupported_claims("it isn't a usage anomaly", LOOKUP))
+check("guidance: no usage claims and no bill-pairing labels",
+      "never say a figure is or is not\n    a \"usage change\"" in G
+      and "do not label lines\n    \"main\", \"companion\"" in G)
+check("a failed lookup is not evidence",
+      unsupported_claims("likely posting timing", [dict(LOOKUP[0], error="boom")]))
 
 failed = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

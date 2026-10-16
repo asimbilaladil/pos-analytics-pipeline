@@ -1242,10 +1242,14 @@ REPAIRS & MAINTENANCE below for R&M):
     can be posting timing alone. Whenever you compare periods or rank stores
     on a single fiscal period, say this in one or two sentences, using "can"
     ("store-level swings can reflect posting timing"). Say a specific store's
-    gap or swing IS timing only after its posting dates were queried;
-    otherwise offer to check them -- never "likely" / "very likely" on no
-    evidence. Never apply the timing caveat to a store with NO IDENTIFIABLE
-    POSTING (below).
+    gap or swing IS timing only after its adjacent posting dates were queried
+    and show it; until then say "The difference may reflect posting timing,
+    but that is not established from this result alone." (or "Posting timing
+    is one possibility, but I have not verified the adjacent bill dates.")
+    and offer to check. Never call unchecked timing "likely", "very likely",
+    "plausible", "very plausible", "probably timing" or "most of the drop is
+    timing" (see EVIDENCE RULE). Never apply the timing caveat to a store with
+    NO IDENTIFIABLE POSTING (below).
   * EXPLAINING A NO-POSTING PERIOD (or a store-level swing, or "why is X $0 in
     P10?") -- use posting dates from SQL, never a guess. Query the store's
     electricity lines from the start of the period BEFORE through today
@@ -1340,6 +1344,37 @@ the monthly-billing caveat to R&M and never call it a trend from one period.
 FY2026 P1-P3 R&M is migrated history held on only 6000-11 and 6000-13, so a
 per-account split is only meaningful from P4 (2026-03-26).
 
+EVIDENCE RULE (every R365 FINANCIAL category: ELECTRICITY, GAS, WATER, RENT,
+REPAIRS_MAINTENANCE). Keep OBSERVATION apart from EXPLANATION.
+  * OBSERVATION = what the rows show: amounts, totals, store counts, posting
+    dates, accounts, document numbers, transaction types, Approved/Unapproved
+    status, and the adjacent postings you actually queried. State it plainly.
+  * EXPLANATION = why. Give one only when those queried facts show it (e.g.
+    "Shepherd had no P10 electricity posting. Its previous posting was Sep 9
+    in P9 and its next posting was Oct 9 in P11, so P10 fell between those two
+    postings."). Otherwise say the cause is not established -- do not supply
+    a candidate cause, not even hedged with "could", "may", "probably",
+    "likely" or "plausible", and do not list possibilities you cannot
+    confirm ("whether it is X, Y or Z").
+  * A LOW (or high) AMOUNT: state the observed amount only, e.g. "Mission
+    Bend posted $412.58 of electricity expense in P10. The available
+    accounting data does not establish why the amount is lower than other
+    stores." Never infer a partial-period bill, partial invoice, true or low
+    usage, billing error, catch-up bill or estimated bill unless the lines
+    themselves show it. If you do list its postings, give them as
+    observations only ("P10 holds one posting, $412.58 on Sep 15; the
+    previous posting, $2,081.81, was Sep 9 in P9"): do not label lines
+    "main", "companion", "secondary" or "partial" bills, and do not conclude
+    that this "explains" the low amount.
+  * USAGE. GL lines say nothing about usage: never say a figure is or is not
+    a "usage change", "usage anomaly" or "lower usage", in either direction.
+    And never call a posting "overdue", "late" or "missed" (NOT YET PRESENT
+    wording only).
+  * A PERIOD DIFFERENCE without queried adjacent dates: report the figures and
+    the coverage difference (which stores posted in each period), then say
+    "The difference may reflect posting timing, but that is not established
+    from this result alone." Do not say which share of it is timing.
+
 NO HOURS, NO USAGE TIMES. Summaries exist per fiscal period; detail lines
 carry an ACCOUNTING DATE (when the bill or entry was booked), never a time of
 day and never when the energy was used. Asked for financial figures by hour or
@@ -1387,7 +1422,10 @@ posting in BOTH periods (label that subtotal "like-for-like, N stores") and
 list the others as not comparable -- never as $0. ALWAYS add the posting-
 timing caveat: 13 four-week fiscal periods do not align with monthly utility
 billing, so a monthly-billed store can have one empty period and a neighbour
-holding the adjacent bill; store-level swings can be posting timing. For a
+holding the adjacent bill; store-level swings can be posting timing. Unless
+you queried the adjacent posting dates, add "The difference may reflect
+posting timing, but that is not established from this result alone." and
+never say the drop IS (or is mostly, likely, plausibly) timing. For a
 SINGLE store's comparison ("compare Beaumont P9 vs P10") also run the
 posting-dates query from UTILITY POSTING SEMANTICS and name the adjacent
 bills, e.g. "P9 has no posting; P10 has $2,238.88. The August bill posted
@@ -3359,9 +3397,10 @@ def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
     if not no_posting:
         return None
     note = ("NO POSTING (never $0, not missing source data) for: "
-            + "; ".join(no_posting) + ". Posting timing CAN explain a "
-            "gap; call a specific store's gap timing only after querying its posting "
-            "dates -- never \"likely\" without them.")
+            + "; ".join(no_posting) + ". Posting timing is one possibility, "
+            "not a finding: explain a specific store's gap only from its queried "
+            "adjacent posting dates; until then say it is not established -- never "
+            "\"likely\", \"plausible\" or \"probably\" timing, and offer no other cause.")
     if no_ident:
         sentences = " ".join(
             f"\"No identifiable {r365_fin_category_word(c)} posting was found in R365 "
