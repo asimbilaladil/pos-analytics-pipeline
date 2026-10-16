@@ -1186,14 +1186,118 @@ category is available yet, so no trusted figure can be given. Do NOT estimate
 or approximate it, and do not offer a number from any other source.
 
 MISSING IS NOT ZERO. A row with has_posting = false (data_status =
-'NO_ACTIVITY', expense_amount NULL) means NO POSTING WAS FOUND for that store
-in that period. It is unknown, NOT $0: utility bills post roughly monthly and
-can land in an adjacent period or not be entered yet. Always:
-  * report such stores in a separate "no posting found" list, never as $0 and
+'NO_ACTIVITY', expense_amount NULL) means NO POSTING for that store in that
+period. Call it exactly that -- "NO POSTING" -- never "$0", "zero expense" or
+"nothing spent" (not even in brackets, e.g. never "$0 (no posting)"), and NOT
+"missing source data" either: the source delivered
+the period completely and simply has no line for that store. Say "source data
+incomplete" ONLY when v_r365_financial_coverage_llm shows source_data_status
+PARTIAL or latest_refresh_failed for that period, or the period is CURRENT.
+Always:
+  * report such stores in a separate "no posting" list, never as $0 and
     never ranked as the lowest;
   * state totals as "across N of 12 stores with a posting" (count of
     expense_amount; SUM ignores the NULLs);
   * never average with them counted as 0.
+
+UTILITY POSTING SEMANTICS (electricity and any utility account):
+  * WORDING. GL data records POSTINGS: "electricity expense posted in the
+    period", "electricity posting(s)". Never call it consumption, usage, meter
+    reading or the service period's usage -- the source has none of those.
+  * BILLING CADENCE vs FISCAL PERIODS. AYG has 13 fiscal periods of 28 days a
+    year; most stores get about one electricity bill per calendar month, and
+    some get two charges a month (a main bill plus a small one). So a store
+    can legitimately have one fiscal period with NO POSTING and a neighbouring
+    period holding the adjacent bill, and store-level period-to-period swings
+    can be posting timing alone. Whenever you compare periods or rank stores
+    on a single fiscal period, say this in one or two sentences, using "can"
+    ("store-level swings can reflect posting timing"). Say a specific store's
+    gap or swing IS timing only after its posting dates were queried;
+    otherwise offer to check them -- never "likely" / "very likely" on no
+    evidence. Never apply the timing caveat to a store with NO IDENTIFIABLE
+    POSTING (below).
+  * EXPLAINING A NO-POSTING PERIOD (or a store-level swing, or "why is X $0 in
+    P10?") -- use posting dates from SQL, never a guess. Query the store's
+    electricity lines from the start of the period BEFORE through today
+    (scope = that period's start_date .. tomorrow, establishment_id = the
+    store):
+        SELECT store_name, accounting_date, period_label, transaction_type,
+               transaction_number, expense_amount
+          FROM v_r365_financial_transaction_llm
+         WHERE analytics_category = 'ELECTRICITY' AND establishment_id = 15
+           AND accounting_date BETWEEN '2026-08-13' AND '2026-10-16'
+         ORDER BY accounting_date
+    Then state the last posting BEFORE the period and the next posting AFTER
+    it, each with its date and period, e.g. "Shepherd has no electricity
+    posting in P10. Its prior bill posted Sep 9, the final day of P9, and the
+    next bill posted Oct 9 in P11, so P10 fell between two monthly postings."
+    Never write $0 for that period, and never estimate or fill in an amount.
+  * NOT YET PRESENT. If no posting follows the gap yet, say "<Month>
+    electricity posting not yet present in R365" (latest posting <date>),
+    where <Month> is the calendar month AFTER the latest posting's month
+    (latest posting Sep 8 -> "October electricity posting not yet present in
+    R365"). Not "zero electricity expense", not "late", "overdue" or "missed
+    bill", and never predict its date or amount. Use that wording only when the store's usual cadence
+    (CADENCE query below: days_since_latest > longest_gap_days) shows the
+    posting would normally be there by now; otherwise just state the latest
+    posting date.
+  * NO IDENTIFIABLE POSTING. If a store has NO electricity line in the whole
+    loaded history (check the transaction view from '2024-04-07'; today: LCF
+    Downtown Houston), say exactly: "No identifiable electricity posting was
+    found in R365 for <store>." Do NOT say its electricity is $0, bundled into
+    rent, paid by the landlord, included in CAM or common-area charges, or on
+    another account -- none of that is proven by the GL. Do not offer those as
+    possible explanations either, not even as an "e.g." of what you cannot
+    say: give no reason at all, and do not list, hint at or rule out any
+    candidate reason, confirmed or not. Exclude it from rankings and averages and
+    list it separately. In any no-posting list, give such a store that
+    sentence instead of the posting-timing caveat.
+  * STORE RANKINGS ("which store has the highest electricity cost?") with no
+    period named: do NOT rank on one 28-day fiscal period. Rank on the last 6
+    COMPLETE calendar months of postings (native detail starts 2026-03-26),
+    and say why (monthly billing vs 28-day periods; a longer window evens out
+    timing):
+        SELECT store_name, count(*) AS postings,
+               count(DISTINCT date_trunc('month', accounting_date)) AS months_with_posting,
+               SUM(expense_amount) AS total_6m,
+               round(SUM(expense_amount) / 6, 2) AS avg_per_month,
+               rank() OVER (ORDER BY SUM(expense_amount) DESC) AS rank_high_to_low
+          FROM v_r365_financial_transaction_llm
+         WHERE analytics_category = 'ELECTRICITY'
+           AND accounting_date BETWEEN '2026-04-01' AND '2026-09-30'
+         GROUP BY store_name ORDER BY total_6m DESC
+    Flag stores with months_with_posting < 6 as timing-affected, and list
+    stores with no posting in the window separately. If the user explicitly
+    names a fiscal period ("rank stores in P10"), answer for that period from
+    v_r365_financial_period_llm as asked, then add the posting-timing caveat
+    and offer the 6-month view.
+  * CADENCE (descriptive only; "how often does X get billed", context for a
+    gap). Native postings only, one row per store:
+        WITH d AS (
+          SELECT store_name, accounting_date, SUM(expense_amount) AS amount
+            FROM v_r365_financial_transaction_llm
+           WHERE analytics_category = 'ELECTRICITY'
+             AND source_quality = 'TRANSACTION_DETAIL'
+             AND accounting_date BETWEEN '2026-03-26' AND '2026-10-16'
+           GROUP BY store_name, accounting_date),
+        g AS (
+          SELECT *, accounting_date - lag(accounting_date) OVER (
+                      PARTITION BY store_name ORDER BY accounting_date) AS gap_days
+            FROM d)
+        SELECT store_name, count(*) AS postings,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_days) AS typical_days_between,
+               max(gap_days) AS longest_gap_days,
+               max(accounting_date) AS latest_posting,
+               DATE '2026-10-16' - max(accounting_date) AS days_since_latest,
+               SUM(amount) FILTER (WHERE accounting_date > '2026-07-16') AS total_3m,
+               round(AVG(amount) FILTER (WHERE accounting_date > '2026-07-16'), 2)
+                                                         AS avg_per_posting_3m
+          FROM g GROUP BY store_name ORDER BY store_name
+    (replace '2026-10-16' with today and '2026-07-16' with today minus 3
+    months). avg_per_posting_3m is NOT a monthly bill where a store has two
+    charges a month -- say so when postings are frequent. These figures
+    DESCRIBE past postings; never use them to predict a bill, to estimate an
+    expense for a no-posting period, or to fill a gap.
 
 NO HOURS, NO USAGE TIMES. Summaries exist per fiscal period; detail lines
 carry an ACCOUNTING DATE (when the bill or entry was booked), never a time of
@@ -1239,8 +1343,15 @@ SQL:
 If the stores with a posting differ between the periods, say so next to the
 totals, then add a by-store table: compare a store only where it has a
 posting in BOTH periods (label that subtotal "like-for-like, N stores") and
-list the others as not comparable -- never as $0. Note that monthly bill
-timing alone can move a period's figure.
+list the others as not comparable -- never as $0. ALWAYS add the posting-
+timing caveat: 13 four-week fiscal periods do not align with monthly utility
+billing, so a monthly-billed store can have one empty period and a neighbour
+holding the adjacent bill; store-level swings can be posting timing. For a
+SINGLE store's comparison ("compare Beaumont P9 vs P10") also run the
+posting-dates query from UTILITY POSTING SEMANTICS and name the adjacent
+bills, e.g. "P9 has no posting; P10 has $2,238.88. The August bill posted
+Aug 12 in P8 and the next bill Sep 17 in P10, so the apparent P9 gap is
+posting timing rather than evidence of zero usage."
 CURRENT PERIOD: period_status CURRENT (or source_data_status PARTIAL) is still
 open and incomplete: say so and never compare it with a closed period's total.
 SOURCE QUALITY: source_quality MIGRATED_SUMMARY (FY2026 P1-P3 era) is migrated
@@ -3068,8 +3179,8 @@ R365_FIN_METRIC_AVAILABILITY = {
 }
 R365_FIN_SEMANTICS = [
     "expense_amount is approved GL expense in dollars for a whole fiscal period.",
-    "has_posting = false / data_status NO_ACTIVITY means no posting was found: "
-    "unknown, NEVER $0. List those stores separately.",
+    "has_posting = false / data_status NO_ACTIVITY means NO POSTING in the period: "
+    "NEVER $0 and not missing source data. List those stores separately.",
     "Only VERIFIED categories appear; CANDIDATE/UNMAPPED accounts (gas, water, "
     "rent, ...) have no trusted category figure.",
     "Period grain only: never split a period figure into days, weeks or hours.",
@@ -3094,12 +3205,15 @@ SELECT fiscal_year, period_number, period_label, start_date, end_date
 """
 
 _R365_FIN_NO_POSTING_SQL = """
-SELECT store_name, period_label, analytics_category
-  FROM v_r365_financial_period_llm
- WHERE period_start >= %(start)s::date AND period_end < %(end)s::date
-   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
-   AND NOT has_posting
- ORDER BY period_start, analytics_category, store_name
+SELECT p.store_name, p.period_label, p.analytics_category,
+       EXISTS (SELECT 1 FROM v_r365_financial_transaction_llm t
+                WHERE t.establishment_id = p.establishment_id
+                  AND t.analytics_category = p.analytics_category) AS ever_posted
+  FROM v_r365_financial_period_llm p
+ WHERE p.period_start >= %(start)s::date AND p.period_end < %(end)s::date
+   AND (%(est)s::int IS NULL OR p.establishment_id = %(est)s::int)
+   AND NOT p.has_posting
+ ORDER BY p.period_start, p.analytics_category, p.store_name
 """
 
 
@@ -3150,6 +3264,10 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
         "calendar_periods_not_loaded": not_loaded,
         "no_posting_in_scope": [f"{r['store_name']} {r['period_label']} "
                                 f"{r['analytics_category']}" for r in no_posting],
+        # stores with NO line of that category in the whole loaded GL history:
+        # "no identifiable posting", never explained as billing timing
+        "no_identifiable_posting": sorted({f"{r['store_name']} {r['analytics_category']}"
+                                           for r in no_posting if not r["ever_posted"]}),
         "verified_categories": sorted({c["analytics_category"] for c in cov}),
         "loaded_period_range": ([f"FY{cov[0]['fiscal_year']} {cov[0]['period_label']}",
                                  f"FY{cov[-1]['fiscal_year']} {cov[-1]['period_label']}"]
@@ -3162,6 +3280,29 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
         "metric_availability": dict(R365_FIN_METRIC_AVAILABILITY),
         "semantics": list(R365_FIN_SEMANTICS),
     }
+
+
+def r365_fin_result_note(gate_meta) -> str | None:
+    """A short R365 FINANCIAL note attached to a run_sql result. PURE.
+
+    The gate's warnings only reach the model through check_data, which a plain
+    period question may skip; the no-posting distinction must not depend on
+    that. Stores with no line of the category in the whole loaded history get
+    the "no identifiable posting" wording instead of the billing-timing caveat.
+    """
+    f = (gate_meta or {}).get("r365_financial") or {}
+    if not f.get("no_posting_in_scope"):
+        return None
+    note = ("NO POSTING (never $0, not missing source data) for: "
+            + "; ".join(f["no_posting_in_scope"]) + ". Posting timing CAN explain a "
+            "gap; call a specific store's gap timing only after querying its posting "
+            "dates -- never \"likely\" without them.")
+    if f.get("no_identifiable_posting"):
+        note += (" Of these, NO IDENTIFIABLE POSTING in the whole loaded GL history: "
+                 + "; ".join(f["no_identifiable_posting"]) + " -- say \"No identifiable "
+                 "electricity posting was found in R365 for <store>.\", give no reason, "
+                 "and do NOT apply the posting-timing caveat to it.")
+    return note
 
 
 def _r365_fin_gate(f: dict) -> tuple[list, list]:
@@ -3198,8 +3339,16 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
                      "never compare them with a closed period's total")
     if f.get("no_posting_in_scope"):
         warns.append("R365 FINANCIAL found NO POSTING for: " + "; ".join(
-            f["no_posting_in_scope"]) + ". These are unknown, NOT $0 -- list them "
-            "separately and exclude them from totals' store counts")
+            f["no_posting_in_scope"]) + ". Report them as NO POSTING -- never $0 and not "
+            "missing source data -- list them separately, exclude them from totals' "
+            "store counts, and explain a gap only from posting dates (UTILITY POSTING "
+            "SEMANTICS), never by guessing")
+    if f.get("no_identifiable_posting"):
+        warns.append("R365 FINANCIAL has NO IDENTIFIABLE POSTING in the whole loaded GL "
+                     "history for: " + "; ".join(f["no_identifiable_posting"]) + ". Say "
+                     "\"No identifiable electricity posting was found in R365 for <store>.\" "
+                     "-- do NOT attribute it to billing timing, and give no reason (not $0, "
+                     "not rent, landlord or CAM)")
     failed = sorted({f"FY{p['fiscal_year']} {p['period_label']}"
                      for p in f.get("periods_in_scope") or [] if p["latest_refresh_failed"]})
     if failed:
@@ -3313,7 +3462,7 @@ def _r365_fin_detail_gate(d: dict) -> tuple[list, list]:
                      "period (no official calendar); group them by accounting date only")
     if not d.get("approved_lines_in_scope"):
         warns.append("R365 FINANCIAL DETAIL: no Approved line matches this store and date "
-                     "range. That means no posting was found -- not $0")
+                     "range: that is NO POSTING -- not $0 and not missing source data")
     return fails, warns
 
 
@@ -4031,6 +4180,7 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "verified_categories": f.get("verified_categories"),
             "periods_in_scope": f.get("periods_in_scope"),
             "no_posting_in_scope": f.get("no_posting_in_scope"),
+            "no_identifiable_posting": f.get("no_identifiable_posting"),
             "last_refreshed_at": f.get("last_refreshed_at"),
         }
     if DOMAIN_R365_FIN_DETAIL in doms:
@@ -4631,6 +4781,9 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 step["sql_seconds"] = round(time.perf_counter() - _t_exec, 3)
                 _timing(timings, "run_sql", time.perf_counter() - _t_exec)
                 step["row_count"] = out["row_count"]
+                _fin_note = r365_fin_result_note(gate_meta)
+                if _fin_note:
+                    out["r365_financial_note"] = _fin_note
                 payload = json.dumps(out, separators=(",", ":"))
                 # keep tool payload bounded
                 if len(payload) > 60000:
