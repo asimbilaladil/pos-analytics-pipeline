@@ -200,6 +200,16 @@ VIEW v_order_channel_context  -- channel context (migration 33)
   only how the order REACHED the POS. There is NO verified drive-thru / dine-in
   / takeout / delivery mapping -- always give the raw code.
 
+VIEW v_ayg_business_periods_llm  -- AYG fiscal period calendar (migration 49)
+  fiscal_year, period_number, period_label, start_date, end_date,
+  period_status (FUTURE | CURRENT | COMPLETED), days_total, days_elapsed
+  REFERENCE DATA: needs NO store/period scope and NO reconciliation -- it IS
+  the period definition. The official AYG calendar, 13 periods of 28 days per
+  fiscal year, loaded for FY2026 and FY2027 ONLY.
+  days_elapsed counts COMPLETE days only (today excluded: today has no settled
+  sales). For a COMPLETED period it equals days_total; FUTURE periods are 0.
+  A fiscal year is NOT the calendar year: FY2027 P1 starts 2026-12-31.
+
 VIEW v_product_category_current  -- CURRENT category reference (migration 32)
   product_id, establishment_id, product_name, category_id, category_name,
   parent_category_id, parent_category_name, mapping_source,
@@ -941,6 +951,62 @@ A: Numbered list, qty and revenue each.
 """
 
 
+# ── composable guidance blocks ──────────────────────────────────────────────
+# Each block covers ONE feature and is interpolated into _system_static().
+# Keeping them separate is not cosmetic: it is what lets a feature be
+# reviewed, tested and committed on its own.
+
+BUSINESS_PERIOD_GUIDANCE = """\
+FISCAL PERIODS ("P8", "period nine", "P10-to-date", "this period").
+AYG runs 13 periods of 28 days per fiscal year, NOT calendar months. Resolve
+every period reference through v_ayg_business_periods_llm -- never from memory,
+never by assuming 4-week or 4-4-5 arithmetic, and never by asking the user for
+raw dates. One cheap lookup gives you label, dates, status and elapsed days:
+    SELECT fiscal_year, period_number, period_label, start_date, end_date,
+           period_status, days_total, days_elapsed
+    FROM v_ayg_business_periods_llm
+    WHERE fiscal_year = 2026 AND period_number IN (8, 9, 10)
+Then use those start_date/end_date values as the explicit literal bounds of
+your business queries. The calendar itself needs no scope declaration; the fact
+tables you then query still need theirs.
+
+  * ALIASES, all the same thing: "P8" / "p8" / "period 8" / "period eight" /
+    "P. 8" / "eighth period". Digits and words both resolve.
+  * "current period" / "this period" -> the row with period_status = CURRENT.
+    "last period" -> the COMPLETED row with the highest start_date.
+  * FISCAL YEAR: only FY2026 and FY2027 are loaded. If the year is unambiguous
+    from context, just use it -- do not ask. Ask only if genuinely ambiguous,
+    and then ask exactly "Do you mean P10 FY2026 or FY2027?" -- never ask the
+    user for start/end dates. If a period resolves to NO row (e.g. FY2025),
+    say the official calendar for that year is not loaded; do NOT estimate it.
+
+A CURRENT PERIOD IS PARTIAL. Never compare a partial period's totals against
+completed periods' totals -- P10 at 25 days vs P9 at 28 days is a 3-day deficit
+that looks like a sales decline and is not one. Instead:
+  1. read days_elapsed for the current period (COMPLETE days only);
+  2. take the FIRST days_elapsed days of each comparison period --
+     start_date .. start_date + (days_elapsed - 1);
+  3. compare those equal-length windows.
+Because every period is 28 days and starts on the same weekday, the first N
+days of any two periods carry the same weekday mix -- so state the windows you
+used and no weekday adjustment is needed.
+Always say explicitly how far in the current period is, e.g. "P10 is 25 days
+into its 28-day period". For a period-to-date comparison report at minimum:
+revenue, REAL transactions, AOV, discount %, and store coverage (how many
+stores reported in each window -- an absent store is not a zero).
+"P10-to-date" / "period-to-date" / "PTD" all mean the complete days so far.
+Do not project a period's final total unless the user explicitly asks for a
+projection, and if asked, label it as such.
+
+FISCAL PERIODS APPLY TO HME TOO. "How was drive-thru in P9?" resolves P9's
+dates first, then reads HME within them. Every HME rule stands unchanged:
+VERIFIED mapped stores only, no Downtown Houston HME data, missing HME is NOT
+zero, cars are NOT POS orders, no fabricated hourly detail, and the HME
+completeness/freshness contract applies to the period's dates exactly as it
+does to any other date range.
+"""
+
+
 def _system_static() -> str:
     """The large, stable part of the system prompt — cached across requests."""
     est_lines = "\n".join(f"  {i} = {n}" for i, n in sorted(ESTABLISHMENTS.items()))
@@ -1071,6 +1137,7 @@ HME rules — these are not stylistic, they change what is true:
   * This never relaxes availability: if the user asked about a date that is not
     loaded, the analysis is still blocked. Only the EXPLANATION changes —
     "awaiting its scheduled ingestion" rather than "the source is stale".
+{BUSINESS_PERIOD_GUIDANCE}
 {GLOSSARY}
 {DATA_NOTES}
 {UNAVAILABLE_METRICS}
@@ -1214,6 +1281,9 @@ _ALLOWED_RELATIONS = frozenset({
     # product_category_mapping itself is NOT granted.
     "v_order_items_category_context", "v_category_review_queue",
     "v_product_category_current",
+    # Fiscal period calendar (migration 49). Reference data: period identity
+    # and dates only. The raw ayg_business_periods table is NOT granted.
+    "v_ayg_business_periods_llm",
     # A8 (migration 33). Channel context: verified group + unverified names.
     "v_order_channel_context",
     # A11 (migration 34). Identity context; safe_customer_key is an opaque hash
@@ -1854,6 +1924,10 @@ _RELATION_DOMAIN = {
     "v_order_identity_context": DOMAIN_IDENTITY,
     "v_identity_profile": DOMAIN_IDENTITY,
     "v_order_loyalty_context": DOMAIN_IDENTITY,
+    # The period calendar is a shared date dimension. Resolving "P10" must not
+    # drag in the Revel sales gate -- and joining it to a gated fact table does
+    # not exempt that table, whose own domain still applies.
+    "v_ayg_business_periods_llm": None,
     # establishments is a shared dimension and implies no domain of its own:
     # joining it to name a store must not drag in the Revel sales gate.
     "establishments": None,
@@ -2821,6 +2895,10 @@ _REFERENCE_RELATIONS = frozenset({
     # not declaring a period it has no column for. The per-order view
     # (v_order_identity_context) stays gated.
     "v_identity_profile",
+    # The fiscal calendar has no store, no revenue and no period to declare --
+    # it IS the period definition. Gating it would be circular: the model could
+    # not look up P10's dates without first declaring the dates of P10.
+    "v_ayg_business_periods_llm",
 })
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
