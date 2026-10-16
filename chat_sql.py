@@ -1131,8 +1131,15 @@ CROSS-SOURCE — join only on establishment_id, never on store name.
 R365_FINANCIAL_GUIDANCE = """\
 R365 FINANCIAL (GL / P&L) DATA (migrations 56/57). Approved general-ledger
 expenses from Restaurant365, published by the R365 source system and refreshed
-here daily at 07:00 America/Chicago (after the source's 06:00 sync). Grain:
-store x AYG FISCAL PERIOD x analytics category. Loaded from FY2026 P1 onward.
+here daily at 07:00 America/Chicago (after the source's 06:00 sync). TWO
+GRAINS (migrations 56-59):
+  SUMMARY    store x AYG FISCAL PERIOD x analytics category, FY2026 P1 onward
+             -> v_r365_financial_period_llm ("how much", totals, rankings,
+             period comparisons)
+  DRILL-DOWN one row per GL detail line, accounting dates 2024-04-07 onward
+             -> v_r365_financial_transaction_llm ("show the transactions /
+             entries / postings", "what makes up", "largest posting", "GL
+             entries for account X")
 
 v_r365_financial_period_llm   — establishment_id x fiscal period x category
     store_name, fiscal_year, period_number, period_label, period_start,
@@ -1146,6 +1153,14 @@ v_r365_financial_account_llm  — the chart of accounts: account_number,
     account_name, account_type, analytics_category, mapping_status (VERIFIED /
     CANDIDATE / UNMAPPED), category_trusted. Metadata only, no amounts.
     Reference data: no scope needed.
+v_r365_financial_transaction_llm — APPROVED GL detail lines, VERIFIED stores:
+    establishment_id, store_name, accounting_date, fiscal_year, period_number,
+    period_label, gl_account_number, gl_account_name, analytics_category
+    (VERIFIED accounts only, else NULL), mapping_status, transaction_type,
+    transaction_status, transaction_number, debit_amount, credit_amount,
+    expense_amount (= debit - credit), source_quality
+v_r365_financial_unapproved_transaction_llm — the same columns for UNAPPROVED
+    lines. Use ONLY when the user explicitly asks for unapproved entries.
 
 SOURCE AUTHORITY — which source answers what:
   * R365 FINANCIAL: GL / P&L / accounting expenses (electricity, utilities,
@@ -1180,10 +1195,14 @@ can land in an adjacent period or not be entered yet. Always:
     expense_amount; SUM ignores the NULLs);
   * never average with them counted as 0.
 
-PERIOD GRAIN ONLY. Financial data exists per fiscal period, never per day,
-week or hour. Asked for financial figures by hour, day or week: say GL expense
-data is only available per fiscal period, and do not split, prorate or
-approximate a period figure into smaller units.
+NO HOURS, NO USAGE TIMES. Summaries exist per fiscal period; detail lines
+carry an ACCOUNTING DATE (when the bill or entry was booked), never a time of
+day and never when the energy was used. Asked for financial figures by hour or
+time of day: say GL data has no such grain and refuse -- do not split, prorate
+or approximate, and never infer hourly usage or consumption from accounting
+dates. Never present the accounting dates of bills as a daily or weekly
+expense trend either: a bill's date is when it was booked, not when the cost
+was incurred.
 
 QUERYING — resolve the period via v_ayg_business_periods_llm, then filter by
 fiscal_year, period_number AND the literal period_start (the scope gate needs a
@@ -1226,6 +1245,75 @@ CURRENT PERIOD: period_status CURRENT (or source_data_status PARTIAL) is still
 open and incomplete: say so and never compare it with a closed period's total.
 SOURCE QUALITY: source_quality MIGRATED_SUMMARY (FY2026 P1-P3 era) is migrated
 P&L history; its transaction_count counts journal entries, not bills.
+
+DRILL-DOWN (v_r365_financial_transaction_llm) -- never reconstruct lines from
+period summaries, and never answer a total question from lines when the
+summary view has it. Scope: declare period_start / period_end_exclusive as the
+accounting-date range and put literal accounting_date bounds in the SQL (for a
+fiscal period also filter fiscal_year and period_number):
+    SELECT store_name, accounting_date, gl_account_number, transaction_type,
+           transaction_number, debit_amount, credit_amount, expense_amount,
+           source_quality,
+           SUM(expense_amount) OVER () AS lines_total,
+           count(*) OVER ()            AS line_count,
+           (SELECT count(DISTINCT establishment_id)
+              FROM v_r365_financial_transaction_llm
+             WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+               AND period_number = 10
+               AND accounting_date BETWEEN '2026-09-10' AND '2026-10-07')
+                                       AS stores_with_lines
+      FROM v_r365_financial_transaction_llm
+     WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+       AND period_number = 10
+       AND accounting_date BETWEEN '2026-09-10' AND '2026-10-07'
+     ORDER BY expense_amount DESC
+  * Quote lines_total, line_count and stores_with_lines from SQL -- never count
+    stores or lines by hand.
+  * NO DATE GIVEN (e.g. "show transactions for account 7500-01"): do NOT ask
+    for a range. Use the whole loaded history (declare period_start
+    '2024-04-07', period_end_exclusive = tomorrow) and answer in two parts
+    from SQL: (1) a by-month count and total of the lines
+    (date_trunc('month', accounting_date)), and (2) the most recent 25 lines.
+    Say which range you covered and offer to narrow it.
+  * Lines total: For a VERIFIED category the Approved lines of a
+    store/period ADD UP EXACTLY to the period summary (the gate checks this);
+    say that they reconcile, and to which summary amount.
+  * Credits/reversals are lines with credit_amount > 0 and a NEGATIVE
+    expense_amount; they reduce the total. Show debit and credit columns when
+    asked, never drop credit lines.
+  * "Largest posting" = the single line with the highest expense_amount (order
+    in SQL, LIMIT 1); state its store, date, type and document number.
+  * APPROVED BY DEFAULT. Every total and summary uses Approved lines only.
+    Query v_r365_financial_unapproved_transaction_llm ONLY when the user
+    explicitly asks for unapproved entries; label them "unapproved (not in any
+    period total)". If none match, say no unapproved lines exist -- that is a
+    real finding, not missing data.
+  * UNVERIFIED ACCOUNTS. Lines exist for every GL account, mapped or not.
+    - A "how much / total / spend" question for an unverified category (e.g.
+      "how much did we spend on rent in P10?") is NOT a drill-down request:
+      answer it exactly as TRUSTED CATEGORIES ONLY says -- the accounting data
+      exists, no VERIFIED category exists, NO dollar figure -- and offer to
+      show the account-level GL entries if they want them.
+    - Only when the user EXPLICITLY asks for entries / lines / transactions
+      ("show rent GL entries", "transactions for account 7500-01") may you list
+      those lines and their SQL total. Name the exact accounts used (an
+      account the user named, or accounts whose gl_account_name starts with
+      the word they used, e.g. 'Rent'), say their mapping_status is
+      UNMAPPED/CANDIDATE, and say this is account-level accounting data, NOT a
+      VERIFIED <category> figure. Never call it "rent expense" as a trusted
+      category total, and never fold candidate accounts into ELECTRICITY.
+    analytics_category is NULL on unverified lines by design. If an account
+    has no lines in the range, say so plainly and mention which related
+    accounts did, if any (e.g. 7500-01 "Rent" has no lines at all in the
+    loaded history; rent postings are on 7500-11 "Rent - Restaurant").
+  * Lines with no store: only the 12 VERIFIED stores are visible; corporate
+    entities are not.
+  * DATA QUALITY: source_quality MIGRATED_SUMMARY lines (HIST DATA IMPORT,
+    through 2026-03-25, i.e. FY2026 P1-P3 and earlier) are migrated P&L
+    journal lines, not the original bills: say transaction-level detail is
+    reduced there. TRANSACTION_DETAIL lines (from P4) are the native postings.
+  * Lines dated before FY2026 have fiscal_year / period_number NULL (no
+    official calendar). Never label them with a fiscal period.
 
 CROSS-SOURCE (only when asked): join v_r365_financial_period_llm to
 v_r365_store_period_llm on establishment_id AND fiscal_year AND period_number
@@ -1604,6 +1692,12 @@ _ALLOWED_RELATIONS = frozenset({
     # or unmapped amounts and run errors never cross this boundary.
     "v_r365_financial_period_llm", "v_r365_financial_coverage_llm",
     "v_r365_financial_account_llm",
+    # R365 FINANCIAL GL detail lines (migrations 58/59): Approved lines by
+    # default, Unapproved lines in their own view for explicit requests only.
+    # r365_financial_transaction itself stays denied: no R365 detail,
+    # transaction, location or account ids cross this boundary.
+    "v_r365_financial_transaction_llm",
+    "v_r365_financial_unapproved_transaction_llm",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1804,7 +1898,7 @@ CHECK_DATA_TOOL = {
                 "type": "array",
                 "items": {"type": "string",
                           "enum": ["revel", "hme", "labor", "identity", "r365",
-                                   "r365_financial"]},
+                                   "r365_financial", "r365_financial_detail"]},
                 "description": (
                     "Which data sources the question actually needs. Pass only "
                     "these, because each one's checks are run and applied: "
@@ -1818,7 +1912,8 @@ CHECK_DATA_TOOL = {
                     "R365-only question needs ['r365'] alone and is NOT blocked "
                     "by Revel reconciliation; an expense question needs "
                     "['r365_financial'] alone (plus 'r365' only to relate it to "
-                    "R365 sales or labour). A "
+                    "R365 sales or labour); 'r365_financial_detail' for individual "
+                    "GL transaction lines (drill-down). A "
                     "drive-thru question needs ['hme'] alone and is NOT blocked "
                     "by Revel sales reconciliation; 'compare drive-thru with "
                     "sales' needs ['hme','revel']. Omitting this runs every "
@@ -2224,13 +2319,18 @@ DOMAIN_R365 = "r365"
 # and refresh, so each keeps its own gate. Like R365 it is opt-in -- routed from
 # the parse tree, never folded into the strict default below.
 DOMAIN_R365_FIN = "r365_financial"
+# The GL DETAIL-LINE grain of the same source. Its own domain because its scope
+# is any accounting-date range (lines carry dates), whereas period summaries
+# only exist for whole fiscal periods; its gate checks line coverage and that
+# the lines reconcile to the period summaries.
+DOMAIN_R365_FIN_DETAIL = "r365_financial_detail"
 # The strict set applied when a check_data call names no domains (or an unknown
 # one). R365 is deliberately NOT in it: R365 is loaded weekly, so folding it in
 # would let a missing R365 week veto an ordinary daily Revel/HME question. That
 # never widens access to R365 data -- a query that reads an R365 view is routed
 # to the R365 gate from its parse tree regardless (domains_for_relations).
 ALL_DOMAINS = (DOMAIN_REVEL, DOMAIN_HME, DOMAIN_LABOR, DOMAIN_IDENTITY)
-KNOWN_DOMAINS = ALL_DOMAINS + (DOMAIN_R365, DOMAIN_R365_FIN)
+KNOWN_DOMAINS = ALL_DOMAINS + (DOMAIN_R365, DOMAIN_R365_FIN, DOMAIN_R365_FIN_DETAIL)
 
 # Which domain each allowlisted relation belongs to. Derived from the relations
 # a statement actually references, so gating is decided by the SQL rather than
@@ -2258,6 +2358,8 @@ _RELATION_DOMAIN = {
     # metadata (no store amounts); both are in _REFERENCE_RELATIONS.
     "v_r365_financial_coverage_llm": None,
     "v_r365_financial_account_llm": None,
+    "v_r365_financial_transaction_llm": DOMAIN_R365_FIN_DETAIL,
+    "v_r365_financial_unapproved_transaction_llm": DOMAIN_R365_FIN_DETAIL,
     # The period calendar is a shared date dimension. Resolving "P10" must not
     # drag in the Revel sales gate -- and joining it to a gated fact table does
     # not exempt that table, whose own domain still applies.
@@ -2960,7 +3062,9 @@ R365_FIN_METRIC_AVAILABILITY = {
     "period_expense": True, "verified_categories_only": True,
     # GL data is posted per accounting date but published per fiscal period.
     "hourly": False, "daily": False, "weekly": False,
-    "unverified_categories": False, "transaction_detail": False,
+    "unverified_categories": False,
+    # Detail lines exist in v_r365_financial_transaction_llm (accounting dates).
+    "transaction_detail": True,
 }
 R365_FIN_SEMANTICS = [
     "expense_amount is approved GL expense in dollars for a whole fiscal period.",
@@ -3107,6 +3211,109 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
                      f"{f.get('refresh_schedule')}); recent postings may be missing")
     if f.get("source_sync_stale"):
         warns.append("R365 FINANCIAL: the source system reported its own sync as stale")
+    return fails, warns
+
+
+_R365_FIN_DETAIL_SCOPE_SQL = """
+SELECT count(*)                                                   AS approved_lines,
+       count(*) FILTER (WHERE source_quality = 'MIGRATED_SUMMARY')  AS migrated_lines,
+       count(*) FILTER (WHERE fiscal_year IS NULL)                 AS pre_calendar_lines
+  FROM v_r365_financial_transaction_llm
+ WHERE accounting_date >= %(start)s::date AND accounting_date < %(end)s::date
+   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+"""
+
+_R365_FIN_DETAIL_RANGE_SQL = """
+SELECT min(accounting_date) AS first_date, max(accounting_date) AS last_date
+  FROM v_r365_financial_transaction_llm
+"""
+
+# For every fiscal period lying wholly inside the scope: per store and VERIFIED
+# category, the Approved lines must add up to the period summary exactly.
+_R365_FIN_DETAIL_RECON_SQL = """
+WITH per AS (
+    SELECT fiscal_year, period_number FROM v_ayg_business_periods_llm
+     WHERE start_date >= %(start)s::date AND end_date < %(end)s::date
+), t AS (
+    SELECT x.establishment_id, x.fiscal_year, x.period_number, x.analytics_category,
+           sum(x.expense_amount) AS s
+      FROM v_r365_financial_transaction_llm x JOIN per USING (fiscal_year, period_number)
+     WHERE x.analytics_category IS NOT NULL
+       AND (%(est)s::int IS NULL OR x.establishment_id = %(est)s::int)
+     GROUP BY 1, 2, 3, 4
+), p AS (
+    SELECT f.establishment_id, f.fiscal_year, f.period_number, f.analytics_category,
+           f.expense_amount AS s
+      FROM v_r365_financial_period_llm f JOIN per USING (fiscal_year, period_number)
+     WHERE f.has_posting
+       AND (%(est)s::int IS NULL OR f.establishment_id = %(est)s::int)
+)
+SELECT count(*)                                         AS pairs,
+       count(*) FILTER (WHERE t.s IS DISTINCT FROM p.s) AS differences
+  FROM p FULL JOIN t USING (establishment_id, fiscal_year, period_number, analytics_category)
+"""
+
+
+def _r365_fin_detail_block(cur, establishment_id, period_start, period_end):
+    """Coverage and summary reconciliation for a GL detail-line scope. Reads
+    only the allowlisted financial views and the calendar, as laynes_ro."""
+    params = {"est": establishment_id, "start": period_start, "end": period_end}
+    cur.execute(_R365_FIN_DETAIL_RANGE_SQL)
+    rng = dict(cur.fetchone())
+    cur.execute(_R365_FIN_DETAIL_SCOPE_SQL, params)
+    sc = dict(cur.fetchone())
+    cur.execute(_R365_FIN_DETAIL_RECON_SQL, params)
+    rc = dict(cur.fetchone())
+    cur.execute("SELECT max(loaded_at) AS t FROM v_r365_financial_coverage_llm")
+    last = cur.fetchone()["t"]
+    start_d, end_d = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    first, lastd = rng["first_date"], rng["last_date"]
+    overlaps = bool(first) and start_d <= lastd and end_d > first
+    return {
+        "available": overlaps,
+        "source": "v_r365_financial_transaction_llm (Approved lines, VERIFIED stores)",
+        "grain": "one row per GL detail line; accounting_date, no time of day",
+        "loaded_date_range": [first.isoformat(), lastd.isoformat()] if first else None,
+        "approved_lines_in_scope": sc["approved_lines"],
+        "migrated_summary_lines_in_scope": sc["migrated_lines"],
+        "pre_calendar_lines_in_scope": sc["pre_calendar_lines"],
+        "reconciliation": {"store_period_category_pairs": rc["pairs"],
+                           "differences": rc["differences"],
+                           "scope": "fiscal periods wholly inside the scope"},
+        "last_refreshed_at": last.isoformat() if last else None,
+        "metric_availability": {"hourly": False, "time_of_day": False,
+                                "unapproved_by_default": False},
+    }
+
+
+def _r365_fin_detail_gate(d: dict) -> tuple[list, list]:
+    """GL detail-line trust gate. PURE. Reasons start "R365 FINANCIAL DETAIL"."""
+    fails, warns = [], []
+    if not d or d.get("available") is None:
+        return ["R365 FINANCIAL DETAIL availability could not be determined"], warns
+    if not d.get("available"):
+        rng = d.get("loaded_date_range")
+        fails.append("R365 FINANCIAL DETAIL has no GL lines loaded for this date range "
+                     f"(loaded accounting dates: {rng[0]}..{rng[1]})" if rng else
+                     "R365 FINANCIAL DETAIL has no GL lines loaded at all")
+        return fails, warns
+    rc = d.get("reconciliation") or {}
+    if rc.get("differences"):
+        fails.append(f"R365 FINANCIAL DETAIL lines do not reconcile to the period summary "
+                     f"for {rc['differences']} store/period/category value(s) in this scope; "
+                     "the transaction detail is not complete for it and must not be "
+                     "presented as the make-up of the period total")
+    if d.get("migrated_summary_lines_in_scope"):
+        warns.append(f"R365 FINANCIAL DETAIL: {d['migrated_summary_lines_in_scope']} line(s) "
+                     "in scope are MIGRATED_SUMMARY history (HIST DATA IMPORT journal "
+                     "entries through 2026-03-25): migrated P&L lines, not original bills -- "
+                     "say the transaction detail there is reduced")
+    if d.get("pre_calendar_lines_in_scope"):
+        warns.append("R365 FINANCIAL DETAIL: lines dated before FY2026 have no fiscal "
+                     "period (no official calendar); group them by accounting date only")
+    if not d.get("approved_lines_in_scope"):
+        warns.append("R365 FINANCIAL DETAIL: no Approved line matches this store and date "
+                     "range. That means no posting was found -- not $0")
     return fails, warns
 
 
@@ -3814,7 +4021,9 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
         }
     if DOMAIN_R365_FIN in doms:
         f = meta.get("r365_financial") or {}
-        fin_failed = any(x.startswith("R365 FINANCIAL") for x in out["blocking_reasons"])
+        fin_failed = any(x.startswith("R365 FINANCIAL")
+                         and not x.startswith("R365 FINANCIAL DETAIL")
+                         for x in out["blocking_reasons"])
         out["r365_financial"] = {
             "trusted": not fin_failed and bool(f.get("available")),
             "scope_is_whole_periods": f.get("scope_is_whole_periods"),
@@ -3823,6 +4032,16 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "periods_in_scope": f.get("periods_in_scope"),
             "no_posting_in_scope": f.get("no_posting_in_scope"),
             "last_refreshed_at": f.get("last_refreshed_at"),
+        }
+    if DOMAIN_R365_FIN_DETAIL in doms:
+        d = meta.get("r365_financial_detail") or {}
+        det_failed = any(x.startswith("R365 FINANCIAL DETAIL")
+                         for x in out["blocking_reasons"])
+        out["r365_financial_detail"] = {
+            "trusted": not det_failed and bool(d.get("available")),
+            "loaded_date_range": d.get("loaded_date_range"),
+            "approved_lines_in_scope": d.get("approved_lines_in_scope"),
+            "reconciliation": d.get("reconciliation"),
         }
     if DOMAIN_REVEL in doms:
         rec = meta.get("reconciliation") or {}
@@ -4055,6 +4274,21 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
         ff, fw = _r365_fin_gate(meta["r365_financial"])
         fails += ff
         warns += fw
+
+    if DOMAIN_R365_FIN_DETAIL in doms:
+        conn = _ro_conn()
+        try:
+            conn.set_session(readonly=True, autocommit=False)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                meta["r365_financial_detail"] = _r365_fin_detail_block(
+                    cur, establishment_id, period_start, period_end)
+        finally:
+            conn.rollback()
+            conn.close()
+        df, dw = _r365_fin_detail_gate(meta["r365_financial_detail"])
+        fails += df
+        warns += dw
 
     if DOMAIN_LABOR in doms and DOMAIN_REVEL not in doms:
         lb, lf, lw = _labor_gate(establishment_id, period_start, period_end)

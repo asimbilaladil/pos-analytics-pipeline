@@ -12,11 +12,13 @@ calls Restaurant365 itself.
 
 Targets are computed from the America/Chicago date and the official AYG
 calendar (ayg_business_periods), never from the host's UTC date:
-  * scheduled:  the chart of accounts, the CURRENT fiscal period and the
-                PREVIOUS one -- late-posted bills and corrections land there.
-                On Mondays (after the source's Monday 05:30 weekly repair) it
-                re-pulls every elapsed period of the current and previous
-                fiscal year as well. All history is never re-pulled daily.
+  * scheduled:  the chart of accounts and every fiscal period that overlaps
+                the last OVERLAP_DAYS (42) days -- six weeks, longer than the
+                source's five-week repair window, so any line the source
+                re-syncs is re-pulled here; in practice 2-3 periods. On Mondays
+                (after the source's Monday 05:30 weekly repair) it re-pulls
+                every elapsed period of the current and previous fiscal year.
+                All history is never re-pulled daily.
   * --backfill: the chart of accounts, every elapsed calendar period, and the
                 pre-calendar GL history (rolled up per account x month, with
                 no fiscal period assigned).
@@ -67,6 +69,7 @@ MAX_ATTEMPTS = int(os.environ.get("R365_FIN_MAX_ATTEMPTS", "3"))
 BACKOFF_SECONDS = [0, 15, 60]
 CONNECT_TIMEOUT, READ_TIMEOUT = 15, 120
 REPAIR_WEEKDAY = 1                      # Monday, after the source's weekly repair
+OVERLAP_DAYS = 42                       # > the source's 5-week (35-day) repair window
 
 EXIT_OK, EXIT_FAILED, EXIT_PARTIAL, EXIT_LOCKED = 0, 1, 2, 75
 STATUS_OPEN = "OPEN"
@@ -105,7 +108,8 @@ def scheduled_periods(calendar, today):
     if today.isoweekday() == REPAIR_WEEKDAY:
         cur_fy = started[-1][0]
         return [k for k in started if k[0] >= cur_fy - 1]
-    return started[-2:]
+    since = today - datetime.timedelta(days=OVERLAP_DAYS)
+    return [k for k in started if calendar[k][1] >= since]
 
 
 def history_range(calendar):
@@ -183,9 +187,12 @@ class Source:
         """Every approved GL detail line for params, across pages. The total
         must hold steady through the scan and every line must be unique."""
         lines, offset, total = [], 0, None
+        params = {**params, "include_unapproved": "true"}
         while True:
             doc = L.parse_payload(self.get(DETAIL_PATH, {**params, "limit": DETAIL_PAGE,
                                                          "offset": offset}))
+            if doc.get("includeUnapproved") is not True:
+                raise L.SourceSchemaError("detail feed did not honour include_unapproved")
             pag = doc.get("pagination") or {}
             if total is None:
                 total = pag.get("total")
@@ -254,6 +261,7 @@ def _run_target(conn, run_id, work, log, label):
 
 
 def _stamp_fetch(fetch, src, t_req, path, digest):
+    fetch.setdefault("fetched_at", datetime.datetime.now(datetime.timezone.utc))
     fetch.update(http_requests=src.requests_made - t_req[0],
                  fetch_seconds=round(src.seconds - t_req[1], 3),
                  raw_archive_path=path, payload_sha256=digest)
@@ -323,7 +331,9 @@ def ingest_period(conn, src, fy, pn, calendar, verified_categories, batch_id, tr
             f"{cal[0]}..{cal[1]} expense={c['expense'][0]} (changed {c['expense'][1]}, "
             f"deleted {c['expense'][2]}) no_activity={plan['no_activity_rows']} "
             f"candidates={c['candidates'][0]} account_period={c['account_period'][0]} "
-            f"lines={plan['detail_lines']} source={plan['source_data_status']}"
+            f"lines={plan['detail_lines']} txn={c['transactions'][0]} (changed "
+            f"{c['transactions'][1]}, deleted {c['transactions'][2]}, unapproved "
+            f"{plan['transaction_stats']['unapproved']}) source={plan['source_data_status']}"
             + (f" unaccounted={plan['unaccounted_stores']}" if plan["unaccounted_stores"] else "")
             + (f" unmapped_locations={[u['name'] for u in plan['unmapped_locations']]}"
                if plan["unmapped_locations"] else ""))
@@ -353,10 +363,26 @@ def ingest_history(conn, src, calendar, batch_id, trigger, dry_run, log):
     def work(fetch):
         plan = fetch_and_plan(fetch)
         c = L.write_history(conn, run_id, plan, fetch)
-        return plan["status"], (f"lines={plan['detail_lines']} account_months="
+        return plan["status"], (f"lines={plan['detail_lines']} txn={c['transactions'][0]} "
+                                f"(changed {c['transactions'][1]}) account_months="
                                 f"{c['account_period'][0]} (changed {c['account_period'][1]}) "
                                 f"range={plan['source_min_date']}..{plan['source_max_date']}")
     return _run_target(conn, run_id, work, log, "HISTORY")
+
+
+def check_transaction_coverage(conn, src, log):
+    """After a full backfill the local transaction table must hold exactly the
+    source's line set: same count, nothing synthesised, nothing missing."""
+    doc = L.parse_payload(src.get(DETAIL_PATH, {"include_unapproved": "true", "limit": 1}))
+    total = (doc.get("pagination") or {}).get("total")
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM r365_financial_transaction")
+        local = cur.fetchone()[0]
+    conn.rollback()
+    ok = local == total
+    log(f"transaction coverage: local {local} vs source {total} -> "
+        f"{'MATCH' if ok else 'MISMATCH'}")
+    return L.STATUS_COMPLETE if ok else L.STATUS_FAILED
 
 
 def main(argv=None):
@@ -422,6 +448,8 @@ def main(argv=None):
             if st == L.STATUS_PARTIAL and calendar[(fy, pn)][1] >= today:
                 st = STATUS_OPEN          # an open period is expected to be partial
             results.append(st)
+        if args.backfill and not args.dry_run:
+            results.append(check_transaction_coverage(conn, src, print))
         print(f"done: {src.requests_made} requests in {src.seconds:.1f}s", flush=True)
     finally:
         conn.close()

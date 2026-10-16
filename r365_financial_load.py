@@ -22,6 +22,10 @@ Rules enforced here (see migrations/56_r365_financial.sql for the evidence):
     period are kept per calendar month and never given one.
   * Category totals are the SOURCE's: VERIFIED accounts only. CANDIDATE and
     UNMAPPED activity is kept as unverified accounting data.
+  * Every GL detail line (Approved and Unapproved) is kept in
+    r365_financial_transaction, keyed by the source detailId and located by the
+    LINE's own location. expense_amount must equal debit - credit. Summaries
+    and account roll-ups use Approved lines only, as the source does.
   * Nothing token-shaped is read from a payload or written anywhere.
 """
 import datetime
@@ -56,10 +60,13 @@ SUMMARY_ROW_KEYS = {"locationId", "locationName", "fiscalYear", "periodNumber",
 NO_ACTIVITY_KEYS = {"locationId", "locationName", "fiscalYear", "periodNumber"}
 CANDIDATE_KEYS = {"locationId", "fiscalYear", "periodNumber", "accountNumber",
                   "accountName", "candidateCategory", "expenseAmount"}
-DETAIL_KEYS = {"detailId", "transactionId", "status", "locationId", "locationName",
-               "accountingDate", "fiscalYear", "periodNumber", "glAccountId",
-               "accountNumber", "analyticsCategory", "mappingStatus", "debitAmount",
+DETAIL_KEYS = {"detailId", "transactionId", "transactionNumber", "transactionType",
+               "status", "locationId", "locationName", "accountingDate", "fiscalYear",
+               "periodNumber", "glAccountId", "accountNumber", "accountName",
+               "accountType", "analyticsCategory", "mappingStatus", "debitAmount",
                "creditAmount", "expenseAmount", "sourceClass"}
+TXN_STATUSES = {"Approved", "Unapproved"}
+SOURCE_CLASSES = {"TRANSACTION_DETAIL", "MIGRATED_SUMMARY"}
 
 
 class SourceSchemaError(Exception):
@@ -263,6 +270,79 @@ def aggregate_detail(lines, bucket_of, where="detail"):
     return rows, cat_sums
 
 
+def parse_transaction(ln, where, fiscal=None):
+    """One source detail line -> one r365_financial_transaction row. PURE.
+
+    fiscal = (fy, pn) the line must carry, or "NONE" for a pre-calendar line.
+    The amount rule is checked, not trusted: expense = debit - credit.
+    """
+    _keys(ln, DETAIL_KEYS, where)
+    if ln["status"] not in TXN_STATUSES:
+        raise SourceSchemaError(f"{where}: unknown status {ln['status']!r}")
+    if ln["mappingStatus"] not in MAPPING_STATUSES:
+        raise SourceSchemaError(f"{where}: unknown mappingStatus {ln['mappingStatus']!r}")
+    if ln["sourceClass"] not in SOURCE_CLASSES:
+        raise SourceSchemaError(f"{where}: unknown sourceClass {ln['sourceClass']!r}")
+    if not ln["detailId"] or not ln["transactionId"] or not ln["locationId"]:
+        raise SourceSchemaError(f"{where}: missing detail, transaction or location id")
+    deb, cred = _money(ln["debitAmount"], where), _money(ln["creditAmount"], where)
+    amt = _money(ln["expenseAmount"], where)
+    if amt != deb - cred:
+        raise SourceSchemaError(f"{where}: expenseAmount {amt} != debit {deb} - credit {cred}")
+    fy, pn = ln["fiscalYear"], ln["periodNumber"]
+    if (fy is None) != (pn is None):
+        raise SourceSchemaError(f"{where}: half a fiscal period ({fy}, {pn})")
+    if fiscal == "NONE" and fy is not None:
+        raise SourceSchemaError(f"{where}: line carries FY{fy} P{pn} but lies before the "
+                                "official calendar")
+    if fiscal not in (None, "NONE") and (fy, pn) != fiscal:
+        raise SourceSchemaError(f"{where}: line is FY{fy} P{pn}, requested "
+                                f"FY{fiscal[0]} P{fiscal[1]}")
+    return {
+        "source_transaction_detail_id": ln["detailId"],
+        "source_transaction_id": ln["transactionId"],
+        "transaction_number": ln["transactionNumber"],
+        "transaction_type": ln["transactionType"],
+        "transaction_status": ln["status"],
+        "r365_location_id": ln["locationId"],
+        "location_name": ln["locationName"],
+        "accounting_date": _date(ln["accountingDate"], where),
+        "fiscal_year": fy, "period_number": pn,
+        "gl_account_id": ln["glAccountId"],
+        "gl_account_number": ln["accountNumber"],
+        "gl_account_name": ln["accountName"],
+        "gl_account_type": ln["accountType"],
+        "analytics_category": ln["analyticsCategory"],
+        "mapping_status": ln["mappingStatus"],
+        "debit_amount": deb, "credit_amount": cred, "expense_amount": amt,
+        "source_class": ln["sourceClass"],
+    }
+
+
+def plan_transactions(lines, mapping, fiscal):
+    """Every detail line as a transaction row (both statuses). PURE."""
+    rows, seen = [], set()
+    for i, ln in enumerate(lines):
+        r = parse_transaction(ln, f"detail[{i}]", fiscal)
+        if r["source_transaction_detail_id"] in seen:
+            raise SourceSchemaError(f"detail[{i}]: duplicate detailId across pages")
+        seen.add(r["source_transaction_detail_id"])
+        r["establishment_id"] = _mapped(mapping, r["r365_location_id"])
+        rows.append(r)
+    return rows
+
+
+def _txn_stats(rows):
+    return {"lines": len(rows),
+            "headers": len({r["source_transaction_id"] for r in rows}),
+            "approved": sum(r["transaction_status"] == "Approved" for r in rows),
+            "unapproved": sum(r["transaction_status"] == "Unapproved" for r in rows),
+            "mapped_store_lines": sum(r["establishment_id"] is not None for r in rows),
+            "unmapped_location_lines": sum(r["establishment_id"] is None for r in rows),
+            "verified_lines": sum(r["mapping_status"] == "VERIFIED" for r in rows),
+            "unverified_lines": sum(r["mapping_status"] != "VERIFIED" for r in rows)}
+
+
 def plan_period(fy, pn, calendar, cat_payloads, all_payload, detail_lines, mapping,
                 verified_categories):
     """Plan one fiscal period. PURE.
@@ -271,8 +351,15 @@ def plan_period(fy, pn, calendar, cat_payloads, all_payload, detail_lines, mappi
     cat_payloads        {category: summary payload filtered to that category}
                         for every VERIFIED category
     all_payload         the unfiltered summary for the period
-    detail_lines        every approved GL detail line of the period
+    detail_lines        every GL detail line of the period, Approved AND
+                        Unapproved (summaries reconcile to the Approved ones)
     """
+    transactions = plan_transactions(detail_lines, mapping, (fy, pn))
+    for t in transactions:
+        if not calendar[0] <= t["accounting_date"] <= calendar[1]:
+            raise SourceSchemaError(f"detail line dated {t['accounting_date']} is outside "
+                                    f"FY{fy} P{pn}")
+    detail_lines = [ln for ln in detail_lines if ln["status"] == "Approved"]
     warnings = []
     if set(cat_payloads) != set(verified_categories):
         raise SourceSchemaError("category payloads do not match the VERIFIED categories")
@@ -400,6 +487,8 @@ def plan_period(fy, pn, calendar, cat_payloads, all_payload, detail_lines, mappi
         "status": STATUS_COMPLETE if complete else STATUS_PARTIAL,
         "expense_rows": expense, "candidate_rows": candidates,
         "account_period_rows": acct_rows,
+        "transaction_rows": transactions,
+        "transaction_stats": _txn_stats(transactions),
         "rows_received": len(all_payload["data"]) + sum(len(p["data"]) for p in cat_payloads.values()),
         "no_activity_rows": no_activity,
         "detail_lines": len(detail_lines),
@@ -439,11 +528,20 @@ def plan_history(lines, mapping, range_start, range_end):
         ms, me = month_bounds(d)
         return f"CM-{d:%Y-%m}", "CALENDAR_MONTH", None, None, ms, me
 
-    rows, _ = aggregate_detail(lines, bucket_of, "history")
+    transactions = plan_transactions(lines, mapping, "NONE")
+    for t in transactions:
+        if not range_start <= t["accounting_date"] <= range_end:
+            raise SourceSchemaError(f"detail line dated {t['accounting_date']} is outside "
+                                    f"{range_start}..{range_end}")
+    rows, _ = aggregate_detail([ln for ln in lines if ln["status"] == "Approved"],
+                               bucket_of, "history")
     for r in rows:
         r["establishment_id"] = _mapped(mapping, r["r365_location_id"])
     dates = [r["min_accounting_date"] for r in rows] + [r["max_accounting_date"] for r in rows]
     return {"status": STATUS_COMPLETE, "account_period_rows": rows,
+            "transaction_rows": transactions,
+            "transaction_stats": _txn_stats(transactions),
+            "range": (range_start, range_end),
             "detail_lines": len(lines),
             "source_min_date": min(dates) if dates else None,
             "source_max_date": max(dates) if dates else None}
@@ -492,11 +590,15 @@ def fail_run(conn, run_id, code, message, fetch=None):
     conn.commit()
 
 
-def _replace(cur, table, pk_cols, value_cols, rows, run_id, scope_sql, scope_params):
+def _replace(cur, table, pk_cols, value_cols, rows, run_id, scope_sql, scope_params,
+             stamp=None):
     """Make `table` hold exactly `rows` within one scope. Returns
     (upserted, changed, deleted). Rows the source no longer reports for the
     scope (a re-classified or reversed posting) are deleted, so a refresh is a
-    faithful replacement, and re-running the same payload changes nothing."""
+    faithful replacement, and re-running the same payload changes nothing.
+    stamp = {column: value} written on every row but NOT compared (e.g. the
+    fetch time), so it never counts as a change."""
+    stamp = stamp or {}
     cur.execute(f"SELECT {', '.join(pk_cols)}, {', '.join(value_cols)} FROM {table} "
                 f"WHERE {scope_sql}", scope_params)
     before = {tuple(r[:len(pk_cols)]): tuple(r[len(pk_cols):]) for r in cur.fetchall()}
@@ -507,13 +609,15 @@ def _replace(cur, table, pk_cols, value_cols, rows, run_id, scope_sql, scope_par
     changed = sum(1 for r in rows
                   if before.get(tuple(r[c] for c in pk_cols)) != tuple(r[c] for c in value_cols))
     if rows:
-        cols = pk_cols + value_cols + ["ingest_run_id"]
-        upd = ", ".join(f"{c} = EXCLUDED.{c}" for c in value_cols + ["ingest_run_id"])
+        extra = list(stamp)
+        cols = pk_cols + value_cols + extra + ["ingest_run_id"]
+        upd = ", ".join(f"{c} = EXCLUDED.{c}" for c in value_cols + extra + ["ingest_run_id"])
         psycopg2.extras.execute_values(
             cur,
             f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s "
             f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {upd}, updated_at = now()",
-            [tuple(r[c] for c in pk_cols + value_cols) + (run_id,) for r in rows],
+            [tuple(r[c] for c in pk_cols + value_cols) + tuple(stamp.values()) + (run_id,)
+             for r in rows],
             page_size=1000)
     return len(rows), changed, len(gone)
 
@@ -535,6 +639,22 @@ _ACCT_PERIOD_VALS = ["bucket_kind", "fiscal_year", "period_number", "bucket_star
                      "debit_amount", "credit_amount", "migrated_summary_amount",
                      "line_count", "transaction_count", "min_accounting_date",
                      "max_accounting_date"]
+
+
+_TXN_PK = ["source_transaction_detail_id"]
+_TXN_VALS = ["source_transaction_id", "transaction_number", "transaction_type",
+             "transaction_status", "r365_location_id", "location_name", "establishment_id",
+             "accounting_date", "fiscal_year", "period_number", "gl_account_id",
+             "gl_account_number", "gl_account_name", "gl_account_type", "analytics_category",
+             "mapping_status", "debit_amount", "credit_amount", "expense_amount",
+             "source_class"]
+
+
+def _write_transactions(cur, run_id, plan, fetch, scope_sql, scope_params):
+    fetched_at = fetch.get("fetched_at") or datetime.datetime.now(datetime.timezone.utc)
+    return _replace(cur, "r365_financial_transaction", _TXN_PK, _TXN_VALS,
+                    plan["transaction_rows"], run_id, scope_sql, scope_params,
+                    stamp={"source_fetched_at": fetched_at})
 
 
 def _finish(cur, run_id, status, **f):
@@ -591,6 +711,8 @@ def write_period(conn, run_id, plan, fetch):
                      plan["account_period_rows"], run_id,
                      "bucket_kind = 'FISCAL_PERIOD' AND fiscal_year = %s AND period_number = %s",
                      (fy, pn))
+        t = _write_transactions(cur, run_id, plan, fetch,
+                                "fiscal_year = %s AND period_number = %s", (fy, pn))
         _finish(cur, run_id, plan["status"],
                 rows_received=plan["rows_received"], rows_upserted=e[0] + c[0],
                 rows_changed=e[1] + c[1], rows_deleted=e[2] + c[2] + a[2],
@@ -605,8 +727,11 @@ def write_period(conn, run_id, plan, fetch):
                 source_status_reasons=_json(plan["source_status_reasons"]),
                 source_last_sync_at=sync_at, source_sync_stale=plan["source_sync_stale"],
                 source_min_date=plan["source_min_date"], source_max_date=plan["source_max_date"],
-                schema_warnings=_json(plan["schema_warnings"]), **_fetch_cols(fetch))
-    return {"expense": e, "candidates": c, "account_period": a}
+                schema_warnings=_json(plan["schema_warnings"]),
+                transaction_rows_upserted=t[0], transaction_rows_changed=t[1],
+                transaction_rows_deleted=t[2],
+                transaction_stats=_json(plan["transaction_stats"]), **_fetch_cols(fetch))
+    return {"expense": e, "candidates": c, "account_period": a, "transactions": t}
 
 
 def write_history(conn, run_id, plan, fetch):
@@ -614,9 +739,15 @@ def write_history(conn, run_id, plan, fetch):
         a = _replace(cur, "r365_financial_account_period", _ACCT_PERIOD_PK, _ACCT_PERIOD_VALS,
                      plan["account_period_rows"], run_id,
                      "bucket_kind = 'CALENDAR_MONTH'", ())
+        t = _write_transactions(cur, run_id, plan, fetch,
+                                "fiscal_year IS NULL AND accounting_date BETWEEN %s AND %s",
+                                plan["range"])
         _finish(cur, run_id, plan["status"], rows_received=plan["detail_lines"],
                 rows_upserted=a[0], rows_changed=a[1], rows_deleted=a[2],
                 detail_lines_received=plan["detail_lines"], account_period_rows=a[0],
                 source_min_date=plan["source_min_date"],
-                source_max_date=plan["source_max_date"], **_fetch_cols(fetch))
-    return {"account_period": a}
+                source_max_date=plan["source_max_date"],
+                transaction_rows_upserted=t[0], transaction_rows_changed=t[1],
+                transaction_rows_deleted=t[2],
+                transaction_stats=_json(plan["transaction_stats"]), **_fetch_cols(fetch))
+    return {"account_period": a, "transactions": t}

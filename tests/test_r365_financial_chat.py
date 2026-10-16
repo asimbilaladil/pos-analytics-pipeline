@@ -25,11 +25,12 @@ import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
 results = []
+TXN = ("v_r365_financial_transaction_llm", "v_r365_financial_unapproved_transaction_llm")
 SAFE = ("v_r365_financial_period_llm", "v_r365_financial_coverage_llm",
-        "v_r365_financial_account_llm")
+        "v_r365_financial_account_llm") + TXN
 RAW = ("r365_financial_period_expense", "r365_financial_candidate_expense",
        "r365_financial_account_period", "r365_financial_account",
-       "r365_financial_ingest_run")
+       "r365_financial_ingest_run", "r365_financial_transaction")
 P9 = ("2026-08-13", "2026-09-10")
 P10 = ("2026-09-10", "2026-10-08")
 
@@ -59,7 +60,7 @@ for v in SAFE:
     check(f"{v} is allowed", not rejected(f"SELECT * FROM {v}"))
 for t in RAW:
     check(f"raw {t} is rejected", rejected(f"SELECT * FROM {t}"))
-check("exactly three financial relations are allowlisted",
+check("exactly the five safe financial relations are allowlisted",
       {r for r in C._ALLOWED_RELATIONS if "financial" in r} == set(SAFE))
 check("raw table in a CTE is rejected",
       rejected("WITH x AS (SELECT * FROM r365_financial_candidate_expense) SELECT * FROM x"))
@@ -96,7 +97,7 @@ cur.execute("""SELECT table_name, string_agg(privilege_type, ',' ORDER BY privil
                 WHERE grantee = 'laynes_ro' AND table_name LIKE '%%financial%%'
                 GROUP BY 1 ORDER BY 1""")
 grants = {r["table_name"]: r["p"] for r in cur.fetchall()}
-check("laynes_ro holds SELECT only, on exactly the three safe views",
+check("laynes_ro holds SELECT only, on exactly the five safe views",
       grants == {v: "SELECT" for v in SAFE}, str(grants))
 
 # ---------------------------------------------------------------------------
@@ -283,7 +284,7 @@ check("SQL network % equals the per-store recomputation", abs(tot - pct) < 1e-9,
 
 print("10. no hourly financial fabrication")
 conn, cur = ro()
-for v in SAFE:
+for v in SAFE[:3]:            # summary-grain views: no date grain at all
     cur.execute(f"SELECT * FROM {v} LIMIT 1")
     names = {d.name for d in cur.description}
     check(f"{v} has no hour/day/week column",
@@ -299,7 +300,7 @@ check("financial guidance is in the system prompt", G in s)
 for needle, what in [
         ("NEVER derive or estimate an expense from sales", "never derive expense from sales"),
         ("It is unknown, NOT $0", "missing is not zero"),
-        ("PERIOD GRAIN ONLY", "no hourly/daily financial data"),
+        ("NO HOURS, NO USAGE TIMES", "no hourly financial data"),
         ("are NOT electricity", "gas/water/etc. not electricity"),
         ("no VERIFIED <category>", "unverified category answer (rent)"),
         ("never to Revel unless Revel is explicitly requested", "no Revel in cross-source"),
@@ -307,6 +308,160 @@ for needle, what in [
         ("REVEL: POS", "Revel authority"), ("HME: drive-thru", "HME authority"),
         ("establishment_id AND fiscal_year AND period_number", "cross-source join keys")]:
     check(f"guidance: {what}", needle in G)
+
+# ---------------------------------------------------------------------------
+print("12. transaction drill-down")
+conn, cur = ro()
+cur.execute("SELECT * FROM v_r365_financial_transaction_llm LIMIT 1")
+tcols = {d.name for d in cur.description}
+texp = {"establishment_id", "store_name", "accounting_date", "fiscal_year", "period_number",
+        "period_label", "gl_account_number", "gl_account_name", "analytics_category",
+        "mapping_status", "transaction_type", "transaction_status", "transaction_number",
+        "debit_amount", "credit_amount", "expense_amount", "source_quality"}
+check("transaction view exposes exactly the reviewed fields", tcols == texp,
+      str(sorted(tcols ^ texp)))
+cur.execute("SELECT * FROM v_r365_financial_unapproved_transaction_llm LIMIT 1")
+check("unapproved view has the same fields", {d.name for d in cur.description} == texp)
+cur.execute("SELECT DISTINCT transaction_status FROM v_r365_financial_transaction_llm")
+check("default transaction view is Approved only",
+      [r["transaction_status"] for r in cur.fetchall()] == ["Approved"])
+cur.execute("SELECT DISTINCT transaction_status FROM v_r365_financial_unapproved_transaction_llm")
+check("unapproved view holds only Unapproved lines (explicit requests)",
+      [r["transaction_status"] for r in cur.fetchall()] == ["Unapproved"])
+cur.execute("SELECT count(*) n FROM v_r365_financial_transaction_llm "
+            "WHERE mapping_status <> 'VERIFIED' AND analytics_category IS NOT NULL")
+check("unverified lines never carry an analytics category (no silent GAS/RENT)",
+      cur.fetchone()["n"] == 0)
+cur.execute("SELECT DISTINCT analytics_category FROM v_r365_financial_transaction_llm "
+            "WHERE analytics_category IS NOT NULL")
+check("only ELECTRICITY appears as a category on lines",
+      [r["analytics_category"] for r in cur.fetchall()] == ["ELECTRICITY"])
+cur.execute("SELECT count(*) n FROM v_r365_financial_transaction_llm "
+            "WHERE expense_amount <> debit_amount - credit_amount")
+check("every visible line satisfies expense = debit - credit", cur.fetchone()["n"] == 0)
+cur.execute("SELECT count(*) n FROM v_r365_financial_transaction_llm WHERE establishment_id IS NULL")
+check("only VERIFIED-store lines visible", cur.fetchone()["n"] == 0)
+cur.execute("SELECT count(*) n FROM v_r365_financial_transaction_llm "
+            "WHERE accounting_date < '2026-01-01' AND fiscal_year IS NOT NULL")
+check("pre-FY2026 lines carry no invented fiscal period", cur.fetchone()["n"] == 0)
+cur.execute("SELECT DISTINCT source_quality FROM v_r365_financial_transaction_llm "
+            "WHERE accounting_date >= '2026-03-26'")
+check("native TRANSACTION_DETAIL from P4 onward",
+      [r["source_quality"] for r in cur.fetchall()] == ["TRANSACTION_DETAIL"])
+
+for pn, total in ((9, Decimal("20789.68")), (10, Decimal("20329.87"))):
+    cur.execute("""SELECT p.store_name, p.expense_amount AS summ, t.s AS txn
+                     FROM v_r365_financial_period_llm p
+                     LEFT JOIN (SELECT establishment_id, sum(expense_amount) s
+                                  FROM v_r365_financial_transaction_llm
+                                 WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+                                   AND period_number = %s GROUP BY 1) t USING (establishment_id)
+                    WHERE p.analytics_category = 'ELECTRICITY' AND p.fiscal_year = 2026
+                      AND p.period_number = %s""", (pn, pn))
+    rows = cur.fetchall()
+    bad = [r["store_name"] for r in rows if r["summ"] != r["txn"]]
+    check(f"P{pn} electricity: every store's lines equal its summary (no-posting stores have none)",
+          not bad, str(bad))
+    cur.execute("SELECT sum(expense_amount) s FROM v_r365_financial_transaction_llm "
+                "WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026 "
+                "AND period_number = %s", (pn,))
+    check(f"P{pn} electricity transaction total = summary {total}, difference 0",
+          cur.fetchone()["s"] == total)
+cur.execute("""WITH t AS (SELECT establishment_id, fiscal_year, period_number, analytics_category,
+                                 sum(expense_amount) s
+                            FROM v_r365_financial_transaction_llm
+                           WHERE analytics_category IS NOT NULL AND fiscal_year IS NOT NULL
+                           GROUP BY 1, 2, 3, 4),
+                    p AS (SELECT establishment_id, fiscal_year, period_number, analytics_category,
+                                 expense_amount s FROM v_r365_financial_period_llm WHERE has_posting)
+               SELECT count(*) pairs, count(*) FILTER (WHERE t.s IS DISTINCT FROM p.s) diffs
+                 FROM p FULL JOIN t USING (establishment_id, fiscal_year, period_number,
+                                           analytics_category)""")
+rc = cur.fetchone()
+check("ALL VERIFIED store/period/category values reconcile summary <-> lines (0 differences)",
+      rc["diffs"] == 0 and rc["pairs"] > 100, str(dict(rc)))
+cur.execute("""SELECT store_name, expense_amount FROM v_r365_financial_transaction_llm
+                WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+                  AND period_number = 10 ORDER BY expense_amount DESC LIMIT 1""")
+top = cur.fetchone()
+check("largest P10 electricity posting is a single Missouri City line of $3,856.01",
+      top["store_name"] == "LCF Missouri City" and top["expense_amount"] == Decimal("3856.01"))
+cur.execute("""SELECT count(*) n, sum(expense_amount) s FROM v_r365_financial_transaction_llm
+                WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+                  AND period_number = 10 AND store_name = 'LCF Missouri City'""")
+mc = cur.fetchone()
+check("Missouri City P10: 3 lines adding to $4,222.32", mc["n"] == 3 and mc["s"] == Decimal("4222.32"))
+cur.execute("SELECT count(*) n FROM v_r365_financial_unapproved_transaction_llm "
+            "WHERE gl_account_number = '6200-03'")
+check("no Unapproved electricity lines exist (a real, reportable finding)",
+      cur.fetchone()["n"] == 0)
+cur.execute("""SELECT gl_account_number, mapping_status, count(*) n
+                 FROM v_r365_financial_transaction_llm
+                WHERE fiscal_year = 2026 AND period_number = 10
+                  AND gl_account_name LIKE 'Rent%%' GROUP BY 1, 2""")
+rent = {r["gl_account_number"]: r["mapping_status"] for r in cur.fetchall()}
+check("rent accounts have account-level lines in P10, all UNMAPPED",
+      "7500-11" in rent and set(rent.values()) == {"UNMAPPED"}, str(rent))
+cur.execute("SELECT count(*) n FROM v_r365_financial_transaction_llm WHERE gl_account_number = '7500-01'")
+check("account 7500-01 lines are queryable by account number", cur.fetchone()["n"] >= 0)
+conn.close()
+
+D2 = C.domains_for_relations
+check("transaction views route to r365_financial_detail",
+      D2({"v_r365_financial_transaction_llm"}) == {"r365_financial_detail"}
+      and D2({"v_r365_financial_unapproved_transaction_llm"}) == {"r365_financial_detail"})
+check("lines + summary in one query -> both financial gates",
+      D2({"v_r365_financial_transaction_llm", "v_r365_financial_period_llm"})
+      == {"r365_financial", "r365_financial_detail"})
+check("r365_financial_detail is opt-in and accepted by check_data",
+      "r365_financial_detail" not in C.ALL_DOMAINS
+      and "r365_financial_detail" in C.CHECK_DATA_TOOL["input_schema"]["properties"]["domains"]["items"]["enum"])
+qd = ("SELECT store_name, expense_amount FROM v_r365_financial_transaction_llm "
+      "WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026 AND period_number = 10 "
+      "AND accounting_date BETWEEN '2026-09-10' AND '2026-10-07'")
+try:
+    C.enforce_scope(qd, None, None, None)
+    check("drill-down without a scope is rejected", False)
+except C.ScopeError:
+    check("drill-down without a scope is rejected", True)
+md = C.enforce_scope(qd, None, *P10)
+check("P10 drill-down passes its gate with 0 reconciliation differences",
+      md["analysis_permitted"] and md["r365_financial_detail"]["reconciliation"]["differences"] == 0)
+m = C.meta_profile(None, "2023-01-01", "2023-02-01", domains=["r365_financial_detail"])
+check("drill-down before loaded history is refused",
+      not m["analysis_permitted"] and "no GL lines loaded" in m["blocking_reasons"][0])
+m = C.meta_profile(None, "2026-01-01", "2026-03-26", domains=["r365_financial_detail"])
+check("P1-P3 drill-down warns about MIGRATED_SUMMARY reduced detail",
+      any("MIGRATED_SUMMARY" in w for w in m["warnings"]))
+g = C._r365_fin_detail_gate({"available": True, "approved_lines_in_scope": 5,
+                             "reconciliation": {"differences": 2}})
+check("a reconciliation difference BLOCKS the drill-down as incomplete",
+      g[0] and "do not reconcile" in g[0][0])
+ctx = C.blocked_domain_context({"blocking_reasons": ["R365 FINANCIAL DETAIL lines do not reconcile"],
+                                "r365_financial": {"available": True},
+                                "r365_financial_detail": {"available": True}},
+                               ["r365_financial", "r365_financial_detail"])
+check("a detail failure is not attributed to the period summary",
+      ctx["r365_financial"]["trusted"] is True)
+check("a detail failure marks the detail domain untrusted",
+      ctx["r365_financial_detail"]["trusted"] is False)
+conn, cur = ro()
+for v in TXN:
+    cur.execute(f"SELECT * FROM {v} LIMIT 1")
+    names = {d.name for d in cur.description}
+    check(f"{v} has no hour / time-of-day column",
+          not names & {"hour", "local_hour", "accounting_time", "posted_at", "timestamp"})
+conn.close()
+G2 = C.R365_FINANCIAL_GUIDANCE
+for needle, what in [
+        ("DRILL-DOWN one row per GL detail line", "two grains named"),
+        ("never reconstruct lines from", "no reconstruction from summaries"),
+        ("APPROVED BY DEFAULT", "approved default"),
+        ("ONLY when the user\n    explicitly asks", "unapproved only on request"),
+        ("NOT a\n    VERIFIED <category> figure", "account-level != verified category"),
+        ("never infer hourly usage", "no hourly inference"),
+        ("MIGRATED_SUMMARY lines", "migrated history fidelity")]:
+    check(f"guidance: {what}", " ".join(needle.split()) in " ".join(G2.split()))
 
 failed = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

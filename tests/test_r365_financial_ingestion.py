@@ -178,13 +178,13 @@ check("a payload carrying a token-shaped key is rejected",
       raises(lambda: L.parse_payload(b'{"data": [], "authorization": "x"}')))
 
 
-def pages(lines, page=2, total=None, shift=False):
+def pages(lines, page=2, total=None, shift=False, unapproved=True):
     out = []
     for i in range(0, max(len(lines), 1), page):
         t = total if total is not None else len(lines)
         if shift and i > 0:
             t += 1
-        out.append((200, json.dumps({"data": lines[i:i + page],
+        out.append((200, json.dumps({"data": lines[i:i + page], "includeUnapproved": unapproved,
                                      "pagination": {"limit": page, "offset": i, "total": t}},
                                     default=str).encode()))
     return out
@@ -195,6 +195,11 @@ s = Sess(pages(LINES))
 got = I.Source("https://h", "T", session=s, sleep=lambda _: None).detail({"fiscal_year": FY})
 check("detail paging collects every line across pages", len(got) == 4 and len(s.calls) == 2)
 check("detail paging sends limit/offset", s.calls[1]["params"]["offset"] == 2)
+check("detail fetch requests include_unapproved=true (Approved AND Unapproved stored)",
+      all(c["params"]["include_unapproved"] == "true" for c in s.calls))
+s2 = Sess(pages(LINES, unapproved=False))
+check("a detail feed that ignores include_unapproved fails closed",
+      raises(lambda: I.Source("https://h", "T", session=s2, sleep=lambda _: None).detail({})))
 s = Sess(pages(LINES, shift=True))
 check("a total that changes mid-scan fails closed",
       raises(lambda: I.Source("https://h", "T", session=s, sleep=lambda _: None).detail({})))
@@ -243,7 +248,7 @@ a["data"][0]["expenseAmount"] = Decimal("100.49")
 check("unfiltered vs category summary disagreement fails closed",
       raises(lambda: plan(allp=a), L.ReconciliationError))
 c, a, li = build()
-li[0]["expenseAmount"] = Decimal("90.50")
+li[0]["expenseAmount"] = li[0]["debitAmount"] = Decimal("90.50")
 check("summary vs GL-detail disagreement fails closed",
       raises(lambda: plan(lines=li), L.ReconciliationError))
 c, a, li = build()
@@ -257,8 +262,16 @@ c, a, li = build()
 li.append(copy.deepcopy(li[0]))
 check("duplicate detail line across pages fails closed", raises(lambda: plan(lines=li)))
 c, a, li = build()
-li[1]["status"] = "Unapproved"
-check("unapproved detail line fails closed", raises(lambda: plan(lines=li)))
+li.append(line(5, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED", "999",
+               approved="Unapproved"))
+PU = plan(lines=li)
+check("unapproved line is KEPT as a transaction but excluded from summary reconciliation",
+      PU["transaction_stats"]["unapproved"] == 1 and PU["transaction_stats"]["lines"] == 5
+      and {r["account_number"]: r["expense_amount"] for r in PU["account_period_rows"]
+           if r["r365_location_id"] == A_ID}["6200-03"] == Decimal("100.50"))
+c, a, li = build()
+li[1]["status"] = "Pending"
+check("unknown line status fails closed", raises(lambda: plan(lines=li)))
 c, a, li = build()
 li[1]["fiscalYear"], li[1]["periodNumber"] = 2027, 12
 check("detail line from another period fails closed", raises(lambda: plan(lines=li)))
@@ -306,11 +319,53 @@ c["ELECTRICITY"]["dataStatus"] = "PARTIAL"
 check("source PARTIAL (open period) -> run PARTIAL", plan(cats=c)["status"] == "PARTIAL")
 
 # ---------------------------------------------------------------------------
+print("4b. transaction lines (pure)")
+T = {r["source_transaction_detail_id"]: r for r in P["transaction_rows"]}
+t1 = T["d-1"]
+check("transaction parsed: ids, type, status, account, amounts",
+      t1["source_transaction_id"] == "t-1" and t1["transaction_type"] == "APInvoice"
+      and t1["transaction_status"] == "Approved" and t1["gl_account_number"] == "6200-03"
+      and t1["gl_account_name"] == "6200-03" and t1["expense_amount"] == Decimal("100.50")
+      and t1["fiscal_year"] == FY and t1["accounting_date"] == D(2027, 12, 10))
+check("every line becomes one transaction row", len(T) == 4)
+check("debit - credit = expense (debit line)",
+      t1["debit_amount"] - t1["credit_amount"] == t1["expense_amount"])
+rev = line(6, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED", "-25.00")
+r6 = L.parse_transaction(rev, "x", (FY, PN))
+check("a credit/reversal line is negative and reduces expense",
+      r6["credit_amount"] == Decimal("25.00") and r6["expense_amount"] == Decimal("-25.00"))
+bad = copy.deepcopy(rev)
+bad["expenseAmount"] = Decimal("25.00")
+check("expenseAmount that is not debit - credit fails closed",
+      raises(lambda: L.parse_transaction(bad, "x", (FY, PN))))
+twin_a = line(7, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED", "50", tx="T")
+twin_b = line(8, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED", "50", tx="T")
+tw = L.plan_transactions([twin_a, twin_b], MAPPING, (FY, PN))
+check("identical date/amount/account/store lines with different detailIds are BOTH kept",
+      len(tw) == 2 and {r["source_transaction_detail_id"] for r in tw} == {"d-7", "d-8"})
+split_a = line(9, A_ID, "LCF Airtex", "acc-x", "7000", "UNMAPPED", "UNMAPPED", "10", tx="HDR")
+split_b = line(10, B_ID, "LCF Beaumont", "acc-x", "7000", "UNMAPPED", "UNMAPPED", "15", tx="HDR")
+sp = {r["source_transaction_detail_id"]: r["establishment_id"]
+      for r in L.plan_transactions([split_a, split_b], MAPPING, (FY, PN))}
+check("one transaction spanning two stores maps each LINE to its own store",
+      sp == {"d-9": 32, "d-10": 14})
+check("non-store entity line keeps a NULL establishment_id", T["d-4"]["establishment_id"] is None)
+check("category/mapping retained per line: VERIFIED vs CANDIDATE vs UNMAPPED",
+      (T["d-1"]["mapping_status"], T["d-3"]["mapping_status"], T["d-2"]["mapping_status"])
+      == ("VERIFIED", "CANDIDATE", "UNMAPPED") and T["d-3"]["analytics_category"] == "GAS")
+check("line from another period fails closed",
+      raises(lambda: L.parse_transaction(line(11, A_ID, "x", "a", "1", "U", "UNMAPPED", "1",
+                                              fy=2027, pn=12), "x", (FY, PN))))
+
+# ---------------------------------------------------------------------------
 print("5. fiscal periods / history")
 cal = {(2026, 9): (D(2026, 8, 13), D(2026, 9, 9)), (2026, 10): (D(2026, 9, 10), D(2026, 10, 7)),
        (2026, 11): (D(2026, 10, 8), D(2026, 11, 4)), (2026, 12): (D(2026, 11, 5), D(2026, 12, 2))}
-check("scheduled (weekday): current + previous period",
-      I.scheduled_periods(cal, D(2026, 10, 16)) == [(2026, 10), (2026, 11)])
+check("scheduled (weekday): every period touching the last 42 days (> 5-week source repair)",
+      I.scheduled_periods(cal, D(2026, 10, 16)) == [(2026, 9), (2026, 10), (2026, 11)])
+check("scheduled overlap drops a period once it ends > 42 days ago",
+      I.scheduled_periods(cal, D(2026, 10, 25)) == [(2026, 10), (2026, 11)])
+check("overlap is at least the source's 5-week repair window", I.OVERLAP_DAYS >= 35)
 check("scheduled (Monday repair): every elapsed period of current/previous FY",
       I.scheduled_periods(cal, D(2026, 10, 19)) == [(2026, 9), (2026, 10), (2026, 11)])
 check("future periods are never targeted",
@@ -397,13 +452,68 @@ try:
                    " max_accounting_date, ingest_run_id) VALUES ('z','a','CM-2025-01',"
                    "'CALENDAR_MONTH',2026,1,'2025-01-01','2025-01-31','x','1',1,1,0,0,1,1,"
                    "'2025-01-02','2025-01-02',%s)", (run_id,)))
+
+    # --- transaction table: UPSERT by source detail id
+    cur.execute("DELETE FROM r365_financial_transaction WHERE fiscal_year = %s "
+                "AND period_number = %s", (FY, PN))
+    c, a, li = build()
+    li.append(line(5, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED",
+                   "999", approved="Unapproved"))
+    t1 = L.write_period(conn, run_id, plan(lines=li), fetch)["transactions"]
+    t2 = L.write_period(conn, run_id, plan(lines=li), fetch)["transactions"]
+    cur.execute("SELECT count(*), count(DISTINCT source_transaction_detail_id) FROM "
+                "r365_financial_transaction WHERE fiscal_year = %s AND period_number = %s", (FY, PN))
+    n, nd = cur.fetchone()
+    check("transactions: first sync inserts every line (Approved + Unapproved)",
+          t1[0] == 5 and t1[1] == 5 and n == 5, str(t1))
+    check("transactions: re-sync creates no duplicates and changes nothing",
+          t2[1] == 0 and t2[2] == 0 and n == nd == 5, str(t2))
+    li2 = copy.deepcopy(li)
+    li2[4]["status"] = "Approved"            # the unapproved line gets approved...
+    li2[4]["expenseAmount"] = li2[4]["debitAmount"] = Decimal("100")  # ...at a new amount
+    c2 = copy.deepcopy(c)
+    c2["ELECTRICITY"]["data"][0]["expenseAmount"] = Decimal("200.50")
+    a2 = copy.deepcopy(a)
+    a2["data"][0]["expenseAmount"] = Decimal("200.50")
+    li2.append(line(6, A_ID, "LCF Airtex", "acc-elec", "6200-03", "ELECTRICITY", "VERIFIED",
+                    "-25.00"))                # a reversal
+    c2["ELECTRICITY"]["data"][0]["expenseAmount"] = Decimal("175.50")
+    a2["data"][0]["expenseAmount"] = Decimal("175.50")
+    t3 = L.write_period(conn, run_id, plan(cats=c2, allp=a2, lines=li2), fetch)["transactions"]
+    cur.execute("SELECT transaction_status, expense_amount FROM r365_financial_transaction "
+                "WHERE source_transaction_detail_id = 'd-5'")
+    check("transactions: changed status/amount is UPDATED in place (same detail id)",
+          cur.fetchone() == ("Approved", Decimal("100")) and t3[1] == 2, str(t3))
+    cur.execute("SELECT expense_amount FROM r365_financial_transaction "
+                "WHERE source_transaction_detail_id = 'd-6'")
+    check("transactions: reversal line preserved as a negative line", cur.fetchone()[0] == -25)
+    cur.execute("SELECT sum(expense_amount) FROM r365_financial_transaction WHERE fiscal_year = %s "
+                "AND period_number = %s AND mapping_status = 'VERIFIED' "
+                "AND transaction_status = 'Approved' AND r365_location_id = %s", (FY, PN, A_ID))
+    check("transactions: Approved VERIFIED lines still add up to the summary after corrections",
+          cur.fetchone()[0] == Decimal("175.50"))
+    li3 = [x for x in li2 if x["detailId"] != "d-4"]
+    a3 = copy.deepcopy(a2)
+    a3["data"] = a3["data"][:2]
+    a3["pagination"]["returned"] = 2
+    t4 = L.write_period(conn, run_id, plan(cats=c2, allp=a3, lines=li3), fetch)["transactions"]
+    check("transactions: a line the source no longer publishes is removed", t4[2] == 1, str(t4))
+    check("DB rejects a transaction violating expense = debit - credit",
+          violates("INSERT INTO r365_financial_transaction (source_transaction_detail_id, "
+                   "source_transaction_id, transaction_type, transaction_status, r365_location_id,"
+                   " location_name, accounting_date, gl_account_id, gl_account_number, "
+                   "gl_account_name, mapping_status, debit_amount, credit_amount, expense_amount,"
+                   " source_class, source_fetched_at, ingest_run_id) VALUES ('zz','t','J',"
+                   "'Approved','l','x','2025-01-01','g','1','n','UNMAPPED',10,0,5,"
+                   "'TRANSACTION_DETAIL',now(),%s)", (run_id,)))
 finally:
     conn.rollback()
     conn.close()
 
 conn = L.connect()
 cur = conn.cursor()
-cur.execute("SELECT count(*) FROM r365_financial_period_expense WHERE fiscal_year = 2027")
+cur.execute("SELECT (SELECT count(*) FROM r365_financial_period_expense WHERE fiscal_year = 2027)"
+            " + (SELECT count(*) FROM r365_financial_transaction WHERE fiscal_year = 2027)")
 check("rollback left no test rows behind", cur.fetchone()[0] == 0)
 conn.close()
 
