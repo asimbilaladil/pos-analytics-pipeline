@@ -220,8 +220,8 @@ check("unknown domain name never drops r365_financial",
 print("8. trust gate")
 m = C.meta_profile(None, *P10, domains=["r365_financial"])
 check("P10 scope passes the financial gate", m["analysis_permitted"], str(m["blocking_reasons"]))
-check("P10 gate warns about the 3 no-posting stores, as NOT $0",
-      any("NO POSTING" in w and "NOT $0" in w and "LCF Shepherd" in w for w in m["warnings"]))
+check("P10 gate warns about the 3 no-posting stores, as never $0",
+      any("NO POSTING" in w and "never $0" in w and "LCF Shepherd" in w for w in m["warnings"]))
 check("financial-only scope did not run Revel reconciliation",
       "reconciliation" not in m and m["domains"] == ["r365_financial"])
 m = C.meta_profile(None, "2026-09-10", "2026-09-17", domains=["r365_financial"])
@@ -299,7 +299,7 @@ G = C.R365_FINANCIAL_GUIDANCE
 check("financial guidance is in the system prompt", G in s)
 for needle, what in [
         ("NEVER derive or estimate an expense from sales", "never derive expense from sales"),
-        ("It is unknown, NOT $0", "missing is not zero"),
+        ("never \"$0\", \"zero expense\"", "missing is not zero"),
         ("NO HOURS, NO USAGE TIMES", "no hourly financial data"),
         ("are NOT electricity", "gas/water/etc. not electricity"),
         ("no VERIFIED <category>", "unverified category answer (rent)"),
@@ -462,6 +462,184 @@ for needle, what in [
         ("never infer hourly usage", "no hourly inference"),
         ("MIGRATED_SUMMARY lines", "migrated history fidelity")]:
     check(f"guidance: {what}", " ".join(needle.split()) in " ".join(G2.split()))
+
+# ---------------------------------------------------------------------------
+print("13. utility posting semantics (no posting != $0, billing cadence)")
+G3 = " ".join(C.R365_FINANCIAL_GUIDANCE.split())
+for needle, what in [
+        ('"NO POSTING" -- never "$0", "zero expense" or "nothing spent"', "no posting is never $0"),
+        ('NOT "missing source data" either', "no posting is not missing source data"),
+        ("source_data_status PARTIAL or latest_refresh_failed", "incomplete only when coverage says so"),
+        ("Never call it consumption, usage, meter reading", "postings, not consumption"),
+        ("13 fiscal periods of 28 days", "13-period vs monthly billing caveat"),
+        ("store-level swings can be posting timing", "period comparison timing caveat"),
+        ("Its prior bill posted Sep 9, the final day of P9, and the next bill posted "
+         "Oct 9 in P11, so P10 fell between two monthly postings", "Shepherd P10 explanation"),
+        ("The August bill posted Aug 12 in P8 and the next bill Sep 17 in P10, so the "
+         "apparent P9 gap is posting timing rather than evidence of zero usage",
+         "Beaumont P9 explanation"),
+        ('"<Month> electricity posting not yet present in R365"', "not-yet-present wording"),
+        ("never predict its date or amount", "no bill prediction"),
+        ('"No identifiable electricity posting was found in R365 for <store>."',
+         "no identifiable posting wording"),
+        ("bundled into rent, paid by the landlord, included in CAM",
+         "no landlord / rent / CAM speculation"),
+        ("Do not offer those as possible explanations either", "no speculative alternatives"),
+        ('never "$0 (no posting)"', "no '$0 (no posting)' phrasing"),
+        ('latest posting Sep 8 -> "October electricity posting not yet present in R365"',
+         "Nederland October wording"),
+        ('not "late", "overdue" or "missed bill"', "no late/overdue claims"),
+        ('not even as an "e.g." of what you cannot say', "no example speculation"),
+        ('never "likely" / "very likely" on no evidence', "no unsupported 'likely' timing claims"),
+        ("Never apply the timing caveat to a store with NO IDENTIFIABLE POSTING",
+         "timing caveat not applied to Downtown"),
+        ("do NOT rank on one 28-day fiscal period", "rankings use a longer window"),
+        ("then add the posting-timing caveat", "explicit-period ranking keeps the caveat"),
+        ("never use them to predict a bill, to estimate an expense for a no-posting period",
+         "cadence is descriptive only")]:
+    check(f"guidance: {what}", " ".join(needle.split()) in G3, needle[:60])
+check("guidance no longer says no-posting stores are 'unknown'",
+      "It is unknown, NOT $0" not in G3)
+
+# every SQL pattern in the new section validates, passes the scope gate and runs as laynes_ro
+blocks, cur_block = [], None
+for line in C.R365_FINANCIAL_GUIDANCE.splitlines():
+    if cur_block is None and line.startswith("        ") and \
+            not line.startswith("         ") and line.strip().split(" ")[0] in ("SELECT", "WITH"):
+        cur_block = [line]
+        blocks.append(cur_block)
+    elif cur_block is not None and line.startswith("        "):
+        cur_block.append(line)
+    else:
+        cur_block = None
+patterns = {"WHERE analytics_category = 'ELECTRICITY' AND establishment_id = 15":
+                ("posting dates", 15, "2026-08-13", "2026-10-17"),
+            "total_6m": ("6-month ranking", None, "2026-04-01", "2026-10-01"),
+            "gap_days": ("cadence", None, "2026-03-26", "2026-10-17")}
+found = {}
+conn, cur = ro()
+for b in blocks:
+    sql = "\n".join(b)
+    for key, (name, est, ps, pe) in patterns.items():
+        if key in sql:
+            try:
+                C._validate(sql)
+                meta = C.enforce_scope(sql, est, ps, pe)
+                cur.execute(sql)
+                found[name] = cur.fetchall()
+                check(f"{name} pattern validates, passes the scope gate and runs",
+                      meta and meta["analysis_permitted"], str(meta and meta["blocking_reasons"]))
+            except Exception as e:  # noqa: BLE001
+                check(f"{name} pattern validates, passes the scope gate and runs", False,
+                      f"{type(e).__name__}: {e}")
+check("all three new SQL patterns found in guidance", set(found) == {
+    "posting dates", "6-month ranking", "cadence"}, str(sorted(found)))
+
+def elec_lines(est, lo, hi):
+    cur.execute("SELECT accounting_date, period_number, expense_amount FROM "
+                "v_r365_financial_transaction_llm WHERE analytics_category = 'ELECTRICITY' "
+                "AND establishment_id = %s AND accounting_date BETWEEN %s AND %s "
+                "ORDER BY accounting_date", (est, lo, hi))
+    return [(str(r["accounting_date"]), r["period_number"], r["expense_amount"])
+            for r in cur.fetchall()]
+
+def period_row(est, pn):
+    cur.execute("SELECT has_posting, expense_amount, data_status FROM v_r365_financial_period_llm "
+                "WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026 "
+                "AND period_number = %s AND establishment_id = %s", (pn, est))
+    return cur.fetchone()
+
+# Shepherd (15): P10 sits between the Sep 9 (P9) and Oct 9 (P11) bills
+r = period_row(15, 10)
+check("Shepherd P10 is a NO_ACTIVITY row with NULL amount (not $0)",
+      r and r["has_posting"] is False and r["expense_amount"] is None
+      and r["data_status"] == "NO_ACTIVITY", str(r))
+check("Shepherd: prior bill Sep 9 in P9, next Oct 9 in P11, nothing in P10",
+      elec_lines(15, "2026-09-01", "2026-10-16") ==
+      [("2026-09-09", 9, Decimal("2221.32")), ("2026-10-09", 11, Decimal("1955.84"))])
+# Beaumont (14): P9 sits between Aug 12 (P8) and Sep 17 (P10)
+r = period_row(14, 9)
+check("Beaumont P9 is NO POSTING (NULL, not $0)",
+      r and r["has_posting"] is False and r["expense_amount"] is None, str(r))
+check("Beaumont: Aug 12 in P8, Sep 17 in P10 ($2,238.88), nothing in P9",
+      elec_lines(14, "2026-08-01", "2026-10-07") ==
+      [("2026-08-12", 8, Decimal("2404.12")), ("2026-09-17", 10, Decimal("2238.88"))])
+# Rosenberg (40): same shape as Beaumont
+check("Rosenberg: Aug 12 in P8, Sep 21 in P10, nothing in P9",
+      elec_lines(40, "2026-08-01", "2026-10-07") ==
+      [("2026-08-12", 8, Decimal("2169.87")), ("2026-09-21", 10, Decimal("2174.85"))])
+# Nederland (26): as of 2026-10-16 the October posting is not yet present, and
+# its own cadence says it normally would be (days since latest > longest gap)
+cur.execute("""WITH d AS (SELECT accounting_date FROM v_r365_financial_transaction_llm
+                 WHERE analytics_category = 'ELECTRICITY' AND establishment_id = 26
+                   AND source_quality = 'TRANSACTION_DETAIL'
+                   AND accounting_date BETWEEN '2026-03-26' AND '2026-10-16'
+                 GROUP BY accounting_date),
+               g AS (SELECT accounting_date, accounting_date - lag(accounting_date)
+                        OVER (ORDER BY accounting_date) AS gap FROM d)
+               SELECT max(accounting_date) AS latest, max(gap) AS longest,
+                      DATE '2026-10-16' - max(accounting_date) AS since FROM g""")
+r = cur.fetchone()
+check("Nederland: latest posting Sep 8, none since (as of 2026-10-16)",
+      str(r["latest"]) == "2026-09-08", str(r))
+check("Nederland: days since latest exceeds its longest gap -> 'not yet present' wording applies",
+      r["since"] > r["longest"], f"since={r['since']} longest={r['longest']}")
+# Downtown Houston (48): no electricity line in the entire loaded history
+cur.execute("SELECT count(*) AS n FROM v_r365_financial_transaction_llm "
+            "WHERE analytics_category = 'ELECTRICITY' AND establishment_id = 48 "
+            "AND accounting_date BETWEEN '2024-04-07' AND '2026-10-16'")
+check("Downtown Houston has no identifiable electricity posting in loaded history",
+      cur.fetchone()["n"] == 0)
+cur.execute("SELECT count(*) AS n FROM v_r365_financial_period_llm WHERE establishment_id = 48 "
+            "AND analytics_category = 'ELECTRICITY' AND expense_amount IS NOT NULL")
+check("Downtown Houston never shows a $ figure (incl. $0) in the period summary",
+      cur.fetchone()["n"] == 0)
+cur.execute("SELECT count(*) AS n FROM v_r365_financial_period_llm WHERE "
+            "analytics_category = 'ELECTRICITY' AND expense_amount = 0")
+check("no electricity period row anywhere is stored as $0", cur.fetchone()["n"] == 0)
+rank = {x["store_name"]: x for x in found.get("6-month ranking", [])}
+check("6-month ranking excludes Downtown Houston (no posting) rather than ranking it $0",
+      "LCF Downtown Houston" not in rank and len(rank) == 11, str(sorted(rank)))
+cad = {x["store_name"]: x for x in found.get("cadence", [])}
+check("cadence: Shepherd postings roughly monthly (typical 25-35 days)",
+      "LCF Shepherd" in cad and 25 <= cad["LCF Shepherd"]["typical_days_between"] <= 35)
+conn.close()
+
+m = C.meta_profile(None, *P10, domains=["r365_financial"])
+w = " ".join(m["warnings"])
+check("P10 gate warning names the no-posting stores as NO POSTING",
+      "NO POSTING" in w and "LCF Shepherd" in w and "LCF Downtown Houston" in w, w[:200])
+check("P10 gate warning says not $0 and not missing source data",
+      "never $0" in w and "not missing source data" in w)
+check("P10 gate warning no longer calls them 'unknown'", "These are unknown" not in w)
+check("P10 profile marks Downtown Houston as NO IDENTIFIABLE POSTING (data-driven)",
+      m["r365_financial"]["no_identifiable_posting"] == ["LCF Downtown Houston ELECTRICITY"],
+      str(m["r365_financial"].get("no_identifiable_posting")))
+check("P10 warning: Downtown gets the no-identifiable-posting sentence, not the timing caveat",
+      any("NO IDENTIFIABLE POSTING" in x and "LCF Downtown Houston" in x
+          and "do NOT attribute it to billing timing" in x and "LCF Shepherd" not in x
+          for x in m["warnings"]))
+m9 = C.meta_profile(None, *P9, domains=["r365_financial"])
+check("P9: Beaumont/Rosenberg are timing gaps (posted before), only Downtown is unidentified",
+      m9["r365_financial"]["no_identifiable_posting"] == ["LCF Downtown Houston ELECTRICITY"]
+      and "LCF Beaumont P9 ELECTRICITY" in m9["r365_financial"]["no_posting_in_scope"])
+note = C.r365_fin_result_note(C.enforce_scope(
+    "SELECT store_name, expense_amount FROM v_r365_financial_period_llm WHERE "
+    "analytics_category = 'ELECTRICITY' AND period_start = '2026-09-10'", None, *P10))
+check("run_sql result note (no check_data needed) lists P10 no-posting stores as NO POSTING",
+      note and "NO POSTING (never $0" in note and "LCF Shepherd P10" in note, str(note)[:160])
+check("run_sql result note marks Downtown as no identifiable posting, no timing caveat",
+      note and "NO IDENTIFIABLE POSTING in the whole loaded GL history: LCF Downtown Houston"
+      in note and "do NOT apply the posting-timing caveat" in note)
+check("no note when every store has a posting / non-financial scope",
+      C.r365_fin_result_note({"r365_financial": {"no_posting_in_scope": []}}) is None
+      and C.r365_fin_result_note(None) is None)
+g = C._r365_fin_gate({"available": True, "calendar_periods_in_scope": 1,
+                      "scope_is_whole_periods": True, "periods_in_scope": [],
+                      "no_posting_in_scope": ["X P10 ELECTRICITY"],
+                      "no_identifiable_posting": []})
+check("a store that has posted before gets no 'no identifiable posting' warning",
+      not any("NO IDENTIFIABLE POSTING" in x for x in g[1]))
 
 failed = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
