@@ -1,0 +1,26 @@
+[Unit]
+Description=R365 weekly canonical ingest, Thursday 20:00 America/Chicago
+
+[Timer]
+# The timezone MUST be part of the OnCalendar EXPRESSION (systemd 252+). A
+# `Timezone=` key in [Timer] does not exist and is silently ignored -- see
+# hme-daily-ingest.timer and laynes-loyalty-labor-sync.timer.
+#
+# Verify after any change with:  systemd-analyze calendar --iterations=2 \
+#     'Thu *-*-* 20:00:00 America/Chicago'
+#   during CDT the elapse must read Fri 01:00 UTC
+#   during CST the elapse must read Fri 02:00 UTC
+#
+# Thursday evening is the first point after the R365 week (Thu->Wed) closes
+# with a full business day of settling. The run re-fetches the latest TWO
+# completed weeks, so a figure adjusted after first publication is repaired the
+# following Thursday.
+#
+# No retry timer yet, on purpose: first observe whether Thursday-20:00 data is
+# consistently settled (r365_ingest_run.status / daily_rows_changed on the
+# overlap week). If PARTIAL weeks appear at 20:00, add a retry with evidence.
+OnCalendar=Thu *-*-* 20:00:00 America/Chicago
+Persistent=true
+
+[Install]
+WantedBy=timers.target

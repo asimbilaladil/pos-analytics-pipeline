@@ -385,10 +385,11 @@ substitute a proxy or derive an estimate:
       order's elapsed time is not derivable. NOTE: order_items_v2.kitchen_seconds
       IS available and is a real per-item kitchen measure — use it, and call it
       kitchen time, never "service speed" or "drive-thru time".
-  * comp vs discount separation
+  * comp vs discount separation IN REVEL
       Both flow through discount_total_amount; discount_reason is free text and
-      is empty on effectively all orders. You can report total discounts, not
-      the comp share of them.
+      is empty on effectively all orders. From Revel you can report total
+      discounts, not the comp share of them. (R365 DOES report discounts, comps
+      and coupons separately per store/day -- see R365 WEEKLY-REPORT DATA.)
   * NOT LISTED HERE: category / product-category analysis. It IS available —
       Revel's Product.category is the authoritative source and the mapping is
       maintained. Do NOT refuse category questions; follow CATEGORY RULES for
@@ -584,6 +585,9 @@ LABOUR -- v_labor_hourly_context (est x business_date x local_hour) and
 v_labor_daily_context (est x business_date). Never join labour to individual
 orders; relate it only by establishment_id + business_date (+ local_hour).
 
+  * (The rules in this LABOUR section describe the v_labor_* timesheet views
+    ONLY. They do not apply to R365 labor_hours / labor_cost -- never attach
+    the break or estimate caveats below to R365 figures.)
   * BREAKS ARE NOT RECORDED. break_data_status is always 'unavailable'.
     labor_hours is ELAPSED CLOCKED TIME (clock_out - clock_in) and INCLUDES any
     unpaid break actually taken, so it OVERSTATES paid-worked time by an unknown
@@ -600,13 +604,17 @@ orders; relate it only by establishment_id + business_date (+ local_hour).
     midnight-crossing shift on both days; shift_overlap_count (hourly) is a
     staffing level, not a shift count. To count shifts worked, use
     shifts_started_count. Summing the other two overstates.
-  * SALES VS LABOUR uses REAL orders and REAL sales only:
+  * DAY / WEEK / PERIOD labour % and labour cost come from R365 (see R365
+    WEEKLY-REPORT DATA). The estimate below is for HOURLY questions, staffing
+    detail, or when the user asks for the timesheet-based figure.
+  * SALES VS LABOUR (timesheet estimate) uses REAL orders and REAL sales only:
         labour % of sales   = estimated_labor_cost / REAL final_total x 100
         sales per labour hr = REAL final_total / labor_hours
         orders per labour hr= REAL order count  / labor_hours
     Name the denominator every time, and label the cost as estimated.
-  * NEVER DECLARE OVER- OR UNDERSTAFFING. No staffing target, sales forecast or
-    labour standard exists in this data, so "overstaffed" is not derivable.
+  * NEVER DECLARE OVER- OR UNDERSTAFFING. No staffing target or labour standard
+    exists in this data (R365 carries a daily SALES forecast, which is not a
+    staffing target), so "overstaffed" is not derivable.
     Quantify instead: labour hours and estimated cost against sales and orders
     for the same hour, and use wording like "hours with relatively high labour
     intensity (labour cost per sales dollar)".
@@ -956,6 +964,170 @@ A: Numbered list, qty and revenue each.
 # Keeping them separate is not cosmetic: it is what lets a feature be
 # reviewed, tested and committed on its own.
 
+R365_GUIDANCE = """\
+R365 WEEKLY-REPORT DATA (migrations 54/55). Restaurant365 figures for all 12
+stores, VERIFIED-mapped to establishment_id. Loaded from 2026-08-13 onward
+ONLY, once a week (Thursday 20:00 America/Chicago). Grain: store x day and the
+OFFICIAL store x week. Weeks run Thursday -> Wednesday, America/Chicago.
+
+v_r365_store_daily_llm    — establishment_id x business_date
+    store_name, week_start, fiscal_year, period_number, period_label, day_status,
+    net_sales, gross_sales, guest_count, check_count, avg_check, avg_per_guest,
+    labor_hours, labor_cost, labor_pct, sales_per_labor_hour,
+    total_deposit, expected_cash (daily only), paid_in, paid_out, over_short,
+    discounts, comps, coupons, total_discounts, discount_pct,
+    gift_cards_redeemed, gift_cards_sold, tips_declared, credit_card_tips,
+    void_count, void_amount,
+    forecasted_sales, forecast_sales_base, sales_vs_forecast_amount,
+    sales_vs_forecast_pct
+v_r365_store_weekly_llm   — establishment_id x week_start (OFFICIAL weekly row)
+    store_name, week_start, week_end, fiscal_year, period_number, period_label,
+    week_status, days_with_data, and the same metrics (no expected_cash)
+v_r365_store_period_llm   — establishment_id x AYG fiscal period, rolled up from
+    the official weekly rows: start_date, end_date, period_status,
+    weeks_in_period, weeks_loaded, weeks_complete, period_fully_covered,
+    the additive totals, and ratios recomputed from those totals
+v_r365_completeness_llm   — one row per loaded week: week_start, week_end,
+    period_label, week_status (COMPLETE / PARTIAL), source_complete,
+    reconciliation_ok, expected/observed_store_count, stores_with_full_week,
+    missing_store_days, closed_store_days, pre_opening_store_days,
+    latest_refresh_failed. Reference data: no scope declaration needed.
+
+WHICH VIEW: daily questions -> v_r365_store_daily_llm. Weekly questions ->
+v_r365_store_weekly_llm (never rebuild a week by summing daily rows; the weekly
+row is official). Fiscal periods -> v_r365_store_period_llm (never sum four
+weeks by hand). Coverage/trust -> v_r365_completeness_llm.
+
+SOURCE AUTHORITY:
+  * R365 is authoritative for its reporting metrics: net/gross sales, guests,
+    checks, avg check, avg per guest, labour hours/cost/%, sales per labour
+    hour, deposits, over/short, paid in/out, discounts/comps/coupons, gift
+    cards, tips, voids and sales forecasts. Use R365 when the question names
+    R365, or asks for a metric only R365 carries (forecast, deposits,
+    over/short, paid in/out, gift cards, tips, comps/coupons split, voids).
+  * LABOUR % / LABOUR COST / SALES PER LABOUR HOUR at day, week or fiscal-
+    period grain come from R365 (labour cost and the sales it is measured
+    against, from one source) -- e.g. "rank stores by labour % last week",
+    "compare sales and labour in P10". Say the figures are R365's.
+  * Revel stays authoritative for menu items, item-level sales, individual POS
+    orders, modifiers, payments and hourly/daypart POS detail. HME stays
+    authoritative for drive-thru cars, lane timing, goals and outliers. The
+    v_labor_* views (estimated cost from Revel timesheets) remain the source for
+    HOURLY staffing, shifts and employee counts, which R365 does not have.
+    R365 labor_cost is R365's own figure: label it "R365 labour cost" and never
+    mix it with estimated_labor_cost in one number.
+  * Other questions that do not name R365 (plain sales, orders, AOV, items,
+    drive-thru) keep their existing source. Do not switch them to R365 unasked.
+
+R365 DOES NOT HAVE menu items, hours/dayparts, individual orders or individual
+employees. Its finest grain is store x DAY. Asked for R365 by item, by hour or
+by employee: say R365 has no such detail and do not approximate it from daily
+figures. If Revel can answer the item or hourly question, offer or give the
+Revel answer, labelled as Revel.
+
+"LAST WEEK" FOR AN R365 QUESTION = the latest COMPLETE R365 week, a full
+Thursday -> Wednesday week, not a rolling seven days and never the current
+in-progress week. Resolve it first, without declaring a scope:
+    SELECT week_start, week_end, week_status FROM v_r365_completeness_llm
+    WHERE week_status = 'COMPLETE' ORDER BY week_start DESC LIMIT 1
+then query with period_start = week_start, period_end_exclusive = week_end + 1
+and the literal WHERE week_start = '<week_start>'. State the dates.
+
+RATIOS — the views already give each ROW's ratio in percentage points (20.5 =
+20.5%). NULL means undefined (zero denominator) or no forecast: report it as
+"n/a", never 0%. For ANY multi-store, multi-day or multi-week figure, NEVER
+average or sum a ratio column; recompute it from summed parts:
+    avg_check            = SUM(net_sales) / NULLIF(SUM(check_count), 0)
+    avg_per_guest        = SUM(net_sales) / NULLIF(SUM(guest_count), 0)
+    labor_pct            = SUM(labor_cost) / NULLIF(SUM(net_sales), 0) * 100
+    sales_per_labor_hour = SUM(net_sales) / NULLIF(SUM(labor_hours), 0)
+    discount_pct         = SUM(total_discounts) / NULLIF(SUM(net_sales), 0) * 100
+Only an explicitly requested UNWEIGHTED store average may average store ratios,
+and it must be labelled as such.
+NETWORK TOTALS COME FROM SQL. When you report a network total or network ratio
+next to a by-store table, compute it in SQL -- preferably in the SAME query as a
+UNION ALL total row, so it is in hand even if a later query is blocked -- never
+add up the store rows yourself. Pattern for any by-store R365 ranking:
+    SELECT store_name, net_sales, labor_cost,
+           labor_cost / NULLIF(net_sales, 0) * 100 AS labor_pct
+      FROM v_r365_store_weekly_llm WHERE week_start = '2026-10-08'
+    UNION ALL
+    SELECT 'NETWORK TOTAL', SUM(net_sales), SUM(labor_cost),
+           SUM(labor_cost) / NULLIF(SUM(net_sales), 0) * 100
+      FROM v_r365_store_weekly_llm WHERE week_start = '2026-10-08'
+Quote the NETWORK TOTAL row exactly as returned.
+
+DATES YOU STATE: an R365 week always starts on a THURSDAY. Quote week_start /
+week_end exactly as read from the data or from the VERIFIED CALENDAR -- never
+recompute or recall them, even in a closing offer.
+
+LABOUR DEFINITIONS: R365 labor_hours and labor_cost are R365's own figures.
+Call them "R365 labour hours" / "R365 labour cost". Do not call them payroll,
+and do not attach the timesheet caveats (unrecorded breaks, hours x wage
+estimate) to them -- those describe the v_labor_* views, not R365.
+
+FORECAST — forecasted_sales is NULL where no forecast was entered (R365 sends 0
+as a placeholder; the views convert it). A NULL-forecast store/day is NOT a 0
+forecast and neither met nor missed forecast: list it as "no forecast". The
+variance compares ONLY forecast-covered sales:
+    sales_vs_forecast_amount = SUM(forecast_sales_base) - SUM(forecasted_sales)
+    sales_vs_forecast_pct    = (SUM(forecast_sales_base) - SUM(forecasted_sales))
+                               / NULLIF(SUM(forecasted_sales), 0) * 100
+Never use SUM(net_sales) - SUM(forecasted_sales): stores or days without a
+forecast would count as a huge beat. "Missed forecast" = sales_vs_forecast_amount
+< 0. Always say which stores had no forecast.
+
+DAY STATUS — day_status NORMAL / CLOSED / PRE_OPENING. CLOSED and PRE_OPENING
+are genuine zero-trading rows (e.g. LCF Beaumont 2026-09-03 CLOSED). Mention
+them, and exclude them from "typical day" or per-operating-day comparisons. A
+day with NO row is missing data: unknown, never zero.
+
+TRUST — check_data with domains ['r365'] (or the run_sql scope gate) reads
+v_r365_completeness_llm. week_status PARTIAL means stores/days are missing or
+daily sums did not reconcile to the official week: exclude or label it. If the
+requested range runs past the latest loaded date or before 2026-08-13, answer
+for the covered dates only and say the coverage is partial. A store missing
+from R365 is unknown, not zero.
+
+FISCAL PERIODS — each AYG period is four R365 weeks. For a period query, filter
+v_r365_store_period_llm by fiscal_year and period_number AND the literal
+start_date (the scope gate needs a date literal), declaring
+period_start = start_date and period_end_exclusive = end_date + 1:
+    SELECT store_name, net_sales, labor_pct, sales_vs_forecast_pct,
+           weeks_loaded, period_fully_covered
+    FROM v_r365_store_period_llm
+    WHERE fiscal_year = 2026 AND period_number = 10 AND start_date = '2026-09-10'
+For a network total, SUM the additive columns of the period view and recompute
+the ratios as above. period_fully_covered = false (e.g. the CURRENT period)
+means partial: say how many weeks are loaded and compare it only against equal-
+length windows of other periods (weekly view), never against full-period totals.
+
+CROSS-SOURCE — join only on establishment_id, never on store name.
+  * ORDER: fetch the R365 side FIRST, in its own run_sql on the R365 views
+    alone, then fetch the other source. Each source keeps its own trust gate;
+    if the other source then fails its gate, the R365 figures you already have
+    are still a trusted, answerable part -- report them, and say plainly why
+    the comparison itself could not be made. Do not front-load one check_data
+    call covering both sources before you have the R365 figures.
+  * R365 daily vs HME or labour: establishment_id + business_date.
+  * R365 WEEKLY vs HME: do NOT join HME on week_start. Aggregate
+    v_hme_store_daily_llm over business_date BETWEEN the R365 week_start and
+    week_end per establishment_id, then join to the weekly R365 row. HME cars
+    are lane vehicle observations, not POS orders or R365 checks.
+  * R365 vs Revel sales: the like-for-like Revel figure is REAL pre-tax
+    subtotal, SUM(subtotal) FROM v_orders_classified WHERE txn_class = 'REAL'
+    over the same business dates (final_total and total_revenue include tax).
+    Label the two "R365 net sales" and "Revel REAL subtotal (pre-tax)", show the
+    absolute and % difference, and do not call either wrong: R365 has run about
+    1-3% above the Revel REAL subtotal per store. The CAUSE of that gap is not
+    established in this data -- do not offer reasons (gift cards, fees,
+    recognition timing, etc.); say only that the two systems measure sales
+    differently and the gap is consistent with the usual range. Use R365 for
+    R365 reporting questions and Revel for POS detail.
+  * Correlation is not causation: say "associated with", never "caused".
+"""
+
+
 BUSINESS_PERIOD_GUIDANCE = """\
 FISCAL PERIODS ("P8", "period nine", "P10-to-date", "this period").
 AYG runs 13 periods of 28 days per fiscal year, NOT calendar months. Resolve
@@ -1137,6 +1309,8 @@ HME rules — these are not stylistic, they change what is true:
   * This never relaxes availability: if the user asked about a date that is not
     loaded, the analysis is still blocked. Only the EXPLANATION changes —
     "awaiting its scheduled ingestion" rather than "the source is stale".
+
+{R365_GUIDANCE}
 {BUSINESS_PERIOD_GUIDANCE}
 {GLOSSARY}
 {DATA_NOTES}
@@ -1303,6 +1477,13 @@ _ALLOWED_RELATIONS = frozenset({
     # drive_thru_cars are lane vehicle observations, NEVER POS orders.
     "v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
     "v_hme_goal_history_llm", "v_hme_day_completeness_llm",
+    # R365 weekly-report facts (migrations 54/55). VERIFIED-mapping-gated views
+    # over tables laynes_ro cannot read: r365_store_daily, r365_store_weekly,
+    # r365_store_mapping and r365_ingest_run stay denied, so the R365 store id,
+    # source store names, run errors and archive paths never cross this
+    # boundary. Percentages are 0-100; NULL means undefined or no forecast.
+    "v_r365_store_daily_llm", "v_r365_store_weekly_llm",
+    "v_r365_store_period_llm", "v_r365_completeness_llm",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1502,13 +1683,17 @@ CHECK_DATA_TOOL = {
             "domains": {
                 "type": "array",
                 "items": {"type": "string",
-                          "enum": ["revel", "hme", "labor", "identity"]},
+                          "enum": ["revel", "hme", "labor", "identity", "r365"]},
                 "description": (
                     "Which data sources the question actually needs. Pass only "
                     "these, because each one's checks are run and applied: "
                     "'revel' for POS sales/orders/products/payments, 'hme' for "
                     "drive-thru cars/timing/goals/outliers, 'labor' for "
-                    "staffing/hours, 'identity' for customer/loyalty context. A "
+                    "staffing/hours, 'identity' for customer/loyalty context, "
+                    "'r365' for R365 weekly-report metrics (net sales, guests, "
+                    "labour %, cash/over-short, discounts/comps/coupons, gift "
+                    "cards, tips, voids, forecast). An R365-only question needs "
+                    "['r365'] alone and is NOT blocked by Revel reconciliation. A "
                     "drive-thru question needs ['hme'] alone and is NOT blocked "
                     "by Revel sales reconciliation; 'compare drive-thru with "
                     "sales' needs ['hme','revel']. Omitting this runs every "
@@ -1908,7 +2093,14 @@ DOMAIN_REVEL = "revel"
 DOMAIN_HME = "hme"
 DOMAIN_LABOR = "labor"
 DOMAIN_IDENTITY = "identity"
+DOMAIN_R365 = "r365"
+# The strict set applied when a check_data call names no domains (or an unknown
+# one). R365 is deliberately NOT in it: R365 is loaded weekly, so folding it in
+# would let a missing R365 week veto an ordinary daily Revel/HME question. That
+# never widens access to R365 data -- a query that reads an R365 view is routed
+# to the R365 gate from its parse tree regardless (domains_for_relations).
 ALL_DOMAINS = (DOMAIN_REVEL, DOMAIN_HME, DOMAIN_LABOR, DOMAIN_IDENTITY)
+KNOWN_DOMAINS = ALL_DOMAINS + (DOMAIN_R365,)
 
 # Which domain each allowlisted relation belongs to. Derived from the relations
 # a statement actually references, so gating is decided by the SQL rather than
@@ -1924,6 +2116,13 @@ _RELATION_DOMAIN = {
     "v_order_identity_context": DOMAIN_IDENTITY,
     "v_identity_profile": DOMAIN_IDENTITY,
     "v_order_loyalty_context": DOMAIN_IDENTITY,
+    "v_r365_store_daily_llm": DOMAIN_R365,
+    "v_r365_store_weekly_llm": DOMAIN_R365,
+    "v_r365_store_period_llm": DOMAIN_R365,
+    # R365 week coverage is reference metadata (no store, no money): it is how
+    # the assistant LEARNS which weeks are trustworthy, so gating it would be
+    # circular. It is also listed in _REFERENCE_RELATIONS.
+    "v_r365_completeness_llm": None,
     # The period calendar is a shared date dimension. Resolving "P10" must not
     # drag in the Revel sales gate -- and joining it to a gated fact table does
     # not exempt that table, whose own domain still applies.
@@ -1967,10 +2166,12 @@ def normalise_domains(domains) -> set:
     if not domains:
         return set(ALL_DOMAINS)
     out = {str(d).strip().lower() for d in domains}
-    unknown = out - set(ALL_DOMAINS)
+    unknown = out - set(KNOWN_DOMAINS)
     if unknown:
-        # An unrecognised domain name is treated as "everything", never ignored.
-        return set(ALL_DOMAINS)
+        # An unrecognised domain name is treated as "everything", never ignored
+        # -- and any recognised domain that came with it (e.g. r365) is kept,
+        # so an unknown name can only ever add checks, never drop one.
+        return set(ALL_DOMAINS) | (out & set(KNOWN_DOMAINS))
     if DOMAIN_IDENTITY in out:
         out.add(DOMAIN_REVEL)
     return out
@@ -2261,6 +2462,350 @@ def _hme_block(cur, establishment_id, period_start, period_end):
             "hourly_or_daypart": False,
         },
     }
+
+
+# ── R365 (weekly-report API) ────────────────────────────────────────────────
+# R365 is ingested ONCE A WEEK: r365-weekly-ingest.timer fires Thursday 20:00
+# America/Chicago and loads the Thursday->Wednesday week that closed the night
+# before (plus the week before it, for late corrections). Its freshness is
+# therefore judged against that schedule, never against "yesterday".
+R365_COVERAGE_START = date(2026, 8, 13)
+R365_INGEST_HOUR = 20                    # mirrors systemd/r365-weekly-ingest.timer
+R365_WINDOW_GRACE_MINUTES = 60
+R365_SUMMARY_TTL_SECONDS = 300
+_r365_summary_cache: dict = {}
+
+R365_METRIC_AVAILABILITY = {
+    "sales": True, "guests_checks": True, "labor": True, "cash": True,
+    "discounts": True, "gift_cards": True, "tips": True, "voids": True,
+    "forecast": True,
+    # The finest R365 grain is store x day. None of these exist in R365.
+    "menu_items": False, "hourly": False, "daypart": False,
+    "individual_employees": False, "individual_orders": False,
+}
+R365_SEMANTICS = [
+    "Ratios in the R365 views are PERCENTAGE POINTS (20.5 = 20.5%).",
+    "NULL means mathematically undefined (zero denominator) or no forecast "
+    "entered -- never 0%.",
+    "A missing R365 row means no data, never zero.",
+    "day_status CLOSED / PRE_OPENING rows are genuine source rows with zero "
+    "trading; exclude them from 'normal operating day' comparisons or say so.",
+    "Forecast variance uses forecast-covered sales: SUM(forecast_sales_base) - "
+    "SUM(forecasted_sales), never total net sales minus forecast.",
+    "Roll ratios up from summed numerators/denominators; never average store "
+    "percentages.",
+]
+
+_R365_WEEKS_SQL = """
+SELECT week_start, week_end, fiscal_year, period_label, week_status,
+       source_complete, reconciliation_ok, expected_store_count,
+       observed_store_count, stores_with_full_week, missing_store_days,
+       closed_store_days, pre_opening_store_days, latest_refresh_failed
+  FROM v_r365_completeness_llm
+ ORDER BY week_start
+"""
+
+_R365_SCOPE_DAYS_SQL = """
+SELECT business_date, count(*) AS store_rows
+  FROM v_r365_store_daily_llm
+ WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+ GROUP BY business_date
+ ORDER BY business_date
+"""
+
+_R365_SPECIAL_DAYS_SQL = """
+SELECT establishment_id, store_name, business_date, day_status
+  FROM v_r365_store_daily_llm
+ WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+   AND day_status <> 'NORMAL'
+ ORDER BY business_date, establishment_id
+"""
+
+
+def r365_expected_week_start(now=None) -> date:
+    """Thursday of the latest week that SHOULD be loaded at this moment.
+
+    The week that closed last Wednesday is due once Thursday's 20:00 Chicago
+    run has had time to finish; before that, the expectation is the week before.
+    """
+    tz = ZoneInfo("America/Chicago")
+    now = (now or datetime.now(tz)).astimezone(tz)
+    today = now.date()
+    this_thursday = today - timedelta(days=(today.isoweekday() + 3) % 7)
+    due = datetime.combine(this_thursday, datetime.min.time(), tz).replace(
+        hour=R365_INGEST_HOUR) + timedelta(minutes=R365_WINDOW_GRACE_MINUTES)
+    return this_thursday - timedelta(days=7 if now >= due else 14)
+
+
+def r365_freshness(latest_complete_week_start, now=None) -> dict:
+    """Schedule-aware R365 freshness. Pure, so it can be tested at any clock."""
+    tz = ZoneInfo("America/Chicago")
+    now = (now or datetime.now(tz)).astimezone(tz)
+    expected = r365_expected_week_start(now)
+    if latest_complete_week_start is None:
+        status, reason = "STALE", "no COMPLETE R365 week is loaded at all"
+    elif latest_complete_week_start >= expected:
+        status = "CURRENT"
+        reason = (f"the latest expected R365 week ({expected}..{expected + timedelta(days=6)}) "
+                  "is loaded and COMPLETE")
+    elif latest_complete_week_start >= expected - timedelta(days=7):
+        status = "LATE"
+        reason = (f"R365 week {expected}..{expected + timedelta(days=6)} was due after "
+                  f"the Thursday {R365_INGEST_HOUR:02d}:00 America/Chicago ingest and "
+                  "is not loaded as COMPLETE")
+    else:
+        status = "STALE"
+        reason = "R365 is more than one weekly ingest behind"
+    days_to_thu = (4 - now.isoweekday()) % 7
+    nxt = (now + timedelta(days=days_to_thu)).replace(
+        hour=R365_INGEST_HOUR, minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=7)
+    return {
+        "freshness_status": status,
+        "freshness_reason": reason,
+        "expected_week_start": expected.isoformat(),
+        "expected_week_end": (expected + timedelta(days=6)).isoformat(),
+        "next_ingest_window": nxt.strftime("%Y-%m-%d %H:%M America/Chicago"),
+        "ingest_schedule": (f"weekly, Thursday {R365_INGEST_HOUR:02d}:00 "
+                            "America/Chicago; loads the Thursday->Wednesday "
+                            "week that closed the night before"),
+    }
+
+
+def _r365_summary(cur) -> dict:
+    """Network-wide R365 coverage. Reads only the completeness view (one row
+    per week, so ~52 rows a year) and caches it briefly: data changes once a
+    week, so rebuilding it per question would be wasted work."""
+    hit = _r365_summary_cache.get("v")
+    if hit and time.time() - _r365_summary_cache["at"] < R365_SUMMARY_TTL_SECONDS:
+        return hit
+    cur.execute(_R365_WEEKS_SQL)
+    weeks = [dict(r) for r in cur.fetchall()]
+    complete = [w for w in weeks if w["week_status"] == "COMPLETE"]
+    latest_complete = complete[-1] if complete else None
+    latest_loaded = weeks[-1] if weeks else None
+    summary = {
+        "weeks": weeks,
+        "coverage_start": R365_COVERAGE_START,
+        "latest_daily_date": latest_loaded["week_end"] if latest_loaded else None,
+        "latest_complete_week_start": latest_complete["week_start"] if latest_complete else None,
+        "latest_complete_week_end": latest_complete["week_end"] if latest_complete else None,
+        "expected_store_count": latest_loaded["expected_store_count"] if latest_loaded else None,
+        "mapped_store_count": latest_loaded["observed_store_count"] if latest_loaded else None,
+        "partial_weeks": [w["week_start"].isoformat() for w in weeks
+                          if w["week_status"] != "COMPLETE"],
+    }
+    _r365_summary_cache.update(v=summary, at=time.time())
+    return summary
+
+
+def _r365_block(cur, establishment_id, period_start, period_end):
+    """R365 coverage/trust profile for one analysis scope.
+
+    Reads ONLY the allowlisted R365 views as the read-only role. The scope part
+    touches at most one row per store-day in the requested window.
+    """
+    s = _r365_summary(cur)
+    params = {"est": establishment_id, "start": period_start, "end": period_end}
+    start_d, end_d = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    last_d = end_d - timedelta(days=1)
+
+    cur.execute(_R365_SCOPE_DAYS_SQL, params)
+    per_date = {r["business_date"]: r["store_rows"] for r in cur.fetchall()}
+    cur.execute(_R365_SPECIAL_DAYS_SQL, params)
+    special = [{"establishment_id": r["establishment_id"], "store": r["store_name"],
+                "business_date": r["business_date"].isoformat(),
+                "day_status": r["day_status"]} for r in cur.fetchall()]
+
+    loaded_weeks = s["weeks"]
+    in_scope = [w for w in loaded_weeks
+                if w["week_start"] <= last_d and w["week_end"] >= start_d]
+    loaded_dates = {w["week_start"] + timedelta(days=i)
+                    for w in loaded_weeks for i in range(7)}
+    requested = [start_d + timedelta(days=i) for i in range((end_d - start_d).days)]
+    uncovered = [d for d in requested if d not in loaded_dates]
+    before = [d for d in uncovered if d < R365_COVERAGE_START]
+    after = [d for d in uncovered
+             if s["latest_daily_date"] is None or d > s["latest_daily_date"]]
+    expected_per_day = 1 if establishment_id is not None else (s["expected_store_count"] or 0)
+    store_gaps = [d.isoformat() for d in requested
+                  if d in loaded_dates and per_date.get(d, 0) < expected_per_day]
+
+    def iso(d):
+        return d.isoformat() if d else None
+
+    return {
+        "available": bool(per_date),
+        "source": ("v_r365_store_daily_llm / v_r365_store_weekly_llm / "
+                   "v_r365_store_period_llm / v_r365_completeness_llm "
+                   "(VERIFIED R365->establishment mappings only)"),
+        "coverage_start": iso(s["coverage_start"]),
+        "latest_daily_date": iso(s["latest_daily_date"]),
+        "latest_complete_week_start": iso(s["latest_complete_week_start"]),
+        "latest_complete_week_end": iso(s["latest_complete_week_end"]),
+        "mapped_store_count": s["mapped_store_count"],
+        "expected_store_count": s["expected_store_count"],
+        "week_definition": "Thursday-Wednesday",
+        "timezone": "America/Chicago",
+        **r365_freshness(s["latest_complete_week_start"]),
+        "partial_weeks": s["partial_weeks"],
+        "weeks_in_scope": [{
+            "week_start": w["week_start"].isoformat(),
+            "week_end": w["week_end"].isoformat(),
+            "period_label": w["period_label"],
+            "week_status": w["week_status"],
+            "fully_inside_scope": w["week_start"] >= start_d and w["week_end"] <= last_d,
+            "observed_store_count": w["observed_store_count"],
+            "expected_store_count": w["expected_store_count"],
+            "missing_store_days": w["missing_store_days"],
+            "reconciliation_ok": w["reconciliation_ok"],
+            "latest_refresh_failed": w["latest_refresh_failed"],
+        } for w in in_scope],
+        "partial_weeks_in_scope": [w["week_start"].isoformat() for w in in_scope
+                                   if w["week_status"] != "COMPLETE"],
+        "covered_dates_in_scope": len([d for d in requested if d in loaded_dates]),
+        "requested_dates": len(requested),
+        "uncovered_dates_in_scope": {
+            "before_coverage_start": [iso(before[0]), iso(before[-1])] if before else None,
+            "after_latest_loaded": [iso(after[0]), iso(after[-1])] if after else None,
+        },
+        "store_missing_dates_in_scope": store_gaps,
+        "special_status_days_in_scope": special,
+        "metric_availability": dict(R365_METRIC_AVAILABILITY),
+        "semantics": list(R365_SEMANTICS),
+    }
+
+
+_R365_FIGURES_METRICS = """
+       sum(net_sales)        AS net_sales,
+       sum(guest_count)      AS guest_count,
+       sum(check_count)      AS check_count,
+       sum(labor_hours)      AS labor_hours,
+       sum(labor_cost)       AS labor_cost,
+       sum(labor_cost) / NULLIF(sum(net_sales), 0) * 100     AS labor_pct,
+       sum(net_sales) / NULLIF(sum(labor_hours), 0)          AS sales_per_labor_hour,
+       sum(net_sales) / NULLIF(sum(check_count), 0)          AS avg_check,
+       sum(total_discounts)  AS total_discounts,
+       sum(total_discounts) / NULLIF(sum(net_sales), 0) * 100 AS discount_pct,
+       sum(over_short)       AS over_short,
+       sum(forecasted_sales) AS forecasted_sales,
+       sum(forecast_sales_base) - sum(forecasted_sales)     AS sales_vs_forecast_amount,
+       (sum(forecast_sales_base) - sum(forecasted_sales))
+           / NULLIF(sum(forecasted_sales), 0) * 100         AS sales_vs_forecast_pct
+"""
+
+
+def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
+    """Core R365 figures for a scope that PASSED the R365 gate, computed in SQL.
+
+    Used only on the blocked path: when another source fails its gate, the
+    final answer is composed without tools, so the trusted R365 side must be
+    handed over as numbers rather than left for the model to recompute by hand.
+    Whole Thursday-aligned weeks read the OFFICIAL weekly rows; any other range
+    sums daily rows. Ratios are recomputed from summed parts.
+    """
+    start_d, end_d = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    whole_weeks = start_d.isoweekday() == 4 and (end_d - start_d).days % 7 == 0
+    if whole_weeks:
+        rel, where, basis = ("v_r365_store_weekly_llm",
+                             "week_start >= %(start)s::date AND week_end < %(end)s::date",
+                             "official R365 weekly rows")
+    else:
+        rel, where, basis = ("v_r365_store_daily_llm",
+                             "business_date >= %(start)s::date AND business_date < %(end)s::date",
+                             "R365 daily rows (range is not whole Thursday->Wednesday weeks)")
+    # Ranks come from SQL too (1 = highest), so a ranked answer composed
+    # without tools never depends on sorting numbers by hand.
+    sql = (f"WITH f AS (SELECT store_name, {_R365_FIGURES_METRICS} FROM {rel} "
+           f"WHERE {where} "
+           "AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int) "
+           "GROUP BY ROLLUP (store_name)) "
+           "SELECT f.*, "
+           "CASE WHEN store_name IS NOT NULL THEN rank() OVER (PARTITION BY store_name IS NULL "
+           "ORDER BY labor_pct DESC NULLS LAST) END AS rank_labor_pct_high_to_low, "
+           "CASE WHEN store_name IS NOT NULL THEN rank() OVER (PARTITION BY store_name IS NULL "
+           "ORDER BY net_sales DESC NULLS LAST) END AS rank_net_sales_high_to_low "
+           "FROM f ORDER BY rank_labor_pct_high_to_low NULLS LAST")
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute(sql, {"est": establishment_id, "start": period_start,
+                              "end": period_end})
+            rows = [{k: (round(float(v), 2) if isinstance(v, decimal.Decimal) else v)
+                     for k, v in r.items()} for r in cur.fetchall()]
+    finally:
+        conn.rollback()
+        conn.close()
+    network = [r for r in rows if r["store_name"] is None]
+    return {
+        "scope": {"establishment_id": establishment_id, "period_start": period_start,
+                  "period_end_exclusive": period_end},
+        "basis": basis + "; ratios recomputed from summed parts; percentages are points",
+        "by_store": [r for r in rows if r["store_name"] is not None],
+        "network_total": network[0] if network and establishment_id is None else None,
+    }
+
+
+def _r365_gate(r: dict) -> tuple[list, list]:
+    """R365's own trust gate. PURE: (fails, warns) from an _r365_block dict.
+
+    Never consults Revel reconciliation. Every reason starts with "R365" so
+    blocked_domain_context can attribute it.
+    """
+    fails, warns = [], []
+    if not r or r.get("available") is None:
+        return ["R365 availability could not be determined for this period"], warns
+    unc = r.get("uncovered_dates_in_scope") or {}
+    if not r.get("available"):
+        why = []
+        if unc.get("before_coverage_start"):
+            why.append(f"R365 history starts {r.get('coverage_start')}; nothing "
+                       "earlier is loaded")
+        if unc.get("after_latest_loaded"):
+            why.append(f"the latest loaded R365 date is {r.get('latest_daily_date')}; "
+                       f"R365 is ingested weekly ({r.get('ingest_schedule')}), next "
+                       f"window {r.get('next_ingest_window')}")
+        fails.append("R365 has no loaded data for this store and period"
+                     + (" (" + "; ".join(why) + ")" if why else ""))
+        return fails, warns
+
+    weeks = r.get("weeks_in_scope") or []
+    partial = r.get("partial_weeks_in_scope") or []
+    if weeks and len(partial) == len(weeks):
+        fails.append("R365 week(s) " + ", ".join(partial) + " are PARTIAL (missing "
+                     "stores/days or daily-vs-weekly reconciliation failed); no "
+                     "COMPLETE R365 week covers this scope")
+    elif partial:
+        warns.append("R365 week(s) " + ", ".join(partial) + " in this scope are "
+                     "PARTIAL: exclude them or label them partial; missing store-days "
+                     "are unknown, not zero")
+    if unc.get("before_coverage_start") or unc.get("after_latest_loaded"):
+        warns.append(f"R365 covers only {r.get('covered_dates_in_scope')} of the "
+                     f"{r.get('requested_dates')} requested dates (loaded R365 range "
+                     f"{r.get('coverage_start')}..{r.get('latest_daily_date')}). "
+                     "Answer for the covered dates only and label the coverage as "
+                     "partial; do not extrapolate the missing dates")
+    gaps = r.get("store_missing_dates_in_scope") or []
+    if gaps:
+        warns.append("R365 has no row for one or more expected stores on "
+                     + ", ".join(gaps[:10]) + ("..." if len(gaps) > 10 else "")
+                     + "; those store-days are unknown, not zero")
+    special = r.get("special_status_days_in_scope") or []
+    if special:
+        warns.append("R365 day_status is not NORMAL on: " + ", ".join(
+            f"{x['store']} {x['business_date']} {x['day_status']}" for x in special)
+            + ". These are genuine zero-trading days; say so, and exclude them "
+              "from normal-operating-day comparisons")
+    refresh_failed = [w["week_start"] for w in weeks if w.get("latest_refresh_failed")]
+    if refresh_failed:
+        warns.append("R365 refresh failed for week(s) " + ", ".join(refresh_failed)
+                     + "; the figures are from the previous successful load")
+    return fails, warns
 
 
 def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
@@ -2899,6 +3444,10 @@ _REFERENCE_RELATIONS = frozenset({
     # it IS the period definition. Gating it would be circular: the model could
     # not look up P10's dates without first declaring the dates of P10.
     "v_ayg_business_periods_llm",
+    # R365 week coverage: which Thursday->Wednesday weeks are loaded and whether
+    # each is COMPLETE. No store row, no money. Gating it would be circular in
+    # the same way -- "last week" for R365 is resolved FROM this view.
+    "v_r365_completeness_llm",
 })
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -2941,10 +3490,29 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "unreconciled_days": h.get("unreconciled_days"),
             "missing_verified_stores": h.get("missing_verified_stores"),
         }
+    if DOMAIN_R365 in doms:
+        r = meta.get("r365") or {}
+        r365_failed = any(x.startswith("R365") for x in out["blocking_reasons"])
+        out["r365"] = {
+            "trusted": not r365_failed and bool(r.get("available")),
+            "coverage_start": r.get("coverage_start"),
+            "latest_daily_date": r.get("latest_daily_date"),
+            "latest_complete_week_start": r.get("latest_complete_week_start"),
+            "latest_complete_week_end": r.get("latest_complete_week_end"),
+            "freshness_status": r.get("freshness_status"),
+            "next_ingest_window": r.get("next_ingest_window"),
+            "weeks_in_scope": r.get("weeks_in_scope"),
+            "partial_weeks_in_scope": r.get("partial_weeks_in_scope"),
+            "uncovered_dates_in_scope": r.get("uncovered_dates_in_scope"),
+        }
     if DOMAIN_REVEL in doms:
         rec = meta.get("reconciliation") or {}
         fresh = meta.get("freshness") or {}
-        revel_reasons = [r for r in out["blocking_reasons"] if "HME" not in r]
+        # Revel's reasons are the ones no other domain claimed. R365 reasons
+        # all start "R365"; without this filter an R365 coverage failure would
+        # be reported to the model as a Revel sales failure.
+        revel_reasons = [r for r in out["blocking_reasons"]
+                         if "HME" not in r and not r.startswith("R365")]
         out["revel"] = {
             "trusted": not revel_reasons,
             "reason": revel_reasons[0] if revel_reasons else None,
@@ -3106,6 +3674,9 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
                 if DOMAIN_HME in doms:
                     meta["hme"] = _hme_block(cur, establishment_id,
                                              period_start, period_end)
+                if DOMAIN_R365 in doms:
+                    meta["r365"] = _r365_block(cur, establishment_id,
+                                               period_start, period_end)
         finally:
             conn.rollback()
             conn.close()
@@ -3128,6 +3699,23 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
         hf, hw = _hme_gate(meta["hme"], period_start, period_end)
         fails += hf
         warns += hw
+
+    if DOMAIN_R365 in doms:
+        if meta.get("r365") is None:
+            # Revel-inclusive path: meta_extract does not build the R365 block.
+            conn = _ro_conn()
+            try:
+                conn.set_session(readonly=True, autocommit=False)
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                    meta["r365"] = _r365_block(cur, establishment_id,
+                                               period_start, period_end)
+            finally:
+                conn.rollback()
+                conn.close()
+        rf, rw = _r365_gate(meta["r365"])
+        fails += rf
+        warns += rw
 
     if DOMAIN_LABOR in doms and DOMAIN_REVEL not in doms:
         lb, lf, lw = _labor_gate(establishment_id, period_start, period_end)
@@ -3514,6 +4102,19 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         messages.append({"role": "user", "content": tool_results})
 
         if blocked is not None:
+            # A trusted R365 scope checked earlier in this turn stays answerable
+            # even though another source just failed: hand its figures over,
+            # computed in SQL, because the call below has no tools.
+            for (c_est, c_start, c_end, c_doms), c_meta in list(scope_cache.items()):
+                if (DOMAIN_R365 in c_doms and "r365_trusted_figures" not in blocked
+                        and (c_meta.get("r365") or {}).get("available")
+                        and not any(x.startswith("R365")
+                                    for x in c_meta.get("blocking_reasons") or [])):
+                    try:
+                        blocked["r365_trusted_figures"] = r365_trusted_figures(
+                            c_est, c_start, c_end)
+                    except psycopg2.Error as e:
+                        blocked["r365_trusted_figures_error"] = str(e).strip()[:200]
             # Deterministic verdict reached: a required source is untrusted.
             # One more call, WITHOUT tools, so the model can only explain -- it
             # cannot spend further round-trips hunting for a usable scope.
@@ -3523,7 +4124,10 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 + "\n\nCompose the final answer now. State plainly which source "
                   "is unusable and why, give the user whatever the trusted "
                   "source(s) above still support, and do not attempt the "
-                  "comparison that the untrusted source would have required.")})
+                  "comparison that the untrusted source would have required. "
+                  "Quote only figures that appear in the tool results above: "
+                  "you cannot run SQL now, so do not compute new totals, sums "
+                  "or ratios by hand.")})
             _t = time.perf_counter()
             resp = client.messages.create(
                 model=model, max_tokens=4096, system=system, messages=messages)
