@@ -56,8 +56,8 @@ for v in SAFE:
     check(f"{v} is allowed", not rejected(f"SELECT * FROM {v}"))
 for t in RAW:
     check(f"raw {t} is rejected", rejected(f"SELECT * FROM {t}"))
-check("exactly four R365 relations are allowlisted",
-      {r for r in C._ALLOWED_RELATIONS if "r365" in r} == set(SAFE))
+check("exactly four R365 operational relations are allowlisted",
+      {r for r in C._ALLOWED_RELATIONS if "r365" in r and "financial" not in r} == set(SAFE))
 check("raw table hidden in a CTE is rejected",
       rejected("WITH x AS (SELECT * FROM r365_ingest_run) SELECT * FROM x"))
 check("raw table in an implicit join is rejected",

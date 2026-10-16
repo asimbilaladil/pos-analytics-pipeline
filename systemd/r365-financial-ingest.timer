@@ -1,0 +1,20 @@
+[Unit]
+Description=R365 financial ingest, daily 07:00 America/Chicago
+
+[Timer]
+# The timezone MUST be part of the OnCalendar EXPRESSION (systemd 252+). A
+# `Timezone=` key in [Timer] does not exist and is silently ignored.
+#
+# Verify after any change with:  systemd-analyze calendar --iterations=2 \
+#     '*-*-* 07:00:00 America/Chicago'
+#   during CDT the elapse must read 12:00 UTC; during CST 13:00 UTC.
+#
+# 07:00 is one hour after the R365 source VPS's daily 06:00 financial sync, and
+# on Mondays 90 minutes after its 05:30 weekly repair, so this pull always sees
+# the source's latest published state.
+OnCalendar=*-*-* 07:00:00 America/Chicago
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
