@@ -1128,6 +1128,117 @@ CROSS-SOURCE — join only on establishment_id, never on store name.
 """
 
 
+R365_FINANCIAL_GUIDANCE = """\
+R365 FINANCIAL (GL / P&L) DATA (migrations 56/57). Approved general-ledger
+expenses from Restaurant365, published by the R365 source system and refreshed
+here daily at 07:00 America/Chicago (after the source's 06:00 sync). Grain:
+store x AYG FISCAL PERIOD x analytics category. Loaded from FY2026 P1 onward.
+
+v_r365_financial_period_llm   — establishment_id x fiscal period x category
+    store_name, fiscal_year, period_number, period_label, period_start,
+    period_end, period_status, analytics_category, expense_amount,
+    transaction_count, account_count, data_status, has_posting, source_quality
+v_r365_financial_coverage_llm — one row per loaded fiscal period x VERIFIED
+    category: period_status, source_data_status (COMPLETE / PARTIAL),
+    expected_store_count, stores_with_posting, stores_without_posting,
+    source_last_sync_at, latest_refresh_failed. Reference data: no scope needed.
+v_r365_financial_account_llm  — the chart of accounts: account_number,
+    account_name, account_type, analytics_category, mapping_status (VERIFIED /
+    CANDIDATE / UNMAPPED), category_trusted. Metadata only, no amounts.
+    Reference data: no scope needed.
+
+SOURCE AUTHORITY — which source answers what:
+  * R365 FINANCIAL: GL / P&L / accounting expenses (electricity, utilities,
+    rent, repairs, insurance, food cost, any "how much did we spend on X").
+  * R365 OPERATIONAL (v_r365_store_*_llm): R365 sales, labour and report
+    metrics.
+  * REVEL: POS orders, items, hours/dayparts, payments.
+  * HME: drive-thru cars and timing.
+  An expense question reads ONLY the R365 FINANCIAL views -- never Revel, HME
+  or the R365 operational views -- unless the user explicitly asks to compare
+  it with sales or labour. NEVER derive or estimate an expense from sales,
+  orders, cars or labour data.
+
+TRUSTED CATEGORIES ONLY. analytics_category in v_r365_financial_period_llm
+holds VERIFIED categories only (today: ELECTRICITY, from GL account 6200-03
+Electric). Gas, water, telephone, cable/internet and waste removal are
+CANDIDATE accounts and are NOT electricity: never add them to ELECTRICITY or
+present them as a utility total. For an expense category that is not VERIFIED
+(e.g. rent, repairs, insurance, food cost, gas, water), look it up in
+v_r365_financial_account_llm and say that the accounting data exists in R365
+(name the accounts and their mapping_status) but no VERIFIED <category>
+category is available yet, so no trusted figure can be given. Do NOT estimate
+or approximate it, and do not offer a number from any other source.
+
+MISSING IS NOT ZERO. A row with has_posting = false (data_status =
+'NO_ACTIVITY', expense_amount NULL) means NO POSTING WAS FOUND for that store
+in that period. It is unknown, NOT $0: utility bills post roughly monthly and
+can land in an adjacent period or not be entered yet. Always:
+  * report such stores in a separate "no posting found" list, never as $0 and
+    never ranked as the lowest;
+  * state totals as "across N of 12 stores with a posting" (count of
+    expense_amount; SUM ignores the NULLs);
+  * never average with them counted as 0.
+
+PERIOD GRAIN ONLY. Financial data exists per fiscal period, never per day,
+week or hour. Asked for financial figures by hour, day or week: say GL expense
+data is only available per fiscal period, and do not split, prorate or
+approximate a period figure into smaller units.
+
+QUERYING — resolve the period via v_ayg_business_periods_llm, then filter by
+fiscal_year, period_number AND the literal period_start (the scope gate needs a
+date literal), declaring period_start = start_date and period_end_exclusive =
+end_date + 1 for the period(s) queried. Rank, sort and total IN SQL -- this one
+query gives the by-store list (already in rank order), the rank, and the
+network total with its store count:
+    SELECT store_name, expense_amount, has_posting,
+           CASE WHEN has_posting THEN rank() OVER (
+                PARTITION BY has_posting ORDER BY expense_amount DESC) END AS rank_high_to_low,
+           SUM(expense_amount) OVER ()  AS network_total,
+           count(expense_amount) OVER () AS stores_with_posting,
+           count(*) OVER ()              AS stores_total
+      FROM v_r365_financial_period_llm
+     WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+       AND period_number = 10 AND period_start = '2026-09-10'
+     ORDER BY has_posting DESC, expense_amount DESC
+Present stores in exactly the order returned and quote rank_high_to_low as
+given. NEVER re-sort, re-rank or re-add figures by hand.
+PERIOD vs PERIOD (e.g. "compare P9 vs P10"): scope = first period's start_date
+.. last period's end_date + 1, with period_start IN (...). LEAD with the
+NETWORK TOTAL of each period (all stores with a posting, each with its "N of
+12 stores" count) and the $ and % change between those two totals, computed in
+SQL:
+    SELECT period_label, SUM(expense_amount) AS network_total,
+           count(expense_amount) AS stores_with_posting,
+           SUM(expense_amount) - lag(SUM(expense_amount)) OVER (ORDER BY period_start) AS change_amount,
+           (SUM(expense_amount) / NULLIF(lag(SUM(expense_amount)) OVER (ORDER BY period_start), 0)
+            - 1) * 100 AS change_pct
+      FROM v_r365_financial_period_llm
+     WHERE analytics_category = 'ELECTRICITY' AND fiscal_year = 2026
+       AND period_start IN ('2026-08-13', '2026-09-10')
+     GROUP BY period_label, period_start ORDER BY period_start
+If the stores with a posting differ between the periods, say so next to the
+totals, then add a by-store table: compare a store only where it has a
+posting in BOTH periods (label that subtotal "like-for-like, N stores") and
+list the others as not comparable -- never as $0. Note that monthly bill
+timing alone can move a period's figure.
+CURRENT PERIOD: period_status CURRENT (or source_data_status PARTIAL) is still
+open and incomplete: say so and never compare it with a closed period's total.
+SOURCE QUALITY: source_quality MIGRATED_SUMMARY (FY2026 P1-P3 era) is migrated
+P&L history; its transaction_count counts journal entries, not bills.
+
+CROSS-SOURCE (only when asked): join v_r365_financial_period_llm to
+v_r365_store_period_llm on establishment_id AND fiscal_year AND period_number
+-- never on store name, never to Revel unless Revel is explicitly requested.
+    electricity_pct_of_sales = SUM(expense_amount) / NULLIF(SUM(net_sales), 0) * 100
+Compute the network percentage over stores WITH a posting only (numerator and
+denominator over the same stores), say how many stores that is, and list the
+stores excluded for having no posting. Labour % comes from
+v_r365_store_period_llm.labor_pct (R365 operational). Label sales as "R365 net
+sales". Correlation is not causation.
+"""
+
+
 BUSINESS_PERIOD_GUIDANCE = """\
 FISCAL PERIODS ("P8", "period nine", "P10-to-date", "this period").
 AYG runs 13 periods of 28 days per fiscal year, NOT calendar months. Resolve
@@ -1311,6 +1422,7 @@ HME rules — these are not stylistic, they change what is true:
     "awaiting its scheduled ingestion" rather than "the source is stale".
 
 {R365_GUIDANCE}
+{R365_FINANCIAL_GUIDANCE}
 {BUSINESS_PERIOD_GUIDANCE}
 {GLOSSARY}
 {DATA_NOTES}
@@ -1484,6 +1596,14 @@ _ALLOWED_RELATIONS = frozenset({
     # boundary. Percentages are 0-100; NULL means undefined or no forecast.
     "v_r365_store_daily_llm", "v_r365_store_weekly_llm",
     "v_r365_store_period_llm", "v_r365_completeness_llm",
+    # R365 FINANCIAL GL expenses (migrations 56/57). VERIFIED-store and
+    # VERIFIED-category gated views over tables laynes_ro cannot read:
+    # r365_financial_period_expense, r365_financial_candidate_expense,
+    # r365_financial_account_period, r365_financial_account and
+    # r365_financial_ingest_run stay denied, so R365 location ids, unverified
+    # or unmapped amounts and run errors never cross this boundary.
+    "v_r365_financial_period_llm", "v_r365_financial_coverage_llm",
+    "v_r365_financial_account_llm",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -1683,7 +1803,8 @@ CHECK_DATA_TOOL = {
             "domains": {
                 "type": "array",
                 "items": {"type": "string",
-                          "enum": ["revel", "hme", "labor", "identity", "r365"]},
+                          "enum": ["revel", "hme", "labor", "identity", "r365",
+                                   "r365_financial"]},
                 "description": (
                     "Which data sources the question actually needs. Pass only "
                     "these, because each one's checks are run and applied: "
@@ -1692,8 +1813,12 @@ CHECK_DATA_TOOL = {
                     "staffing/hours, 'identity' for customer/loyalty context, "
                     "'r365' for R365 weekly-report metrics (net sales, guests, "
                     "labour %, cash/over-short, discounts/comps/coupons, gift "
-                    "cards, tips, voids, forecast). An R365-only question needs "
-                    "['r365'] alone and is NOT blocked by Revel reconciliation. A "
+                    "cards, tips, voids, forecast), 'r365_financial' for GL / "
+                    "P&L expenses per fiscal period (electricity, rent, ...). An "
+                    "R365-only question needs ['r365'] alone and is NOT blocked "
+                    "by Revel reconciliation; an expense question needs "
+                    "['r365_financial'] alone (plus 'r365' only to relate it to "
+                    "R365 sales or labour). A "
                     "drive-thru question needs ['hme'] alone and is NOT blocked "
                     "by Revel sales reconciliation; 'compare drive-thru with "
                     "sales' needs ['hme','revel']. Omitting this runs every "
@@ -2094,13 +2219,18 @@ DOMAIN_HME = "hme"
 DOMAIN_LABOR = "labor"
 DOMAIN_IDENTITY = "identity"
 DOMAIN_R365 = "r365"
+# R365 FINANCIAL (GL expenses, fiscal-period grain) is a separate domain from
+# the R365 operational weekly-report data: a different source endpoint, grain
+# and refresh, so each keeps its own gate. Like R365 it is opt-in -- routed from
+# the parse tree, never folded into the strict default below.
+DOMAIN_R365_FIN = "r365_financial"
 # The strict set applied when a check_data call names no domains (or an unknown
 # one). R365 is deliberately NOT in it: R365 is loaded weekly, so folding it in
 # would let a missing R365 week veto an ordinary daily Revel/HME question. That
 # never widens access to R365 data -- a query that reads an R365 view is routed
 # to the R365 gate from its parse tree regardless (domains_for_relations).
 ALL_DOMAINS = (DOMAIN_REVEL, DOMAIN_HME, DOMAIN_LABOR, DOMAIN_IDENTITY)
-KNOWN_DOMAINS = ALL_DOMAINS + (DOMAIN_R365,)
+KNOWN_DOMAINS = ALL_DOMAINS + (DOMAIN_R365, DOMAIN_R365_FIN)
 
 # Which domain each allowlisted relation belongs to. Derived from the relations
 # a statement actually references, so gating is decided by the SQL rather than
@@ -2123,6 +2253,11 @@ _RELATION_DOMAIN = {
     # the assistant LEARNS which weeks are trustworthy, so gating it would be
     # circular. It is also listed in _REFERENCE_RELATIONS.
     "v_r365_completeness_llm": None,
+    "v_r365_financial_period_llm": DOMAIN_R365_FIN,
+    # Financial period coverage and the chart of accounts are reference
+    # metadata (no store amounts); both are in _REFERENCE_RELATIONS.
+    "v_r365_financial_coverage_llm": None,
+    "v_r365_financial_account_llm": None,
     # The period calendar is a shared date dimension. Resolving "P10" must not
     # drag in the Revel sales gate -- and joining it to a gated fact table does
     # not exempt that table, whose own domain still applies.
@@ -2751,6 +2886,13 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
     }
 
 
+def _is_r365_ops_reason(reason: str) -> bool:
+    """An R365 OPERATIONAL gate reason. R365 FINANCIAL reasons also start with
+    "R365", so a plain prefix test would blame the weekly-report data for a
+    financial-coverage failure."""
+    return reason.startswith("R365") and not reason.startswith("R365 FINANCIAL")
+
+
 def _r365_gate(r: dict) -> tuple[list, list]:
     """R365's own trust gate. PURE: (fails, warns) from an _r365_block dict.
 
@@ -2805,6 +2947,166 @@ def _r365_gate(r: dict) -> tuple[list, list]:
     if refresh_failed:
         warns.append("R365 refresh failed for week(s) " + ", ".join(refresh_failed)
                      + "; the figures are from the previous successful load")
+    return fails, warns
+
+
+# ── R365 FINANCIAL (GL expenses from the R365 source API) ───────────────────
+# Pulled daily at 07:00 America/Chicago by r365-financial-ingest.timer, after
+# the source system's own 06:00 sync. The grain is the AYG fiscal period, so a
+# scope is only meaningful when it is made of whole periods.
+R365_FIN_INGEST_HOUR = 7                 # mirrors systemd/r365-financial-ingest.timer
+R365_FIN_MAX_AGE_HOURS = 30              # one missed daily pull is worth a warning
+R365_FIN_METRIC_AVAILABILITY = {
+    "period_expense": True, "verified_categories_only": True,
+    # GL data is posted per accounting date but published per fiscal period.
+    "hourly": False, "daily": False, "weekly": False,
+    "unverified_categories": False, "transaction_detail": False,
+}
+R365_FIN_SEMANTICS = [
+    "expense_amount is approved GL expense in dollars for a whole fiscal period.",
+    "has_posting = false / data_status NO_ACTIVITY means no posting was found: "
+    "unknown, NEVER $0. List those stores separately.",
+    "Only VERIFIED categories appear; CANDIDATE/UNMAPPED accounts (gas, water, "
+    "rent, ...) have no trusted category figure.",
+    "Period grain only: never split a period figure into days, weeks or hours.",
+    "A CURRENT period (source_data_status PARTIAL) is incomplete; never compare "
+    "it with a closed period's total.",
+]
+
+_R365_FIN_COVERAGE_SQL = """
+SELECT fiscal_year, period_number, period_label, period_start, period_end,
+       period_status, analytics_category, source_data_status,
+       expected_store_count, stores_with_posting, stores_without_posting,
+       source_last_sync_at, source_sync_stale, latest_refresh_failed, loaded_at
+  FROM v_r365_financial_coverage_llm
+ ORDER BY period_start, analytics_category
+"""
+
+_R365_FIN_CALENDAR_SQL = """
+SELECT fiscal_year, period_number, period_label, start_date, end_date
+  FROM v_ayg_business_periods_llm
+ WHERE start_date < %(end)s::date AND end_date >= %(start)s::date
+ ORDER BY start_date
+"""
+
+_R365_FIN_NO_POSTING_SQL = """
+SELECT store_name, period_label, analytics_category
+  FROM v_r365_financial_period_llm
+ WHERE period_start >= %(start)s::date AND period_end < %(end)s::date
+   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+   AND NOT has_posting
+ ORDER BY period_start, analytics_category, store_name
+"""
+
+
+def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
+    """R365 FINANCIAL coverage/trust profile for one scope. Reads only the
+    allowlisted financial views and the fiscal calendar, as laynes_ro."""
+    start_d, end_d = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    params = {"est": establishment_id, "start": period_start, "end": period_end}
+    cur.execute(_R365_FIN_CALENDAR_SQL, params)
+    cal = [dict(r) for r in cur.fetchall()]
+    cur.execute(_R365_FIN_COVERAGE_SQL)
+    cov = [dict(r) for r in cur.fetchall()]
+    cur.execute(_R365_FIN_NO_POSTING_SQL, params)
+    no_posting = [dict(r) for r in cur.fetchall()]
+
+    loaded = {(c["fiscal_year"], c["period_number"]) for c in cov}
+    aligned = bool(cal) and cal[0]["start_date"] == start_d \
+        and cal[-1]["end_date"] == end_d - timedelta(days=1)
+    in_scope = [c for c in cov
+                if c["period_start"] < end_d and c["period_end"] >= start_d]
+    not_loaded = [f"FY{p['fiscal_year']} {p['period_label']}" for p in cal
+                  if (p["fiscal_year"], p["period_number"]) not in loaded]
+    last_load = max((c["loaded_at"] for c in cov if c["loaded_at"]), default=None)
+    now = now or datetime.now(ZoneInfo("America/Chicago"))
+    age_h = ((now - last_load).total_seconds() / 3600) if last_load else None
+
+    def iso(d):
+        return d.isoformat() if d else None
+
+    return {
+        "available": bool(in_scope),
+        "source": ("v_r365_financial_period_llm (VERIFIED stores and VERIFIED "
+                   "categories only), v_r365_financial_coverage_llm"),
+        "grain": "store x AYG fiscal period x analytics category",
+        "scope_is_whole_periods": aligned,
+        "calendar_periods_in_scope": len(cal),
+        "periods_in_scope": [{
+            "fiscal_year": c["fiscal_year"], "period_label": c["period_label"],
+            "period_start": iso(c["period_start"]), "period_end": iso(c["period_end"]),
+            "period_status": c["period_status"],
+            "analytics_category": c["analytics_category"],
+            "source_data_status": c["source_data_status"],
+            "stores_with_posting": c["stores_with_posting"],
+            "stores_without_posting": c["stores_without_posting"],
+            "expected_store_count": c["expected_store_count"],
+            "latest_refresh_failed": c["latest_refresh_failed"],
+        } for c in in_scope],
+        "calendar_periods_not_loaded": not_loaded,
+        "no_posting_in_scope": [f"{r['store_name']} {r['period_label']} "
+                                f"{r['analytics_category']}" for r in no_posting],
+        "verified_categories": sorted({c["analytics_category"] for c in cov}),
+        "loaded_period_range": ([f"FY{cov[0]['fiscal_year']} {cov[0]['period_label']}",
+                                 f"FY{cov[-1]['fiscal_year']} {cov[-1]['period_label']}"]
+                                if cov else None),
+        "last_refreshed_at": iso(last_load),
+        "refresh_age_hours": round(age_h, 1) if age_h is not None else None,
+        "source_sync_stale": any(c["source_sync_stale"] for c in in_scope),
+        "refresh_schedule": (f"daily {R365_FIN_INGEST_HOUR:02d}:00 America/Chicago, after "
+                             "the R365 source's 06:00 sync"),
+        "metric_availability": dict(R365_FIN_METRIC_AVAILABILITY),
+        "semantics": list(R365_FIN_SEMANTICS),
+    }
+
+
+def _r365_fin_gate(f: dict) -> tuple[list, list]:
+    """R365 FINANCIAL's own trust gate. PURE. Every reason starts with
+    "R365 FINANCIAL" so it is never attributed to R365 operational or Revel."""
+    fails, warns = [], []
+    if not f or f.get("available") is None:
+        return ["R365 FINANCIAL availability could not be determined for this scope"], warns
+    if not f.get("calendar_periods_in_scope"):
+        fails.append("R365 FINANCIAL is organised by the official AYG fiscal calendar, "
+                     "which is defined for FY2026 and FY2027 only; this range has no "
+                     "official fiscal period, so no period expense can be given (do not "
+                     "estimate one)")
+        return fails, warns
+    if not f.get("scope_is_whole_periods"):
+        fails.append("R365 FINANCIAL data exists per AYG fiscal period only; declare whole "
+                     "periods (period_start = a period's start_date, period_end_exclusive = "
+                     "a period's end_date + 1). It cannot be split into days, weeks or hours")
+        return fails, warns
+    if not f.get("available"):
+        fails.append("R365 FINANCIAL has no loaded period in this scope (loaded: "
+                     + (" .. ".join(f.get("loaded_period_range") or []) or "none") + ")")
+        return fails, warns
+    if f.get("calendar_periods_not_loaded"):
+        warns.append("R365 FINANCIAL is not loaded for " + ", ".join(
+            f["calendar_periods_not_loaded"]) + "; answer for the loaded periods only")
+    partial = sorted({f"FY{p['fiscal_year']} {p['period_label']}"
+                      for p in f.get("periods_in_scope") or []
+                      if p["source_data_status"] != "COMPLETE"
+                      or p["period_status"] == "CURRENT"})
+    if partial:
+        warns.append("R365 FINANCIAL period(s) " + ", ".join(partial) + " are still open "
+                     "or not fully loaded at the source (PARTIAL): label them partial and "
+                     "never compare them with a closed period's total")
+    if f.get("no_posting_in_scope"):
+        warns.append("R365 FINANCIAL found NO POSTING for: " + "; ".join(
+            f["no_posting_in_scope"]) + ". These are unknown, NOT $0 -- list them "
+            "separately and exclude them from totals' store counts")
+    failed = sorted({f"FY{p['fiscal_year']} {p['period_label']}"
+                     for p in f.get("periods_in_scope") or [] if p["latest_refresh_failed"]})
+    if failed:
+        warns.append("R365 FINANCIAL refresh failed for " + ", ".join(failed)
+                     + "; the figures are from the previous successful load")
+    age = f.get("refresh_age_hours")
+    if age is not None and age > R365_FIN_MAX_AGE_HOURS:
+        warns.append(f"R365 FINANCIAL was last refreshed {age} hours ago (expected "
+                     f"{f.get('refresh_schedule')}); recent postings may be missing")
+    if f.get("source_sync_stale"):
+        warns.append("R365 FINANCIAL: the source system reported its own sync as stale")
     return fails, warns
 
 
@@ -3448,6 +3750,11 @@ _REFERENCE_RELATIONS = frozenset({
     # each is COMPLETE. No store row, no money. Gating it would be circular in
     # the same way -- "last week" for R365 is resolved FROM this view.
     "v_r365_completeness_llm",
+    # R365 FINANCIAL coverage (which periods are loaded, how many stores had a
+    # posting) and the chart of accounts (names and mapping status, no
+    # amounts). The assistant learns from these which categories are trusted
+    # and that rent etc. are not -- gating them would be circular.
+    "v_r365_financial_coverage_llm", "v_r365_financial_account_llm",
 })
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -3492,7 +3799,7 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
         }
     if DOMAIN_R365 in doms:
         r = meta.get("r365") or {}
-        r365_failed = any(x.startswith("R365") for x in out["blocking_reasons"])
+        r365_failed = any(_is_r365_ops_reason(x) for x in out["blocking_reasons"])
         out["r365"] = {
             "trusted": not r365_failed and bool(r.get("available")),
             "coverage_start": r.get("coverage_start"),
@@ -3504,6 +3811,18 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "weeks_in_scope": r.get("weeks_in_scope"),
             "partial_weeks_in_scope": r.get("partial_weeks_in_scope"),
             "uncovered_dates_in_scope": r.get("uncovered_dates_in_scope"),
+        }
+    if DOMAIN_R365_FIN in doms:
+        f = meta.get("r365_financial") or {}
+        fin_failed = any(x.startswith("R365 FINANCIAL") for x in out["blocking_reasons"])
+        out["r365_financial"] = {
+            "trusted": not fin_failed and bool(f.get("available")),
+            "scope_is_whole_periods": f.get("scope_is_whole_periods"),
+            "loaded_period_range": f.get("loaded_period_range"),
+            "verified_categories": f.get("verified_categories"),
+            "periods_in_scope": f.get("periods_in_scope"),
+            "no_posting_in_scope": f.get("no_posting_in_scope"),
+            "last_refreshed_at": f.get("last_refreshed_at"),
         }
     if DOMAIN_REVEL in doms:
         rec = meta.get("reconciliation") or {}
@@ -3677,6 +3996,9 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
                 if DOMAIN_R365 in doms:
                     meta["r365"] = _r365_block(cur, establishment_id,
                                                period_start, period_end)
+                if DOMAIN_R365_FIN in doms:
+                    meta["r365_financial"] = _r365_fin_block(
+                        cur, establishment_id, period_start, period_end)
         finally:
             conn.rollback()
             conn.close()
@@ -3716,6 +4038,23 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
         rf, rw = _r365_gate(meta["r365"])
         fails += rf
         warns += rw
+
+    if DOMAIN_R365_FIN in doms:
+        if meta.get("r365_financial") is None:
+            # Revel-inclusive path: meta_extract does not build this block.
+            conn = _ro_conn()
+            try:
+                conn.set_session(readonly=True, autocommit=False)
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                    meta["r365_financial"] = _r365_fin_block(
+                        cur, establishment_id, period_start, period_end)
+            finally:
+                conn.rollback()
+                conn.close()
+        ff, fw = _r365_fin_gate(meta["r365_financial"])
+        fails += ff
+        warns += fw
 
     if DOMAIN_LABOR in doms and DOMAIN_REVEL not in doms:
         lb, lf, lw = _labor_gate(establishment_id, period_start, period_end)
@@ -4108,7 +4447,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
             for (c_est, c_start, c_end, c_doms), c_meta in list(scope_cache.items()):
                 if (DOMAIN_R365 in c_doms and "r365_trusted_figures" not in blocked
                         and (c_meta.get("r365") or {}).get("available")
-                        and not any(x.startswith("R365")
+                        and not any(_is_r365_ops_reason(x)
                                     for x in c_meta.get("blocking_reasons") or [])):
                     try:
                         blocked["r365_trusted_figures"] = r365_trusted_figures(
