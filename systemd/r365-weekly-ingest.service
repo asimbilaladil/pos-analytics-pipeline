@@ -1,16 +1,19 @@
 [Unit]
 Description=R365 weekly canonical ingest (weekly-report API -> PostgreSQL)
-Documentation=file:///root/pos-analytics-pipeline/migrations/54_r365_canonical.sql
+Documentation=file:///root/pos-analytics-pipeline-release/migrations/54_r365_canonical.sql
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
+# Code runs from the clean release checkout (detached at a merged commit).
+# /root/pos-analytics-pipeline holds unfinished pricing work and must never
+# be the code path; only its shared venv interpreter is used, as laynes-api does.
 Type=oneshot
-WorkingDirectory=/root/pos-analytics-pipeline
+WorkingDirectory=/root/pos-analytics-pipeline-release
 # All logic lives in the orchestrator: Chicago week targeting (latest TWO
 # completed Thursday->Wednesday weeks), flock, bounded HTTP retries, verbatim
 # raw archive, validation, idempotent upsert and the r365_ingest_run record.
-ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline/r365_weekly_ingest.py
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python /root/pos-analytics-pipeline-release/r365_weekly_ingest.py
 # The orchestrator reads the token from this root-only 0600 file itself.
 # Deliberately NOT EnvironmentFile=, so the token never appears in
 # `systemctl show` or the journal.
