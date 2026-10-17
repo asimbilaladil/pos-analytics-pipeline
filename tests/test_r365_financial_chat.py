@@ -481,16 +481,16 @@ for needle, what in [
         ("store-level swings can be posting timing", "period comparison timing caveat"),
         ("Its prior bill posted Sep 9, the final day of P9, and the next bill posted "
          "Oct 9 in P11, so P10 fell between two monthly postings", "Shepherd P10 explanation"),
-        ("The August bill posted Aug 12 in P8 and the next bill Sep 17 in P10, so the "
-         "apparent P9 gap is posting timing rather than evidence of zero usage",
+        ("The August bill posted Aug 12 in P8 and the next bill Sep 17 in P10, so P9 "
+         "fell between those two postings",
          "Beaumont P9 explanation"),
         ('"<Month> electricity posting not yet present in R365"', "not-yet-present wording"),
         ("never predict its date or amount", "no bill prediction"),
         ('"No identifiable electricity posting was found in R365 for <store>."',
          "no identifiable posting wording"),
-        ("bundled into rent, paid by the landlord, included in CAM",
-         "no landlord / rent / CAM speculation"),
-        ("Do not offer those as possible explanations either", "no speculative alternatives"),
+        ("Name no other place, account, party or arrangement that might cover it",
+         "no speculation about where it is paid or recorded"),
+        ("and do not rule any out either", "no ruling out of alternatives"),
         ('never "$0 (no posting)"', "no '$0 (no posting)' phrasing"),
         ('latest posting Sep 8 -> "October electricity posting not yet present in R365"',
          "Nederland October wording"),
@@ -635,9 +635,11 @@ note = C.r365_fin_result_note(C.enforce_scope(
     "SELECT store_name, expense_amount FROM v_r365_financial_period_llm WHERE "
     "analytics_category = 'ELECTRICITY' AND period_start = '2026-09-10'", None, *P10))
 check("run_sql result note (no check_data needed) lists P10 no-posting stores as NO POSTING",
-      note and "NO POSTING (never $0" in note and "LCF Shepherd P10" in note, str(note)[:160])
+      note and "NO POSTING is not $0" in note
+      and "LCF Shepherd had no electricity posting in P10" in note, str(note)[:160])
 check("run_sql result note marks Downtown as no identifiable posting, no timing caveat",
-      note and "NO IDENTIFIABLE POSTING in the whole loaded GL history: LCF Downtown Houston"
+      note and "NO IDENTIFIABLE POSTING in the whole loaded GL history" in note
+      and "No identifiable electricity posting was found in R365 for LCF Downtown Houston."
       in note and "do NOT apply the posting-timing caveat" in note)
 check("no note when every store has a posting / non-financial scope",
       C.r365_fin_result_note({"r365_financial": {"no_posting_in_scope": []}}) is None
@@ -794,7 +796,8 @@ note = C.r365_fin_result_note(C.enforce_scope(
     "analytics_category = 'WATER' AND period_start = '2026-09-10'", None, *P10),
     "SELECT store_name FROM v_r365_financial_period_llm WHERE analytics_category = 'WATER'")
 check("run_sql note for a WATER query lists only WATER no-posting stores",
-      note and "WATER" in note and "ELECTRICITY" not in note and "GAS" not in note, str(note)[:200])
+      note and "no water posting in P10" in note and "electricity posting" not in note
+      and "gas posting" not in note, str(note)[:200])
 check("run_sql note gives Downtown the water-specific no-identifiable sentence",
       note and "No identifiable water posting was found in R365 for LCF Downtown Houston." in note)
 G = C.R365_FINANCIAL_GUIDANCE
@@ -875,10 +878,125 @@ check("'overdue' and bill-pairing / usage claims are rejected even after a looku
       and unsupported_claims("P10 only captured the smaller companion charge", LOOKUP)
       and unsupported_claims("it isn't a usage anomaly", LOOKUP))
 check("guidance: no usage claims and no bill-pairing labels",
-      "never say a figure is or is not\n    a \"usage change\"" in G
+      "do not mention\n    usage at all, not even to deny it" in G
       and "do not label lines\n    \"main\", \"companion\"" in G)
 check("a failed lookup is not evidence",
       unsupported_claims("likely posting timing", [dict(LOOKUP[0], error="boom")]))
+
+# ---------------------------------------------------------------------------
+print("16. no posting is never $0; 'no identifiable' is all-history only; exact dates")
+from r365_fin_wording import zero_for_missing, misused_no_identifiable, wrong_day_counts  # noqa: E402
+
+STORES = sorted({n.replace("LCF ", "") for n in C.ESTABLISHMENTS.values()} | {"Downtown Houston"})
+conn, cur = ro()
+cur.execute("""SELECT period_label, start_date, end_date FROM v_ayg_business_periods_llm
+                WHERE fiscal_year = 2026""")
+PERIODS = {r["period_label"]: (r["start_date"], r["end_date"]) for r in cur.fetchall()}
+cur.execute("""SELECT store_name FROM v_r365_financial_period_llm
+                WHERE analytics_category = 'GAS' AND fiscal_year = 2026 AND period_number = 10
+                  AND NOT has_posting
+                  AND establishment_id IN (SELECT establishment_id FROM v_r365_financial_period_llm
+                                            WHERE analytics_category = 'GAS' AND fiscal_year = 2026
+                                              AND period_number = 9 AND has_posting)""")
+gas_gap = sorted(r["store_name"] for r in cur.fetchall())
+conn.close()
+check("A. data: 5 stores had a GAS posting in P9 but no posting in P10", len(gas_gap) == 5, str(gas_gap))
+ALLOWED = {"electricity": {"Downtown Houston"}, "water": {"Downtown Houston"}}
+
+# A. gas P9 vs P10 coverage wording
+for bad in ["these five stores totaled $3,247.43 of the P9 figure and contributed $0 to P10.",
+            "Katy had $0 in P10.", "Five stores had zero gas expense in P10."]:
+    check(f"A. rejects zero-for-missing: {bad[:45]}...", zero_for_missing(bad), bad)
+check("A. accepts '5 stores had a posting in P9 but no posting in P10'",
+      not zero_for_missing("5 stores had a posting in P9 but no posting in P10."))
+check("A. a negated '$0' stays allowed ('no posting, not $0')",
+      not zero_for_missing("Shepherd had no gas posting in P10 -- not $0, just no line."))
+
+# B. period-only gap vs all-history absence
+check("B. accepts 'Shepherd had no GAS posting in P10'",
+      not misused_no_identifiable("LCF Shepherd had no GAS posting in P10.", ALLOWED, STORES))
+for bad in ["So the drop is mostly a coverage difference -- five stores show no identifiable GAS posting in P10.",
+            "LCF Shepherd has no identifiable gas posting in P10."]:
+    check(f"B. rejects period-only 'no identifiable': {bad[:50]}...",
+          misused_no_identifiable(bad, ALLOWED, STORES), bad)
+
+# C. Downtown electricity: the all-history phrase stays allowed
+check("C. accepts 'No identifiable electricity posting was found in R365 for LCF Downtown Houston.'",
+      not misused_no_identifiable("No identifiable electricity posting was found in R365 for "
+                                  "LCF Downtown Houston.", ALLOWED, STORES))
+check("C. rejects the all-history phrase for a store that has postings",
+      misused_no_identifiable("No identifiable electricity posting was found in R365 for "
+                              "LCF Shepherd.", ALLOWED, STORES))
+
+from r365_fin_wording import reasons_for_unidentified  # noqa: E402
+check("C. rejects listing (even ruling out) reasons for Downtown",
+      reasons_for_unidentified("I can't say why (not bundled into rent, not paid by a landlord).")
+      and not reasons_for_unidentified("No identifiable electricity posting was found in R365 "
+                                       "for LCF Downtown Houston."))
+check("A. 'rather than counted as $0' is a negation, not a zero claim",
+      not zero_for_missing("it is excluded from rankings rather than counted as $0."))
+
+# D. Shepherd dates: exact dates fine; relative counts must be right (Oct 9 = 2 days after Oct 7)
+check("D. calendar: P10 ran Sep 10 - Oct 7, P11 starts Oct 8",
+      PERIODS["P10"] == (date(2026, 9, 10), date(2026, 10, 7)) and PERIODS["P11"][0] == date(2026, 10, 8))
+check("D. rejects 'Oct 9 ... one day after P10 ended'",
+      wrong_day_counts("- **Oct 9, 2026** - $1,955.84 (posted in P11, one day after P10 ended)", PERIODS))
+check("D. accepts 'Oct 9 ... two days after P10 ended' and 'two days into P11'",
+      not wrong_day_counts("Next bill: Oct 9, two days after P10 ended", PERIODS)
+      and not wrong_day_counts("the next bill landed on Oct 9, two days into P11", PERIODS))
+check("D. accepts exact dates with no relative count",
+      not wrong_day_counts("Previous posting: Sep 9 (P9). Next posting: Oct 9 (P11). P10 ran Sep 10-Oct 7.", PERIODS))
+check("D. rejects a wrong count before a period ('Sep 9 was two days before P10')",
+      wrong_day_counts("Prior bill posted Sep 9 two days before P10", PERIODS))
+check("D. accepts a right count; an unanchored count must fit a stated posting date",
+      not wrong_day_counts("the Sep 9 bill landed one day before P10 started", PERIODS)
+      and not wrong_day_counts("Next posting: Oct 9 (P11).\nThe next bill landed two days "
+                               "into P11.", PERIODS)
+      and wrong_day_counts("Next posting: Oct 9 (P11).\nThe next bill landed one day "
+                           "into P11.", PERIODS)
+      and wrong_day_counts("the next bill didn't post until two days into P11", PERIODS))
+check("note opens with the frame rule: no usage in either direction, report what rows show",
+      C.r365_fin_result_note(m).startswith(C.R365_FIN_FRAME_RULE)
+      and C.r365_fin_result_note({"r365_financial_detail": {"available": True}}).startswith(C.R365_FIN_FRAME_RULE)
+      and "Do not mention usage or consumption at all, in either direction" in C.R365_FIN_FRAME_RULE
+      and "not what they are not" in C.R365_FIN_FRAME_RULE)
+check("detail note: the only remark on cause for a no-identifiable store is fixed",
+      "your ENTIRE remark on cause is: \"The available accounting data does not establish why.\""
+      in C.r365_fin_result_note({"r365_financial_detail": {"available": True}}))
+check("summary note: same fixed remark for the no-identifiable store",
+      "Your ENTIRE remark on cause is" in C.r365_fin_result_note(
+          {"r365_financial": {"no_posting_in_scope": ["LCF Downtown Houston P10 ELECTRICITY"],
+                              "no_identifiable_posting": ["LCF Downtown Houston ELECTRICITY"]}}))
+check("guidance: asked why, the fixed remark", "Asked WHY, the whole\n    remark on cause" in C.R365_FINANCIAL_GUIDANCE)
+check("negation window covers 'No electricity expense was \"$0\"'",
+      not zero_for_missing('No electricity expense was "$0" for the period.'))
+check("note: no overdue / usage claims",
+      "Never call a posting overdue, late or missed" in C.R365_FIN_DATE_RULE)
+
+# the deterministic note carries the rules next to the rows
+m = {"r365_financial": {"no_posting_in_scope": ["LCF Shepherd P10 GAS",
+                                                "LCF Downtown Houston P10 ELECTRICITY"],
+                        "no_identifiable_posting": ["LCF Downtown Houston ELECTRICITY"],
+                        "verified_categories": ["GAS", "ELECTRICITY"]}}
+note = C.r365_fin_result_note(m)
+check("note: period-only gap gets 'had no gas posting in P10', not 'no identifiable'",
+      "\"LCF Shepherd had no gas posting in P10\"" in note
+      and "No identifiable gas posting" not in note, note[:300])
+check("note: 'no identifiable' offered only for the all-history store",
+      "\"No identifiable electricity posting was found in R365 for LCF Downtown Houston.\"" in note
+      and "the only stores that phrase may be used for" in note)
+check("note: bans $0 / contributed $0 and gives the comparison sentence",
+      "never write \"$0\", \"contributed $0\"" in note
+      and "N stores had a posting in P9 but no posting in P10" in note)
+check("note: date rule -- exact dates, no relative counts unless SQL computed them",
+      "Never state a relative day count" in note and "do not do date arithmetic yourself" in note)
+dn = C.r365_fin_result_note({"r365_financial_detail": {"available": True}})
+check("detail-line results get the no-$0 / all-history / date note too",
+      dn and "never write $0" in dn and "whole loaded history" in dn
+      and "Never state a relative day count" in dn, str(dn)[:200])
+check("guidance: comparison and date wording",
+      "\"N stores had a posting in P9 but no posting in P10\"" in C.R365_FINANCIAL_GUIDANCE
+      and "never a relative day count" in C.R365_FINANCIAL_GUIDANCE)
 
 failed = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
