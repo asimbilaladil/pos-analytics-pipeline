@@ -1219,7 +1219,15 @@ Always:
     never ranked as the lowest;
   * state totals as "across N of 12 stores with a posting" (count of
     expense_amount; SUM ignores the NULLs);
-  * never average with them counted as 0.
+  * never average with them counted as 0, and never say such a store
+    "contributed $0" or had "zero <category> expense": in a comparison say
+    "N stores had a posting in P9 but no posting in P10";
+  * a store that has earlier postings but none in this period "had no GAS
+    posting in P10" -- "no identifiable <category> posting" is ONLY for a
+    store with no line of that category in the whole loaded history;
+  * DATES: give exact dates ("Previous posting: Sep 9. Next posting: Oct 9.
+    P10 ran Sep 10-Oct 7.") and never a relative day count ("one day after",
+    "two days into") unless SQL computed it.
 
 UTILITY POSTING SEMANTICS (electricity, and the same for GAS, WATER and RENT --
 replace "electricity" / 'ELECTRICITY' with the category asked about; see
@@ -1279,13 +1287,13 @@ REPAIRS & MAINTENANCE below for R&M):
     whole loaded history (check the transaction view from '2024-04-07'; today:
     LCF Downtown Houston for ELECTRICITY and WATER), say exactly: "No
     identifiable electricity posting was found in R365 for <store>." (or
-    "No identifiable water posting ..."). Do NOT say its electricity is $0,
-    bundled into rent, paid by the landlord, included in CAM or common-area
-    charges, or on another account -- none of that is proven by the GL. Do not offer those as
-    possible explanations either, not even as an "e.g." of what you cannot
-    say: give no reason at all, and do not list, hint at or rule out any
-    candidate reason, confirmed or not. Exclude it from rankings and averages and
-    list it separately. In any no-posting list, give such a store that
+    "No identifiable water posting ..."). Do NOT say its electricity is $0.
+    Name no other place, account, party or arrangement that might cover it,
+    and do not rule any out either -- none is proven by the GL. Give no
+    reason at all, not even as an "e.g." of what you cannot say, and do not
+    hint at any candidate reason, confirmed or not. Asked WHY, the whole
+    remark on cause is: "The available accounting data does not establish
+    why." Exclude it from rankings and averages and list it separately. In any no-posting list, give such a store that
     sentence instead of the posting-timing caveat.
   * STORE RANKINGS ("which store has the highest electricity cost?") with no
     period named: do NOT rank on one 28-day fiscal period. Rank on the last 6
@@ -1366,8 +1374,8 @@ REPAIRS_MAINTENANCE). Keep OBSERVATION apart from EXPLANATION.
     previous posting, $2,081.81, was Sep 9 in P9"): do not label lines
     "main", "companion", "secondary" or "partial" bills, and do not conclude
     that this "explains" the low amount.
-  * USAGE. GL lines say nothing about usage: never say a figure is or is not
-    a "usage change", "usage anomaly" or "lower usage", in either direction.
+  * USAGE. GL lines say nothing about usage or consumption: do not mention
+    usage at all, not even to deny it -- describe postings and coverage only.
     And never call a posting "overdue", "late" or "missed" (NOT YET PRESENT
     wording only).
   * A PERIOD DIFFERENCE without queried adjacent dates: report the figures and
@@ -1432,8 +1440,8 @@ never say the drop IS (or is mostly, likely, plausibly) timing. For a
 SINGLE store's comparison ("compare Beaumont P9 vs P10") also run the
 posting-dates query from UTILITY POSTING SEMANTICS and name the adjacent
 bills, e.g. "P9 has no posting; P10 has $2,238.88. The August bill posted
-Aug 12 in P8 and the next bill Sep 17 in P10, so the apparent P9 gap is
-posting timing rather than evidence of zero usage."
+Aug 12 in P8 and the next bill Sep 17 in P10, so P9 fell between those two
+postings."
 CURRENT PERIOD: period_status CURRENT (or source_data_status PARTIAL) is still
 open and incomplete: say so and never compare it with a closed period's total.
 SOURCE QUALITY: source_quality MIGRATED_SUMMARY (FY2026 P1-P3 era) is migrated
@@ -3381,16 +3389,31 @@ def _split_store_category(entry: str) -> tuple[str, str]:
     return store, category
 
 
+R365_FIN_DATE_RULE = (
+    "DATES: state exact dates only, in this form: \"Previous posting: Sep 9 (P9). Next "
+    "posting: Oct 9 (P11). P10 ran Sep 10-Oct 7.\" Never state a relative day count "
+    "(\"one day before\", \"two days into\", \"the day after\") unless SQL computed it "
+    "-- do not do date arithmetic yourself. Never call a posting overdue, late or "
+    "missed.")
+R365_FIN_FRAME_RULE = (
+    "FIRST: describe postings, amounts, dates and store coverage only. Do not mention "
+    "usage or consumption at all, in either direction -- the GL has none -- and report "
+    "what the rows show, not what they are not. ")
+
+
 def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
     """A short R365 FINANCIAL note attached to a run_sql result. PURE.
 
     The gate's warnings only reach the model through check_data, which a plain
-    period question may skip; the no-posting distinction must not depend on
-    that. Stores with no line of the category in the whole loaded history get
-    the "no identifiable posting" wording instead of the billing-timing caveat.
-    When the SQL names categories ('GAS', ...), only those are listed.
+    period question may skip, and prompt-only wording rules showed run-to-run
+    variance; the note puts them next to the rows. It names, per store, the
+    exact wording for a period-only gap ("had no GAS posting in P10") and
+    reserves "no identifiable posting" for stores with no line of the category
+    in the whole loaded history. When the SQL names categories ('GAS', ...),
+    only those are listed. Detail-line results get the date rule.
     """
-    f = (gate_meta or {}).get("r365_financial") or {}
+    gate_meta = gate_meta or {}
+    f = gate_meta.get("r365_financial") or {}
     no_posting = list(f.get("no_posting_in_scope") or [])
     no_ident = list(f.get("no_identifiable_posting") or [])
     named = {c for c in f.get("verified_categories") or [] if sql and f"'{c}'" in sql}
@@ -3398,23 +3421,50 @@ def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
         no_posting = [e for e in no_posting if _split_store_category(e)[1] in named]
         no_ident = [e for e in no_ident if _split_store_category(e)[1] in named]
     if not no_posting:
+        if gate_meta.get("r365_financial_detail"):
+            return (R365_FIN_FRAME_RULE + "R365 FINANCIAL lines. A store or period with no line here had NO "
+                    "POSTING -- never write $0, zero expense or spent nothing for it. "
+                    "\"No identifiable <category> posting\" is only for a store with no "
+                    "line of that category in the whole loaded history. For such a store "
+                    "your ENTIRE remark on cause is: \"The available accounting data does "
+                    "not establish why.\" -- add no examples, guesses or lists of what it "
+                    "might or might not be. Explain a gap only from the dates of the lines "
+                    "you queried. "
+                    + R365_FIN_DATE_RULE)
         return None
-    note = ("NO POSTING (never $0, not missing source data) for: "
-            + "; ".join(no_posting) + ". Posting timing is one possibility, "
-            "not a finding: explain a specific store's gap only from its queried "
-            "adjacent posting dates. Until you have queried them, your ONLY remark on "
-            "timing is: \"The difference may reflect posting timing, but that is not "
-            "established from this result alone.\" -- do not call timing likely, "
-            "plausible, probable or the driver of a change, and offer no other cause.")
-    if no_ident:
-        sentences = " ".join(
-            f"\"No identifiable {r365_fin_category_word(c)} posting was found in R365 "
-            f"for {st}.\"" for st, c in map(_split_store_category, no_ident))
-        note += (" Of these, NO IDENTIFIABLE POSTING in the whole loaded GL history: "
-                 + "; ".join(no_ident) + " -- say " + sentences + " Give no reason, "
-                 "and do NOT apply the posting-timing caveat to it.")
+    ident = set(no_ident)
+    period_only, unidentified = [], []
+    for e in no_posting:
+        rest, category = _split_store_category(e)
+        store, period = _split_store_category(rest)
+        word = r365_fin_category_word(category)
+        if f"{store} {category}" in ident:
+            unidentified.append(f"\"No identifiable {word} posting was found in R365 "
+                                f"for {store}.\"")
+        else:
+            period_only.append(f"\"{store} had no {word} posting in {period}\"")
+    note = (R365_FIN_FRAME_RULE + "NO POSTING is not $0: never write \"$0\", \"contributed $0\", \"zero "
+            "expense\" or \"spent nothing\" for a store with no posting, and never count "
+            "it as 0 in a total or a change. In a period comparison say \"N stores had a "
+            "posting in P9 but no posting in P10\" and report like-for-like stores "
+            "separately.")
+    if period_only:
+        note += (" PERIOD-ONLY GAPS (these stores DO have earlier postings, so never call "
+                 "them \"no identifiable\"): say " + "; ".join(sorted(set(period_only)))
+                 + ".")
+    if unidentified:
+        note += (" NO IDENTIFIABLE POSTING in the whole loaded GL history (the only stores "
+                 "that phrase may be used for): say " + " ".join(sorted(set(unidentified)))
+                 + " Your ENTIRE remark on cause is: \"The available accounting data does "
+                 "not establish why.\" -- add no examples, guesses or lists of what it might "
+                 "or might not be, and do NOT apply the posting-timing caveat to it.")
+    note += (" Posting timing is one possibility, not a finding: explain a specific "
+             "store's gap only from its queried adjacent posting dates. Until you have "
+             "queried them, your ONLY remark on timing is: \"The difference may reflect "
+             "posting timing, but that is not established from this result alone.\" -- do "
+             "not call timing likely, plausible, probable or the driver of a change, and "
+             "offer no other cause. " + R365_FIN_DATE_RULE)
     return note
-
 
 def _r365_fin_gate(f: dict) -> tuple[list, list]:
     """R365 FINANCIAL's own trust gate. PURE. Every reason starts with
@@ -3459,8 +3509,8 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
                      "history for: " + "; ".join(f["no_identifiable_posting"]) + ". Say "
                      "\"No identifiable <category> posting was found in R365 for <store>.\" "
                      "(e.g. \"No identifiable electricity posting ...\") -- do NOT "
-                     "attribute it to billing timing, and give no reason (not $0, not "
-                     "rent, landlord or CAM)")
+                     "attribute it to billing timing, and give no reason: not $0, and "
+                     "no possible cause named or ruled out")
     failed = sorted({f"FY{p['fiscal_year']} {p['period_label']}"
                      for p in f.get("periods_in_scope") or [] if p["latest_refresh_failed"]})
     if failed:
