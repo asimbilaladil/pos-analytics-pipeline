@@ -829,13 +829,15 @@ for needle, what in [
         ("Never infer a partial-period bill, partial invoice, true or low\n    usage, billing error, catch-up bill or estimated bill",
          "bans unverified low-amount theories"),
         ("so P10 fell between those two\n    postings.", "evidence-based Shepherd example kept"),
-        ("never say the drop IS (or is mostly, likely, plausibly) timing", "period comparison guard")]:
+        ("never say the drop IS (or is mostly, likely, plausibly) timing", "period comparison guard"),
+        ("Use that sentence as the WHOLE timing remark", "unchecked-timing sentence stands alone")]:
     check(f"guidance: {what}", needle in G)
 check("guidance still says NO POSTING is never $0", "never \"$0\", \"zero expense\"" in G)
 note = C.r365_fin_result_note({"r365_financial": {"no_posting_in_scope": ["LCF Shepherd P10 GAS"],
                                                   "verified_categories": ["GAS"]}})
-check("run_sql note calls timing a possibility, not a finding, and bans likely/plausible",
-      "one possibility, not a finding" in note and "\"plausible\"" in note
+check("run_sql note calls timing a possibility, not a finding, and gives the only allowed remark",
+      "one possibility, not a finding" in note and "plausible" in note
+      and "your ONLY remark on timing is: \"The difference may reflect posting timing" in note
       and "CAN explain" not in note, note)
 
 LOOKUP = [{"sql": "SELECT store_name, accounting_date, period_label, expense_amount "
@@ -851,6 +853,7 @@ bad = {
     "partial-period posting": "Mission Bend's low figure could be a partial-period posting.",
     "true low usage": "rather than true low usage",
     "most of the drop is timing": "most of that network drop is driven by which stores billed",
+    "plausible structural explanation": "only that it's a plausible structural explanation given the coverage pattern",
 }
 for what, text in bad.items():
     check(f"guard rejects unsupported '{what}' without a posting-date lookup",

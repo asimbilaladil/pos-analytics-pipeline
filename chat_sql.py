@@ -1373,7 +1373,10 @@ REPAIRS_MAINTENANCE). Keep OBSERVATION apart from EXPLANATION.
   * A PERIOD DIFFERENCE without queried adjacent dates: report the figures and
     the coverage difference (which stores posted in each period), then say
     "The difference may reflect posting timing, but that is not established
-    from this result alone." Do not say which share of it is timing.
+    from this result alone." Use that sentence as the WHOLE timing remark:
+    do not add that timing is plausible, structural, expected or the main
+    driver, and do not say which share of it is timing. (Saying that the
+    like-for-like stores were flat is an observation and is fine.)
 
 NO HOURS, NO USAGE TIMES. Summaries exist per fiscal period; detail lines
 carry an ACCOUNTING DATE (when the bill or entry was booked), never a time of
@@ -3399,8 +3402,10 @@ def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
     note = ("NO POSTING (never $0, not missing source data) for: "
             + "; ".join(no_posting) + ". Posting timing is one possibility, "
             "not a finding: explain a specific store's gap only from its queried "
-            "adjacent posting dates; until then say it is not established -- never "
-            "\"likely\", \"plausible\" or \"probably\" timing, and offer no other cause.")
+            "adjacent posting dates. Until you have queried them, your ONLY remark on "
+            "timing is: \"The difference may reflect posting timing, but that is not "
+            "established from this result alone.\" -- do not call timing likely, "
+            "plausible, probable or the driver of a change, and offer no other cause.")
     if no_ident:
         sentences = " ".join(
             f"\"No identifiable {r365_fin_category_word(c)} posting was found in R365 "
