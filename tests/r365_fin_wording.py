@@ -7,8 +7,7 @@ phrases are unsupported causal claims.
 import re
 
 UNSUPPORTED = [
-    r"very plausible",
-    r"\bplausible explanation",
+    r"\bplausib",                      # plausible / plausibly, in any phrasing
     r"\blikely (?:posting |billing |bill )?timing",
     r"\btiming is likely",
     r"\bprobably (?:because|timing|due)",
