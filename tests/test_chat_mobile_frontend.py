@@ -72,6 +72,7 @@ class MockApi:
         self.convs, self.jobs, self.keys = {}, {}, {}
         self.next_id, self.polls, self.posts, self.conv_gets = 100, 0, [], 0
         self.lose_ack = None          # coroutine run between server work and the reply
+        self.models = ["m"]
 
     def complete(self, job_id, text="FINAL ANSWER"):
         j = self.jobs[job_id]
@@ -88,7 +89,7 @@ class MockApi:
         if path == "/auth/me":
             return await ok({"id": 7, "email": "t@x", "full_name": "T", "role": "user", "is_admin": False})
         if path == "/models":
-            return await ok({"models": ["m"], "default": "m"})
+            return await ok({"models": self.models, "default": self.models[0]})
         if path == "/conversations" and m == "GET":
             return await ok([{"id": c["id"], "title": c["title"], "model": "m",
                               "updated_at": "2026-10-18T00:00:00Z"} for c in self.convs.values()])
@@ -347,6 +348,34 @@ async def main():
         check("an idle conversation opens without an error banner (active-job null)",
               u["answers"] == 1 and u["error"] is None, str(u))
         await ctx.close()
+
+        # Model picker on a phone: visible, on screen, and it changes the model sent
+        for width in (390, 320):
+            api = MockApi()
+            api.models = ["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5-20251001"]
+            ctx, p, cdp = await fresh(api, await browser.new_context(
+                viewport={"width": width, "height": 800}, is_mobile=True, has_touch=True))
+            sel = p.locator("select[aria-label='Assistant model']")
+            box = await sel.bounding_box() if await sel.is_visible() else None
+            check(f"model picker is visible on a {width}px phone",
+                  box is not None and box["x"] >= 0 and box["x"] + box["width"] <= width, str(box))
+            boxes = await p.evaluate("""() => Array.from(document.querySelectorAll('header button, header select'))
+                .filter(e => e.offsetParent !== null).map(e => { const r = e.getBoundingClientRect();
+                  return [r.left, r.right] })""")
+            boxes.sort()
+            overlap = any(a[1] > b[0] + 0.5 for a, b in zip(boxes, boxes[1:]))
+            scroll_w = await p.evaluate("document.documentElement.scrollWidth")
+            check(f"{width}px header: controls do not overlap and the page does not scroll sideways",
+                  not overlap and scroll_w <= width, f"{boxes} scrollWidth={scroll_w}")
+            fs = await sel.evaluate("e => parseFloat(getComputedStyle(e).fontSize)")
+            check(f"{width}px: picker text is >= 16px (no iOS zoom on tap)", fs >= 16, str(fs))
+            await sel.select_option("claude-opus-5")
+            await ask(p)
+            await until(p, lambda u: u["thinking"])
+            check(f"{width}px: the chosen model is sent with the question",
+                  api.posts and api.posts[-1].get("model") == "claude-opus-5",
+                  str(api.posts[-1].get("model") if api.posts else None))
+            await ctx.close()
         await browser.close()
 
 
