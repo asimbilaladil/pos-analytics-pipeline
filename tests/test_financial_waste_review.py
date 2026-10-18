@@ -240,7 +240,7 @@ skipped = [st for st in r.steps if st.get("error") == "not executed: review tool
 check("review: at most 3 run_sql executed", len(executed) == 3, str(len(executed)))
 check("review: a 4th query is refused, not run", len(skipped) == 1)
 check("review: then one synthesis call without tools",
-      len(f.calls) == 3 and "tools" not in f.calls[-1] and r.answer == "Review answer.")
+      len(f.calls) == 3 and "tools" not in f.calls[-1] and r.answer.startswith("Review answer."))
 check("review: the plan is in the system prompt of every call",
       all(any("FINANCIAL_WASTE_REVIEW" in b["text"] for b in c["system"]) for c in f.calls))
 check("review: synthesis carries the review answer rules",
@@ -250,6 +250,101 @@ check("review: intent and window recorded in steps",
 r, f = run("How much electricity did we spend in P10?", [resp("end_turn", text("x"))])
 check("ordinary question: no review plan in the system prompt",
       not any("FINANCIAL_WASTE_REVIEW" in b["text"] for b in f.calls[0]["system"]))
+
+# ---------------------------------------------------------------------------
+print("7. Margin targets (computed in SQL, guaranteed in the answer)")
+r0 = out["Q1"]["rows"][0]
+check("Q1: net sales 4,178,625.62", r0["network_net_sales"] == 4178625.62, str(r0["network_net_sales"]))
+check("Q1: one_margin_point = 41,786.26", r0["one_margin_point"] == 41786.26, str(r0["one_margin_point"]))
+check("Q1: two_margin_points = 83,572.52", r0["two_margin_points"] == 83572.52, str(r0["two_margin_points"]))
+check("Q1: three_margin_points = 125,358.78", r0["three_margin_points"] == 125358.78, str(r0["three_margin_points"]))
+ev = {"targets": r0, "scenario": out["Q2"]["rows"][0]}
+g = C.fin_review_guarantee("Review body without the figures.", ev)
+check("backstop: missing targets are appended from SQL",
+      "1 point = $41,786.26" in g and "2 points = $83,572.52" in g and "3 points = $125,358.78" in g, g[-260:])
+check("backstop: targets labelled target size only, not savings", "target size only, not savings" in g)
+hyp = ("The $93,954.27 / 2.25-point outlier-to-median scenario is the current working hypothesis "
+       "for the 2–3 point objective, pending invoice, contract and business validation. "
+       "It is not confirmed savings.")
+check("backstop: exact working-hypothesis sentence appended from SQL", hyp in g, g[-300:])
+full = "1 point = $41,786.26, 2 points = $83,572.52, 3 points = $125,358.78. " + hyp
+check("backstop: nothing appended when the answer already has both", C.fin_review_guarantee(full, ev) == full)
+check("backstop: never turns an empty answer into a partial one", C.fin_review_guarantee("", ev) == "")
+check("synthesis rules: targets + exact hypothesis sentence + banned framings",
+      "\"2 points = $<two_margin_points>\"" in C.FIN_REVIEW_SYNTHESIS_RULES
+      and "working hypothesis for the 2–3 point objective" in C.FIN_REVIEW_SYNTHESIS_RULES
+      and "It is not confirmed savings." in C.FIN_REVIEW_SYNTHESIS_RULES
+      and "identified, achievable or confirmed savings" in C.FIN_REVIEW_SYNTHESIS_RULES)
+check("plan: the three target lines in the executive summary",
+      "\"3 points = $<three_margin_points>\"" in C.fin_review_plan(w))
+r, f = run(EXACT, [resp("tool_use", tool(1, TPL["Q1"], s, e), tool(2, TPL["Q2"], s, e)),
+                   resp("tool_use", tool(3, PERIOD_SQL)),
+                   resp("end_turn", text("Review body that forgot the targets."))])
+check("review answer always carries the three targets and the hypothesis sentence",
+      all(x in r.answer for x in ("$41,786.26", "$83,572.52", "$125,358.78", "working hypothesis",
+                                  "It is not confirmed savings.")), r.answer[-300:])
+
+# ---------------------------------------------------------------------------
+print("8. Blocked path: same synthesis helper, evidence kept, never empty")
+UNBOUNDED = ("SELECT store_name, SUM(expense_amount) AS total FROM v_r365_financial_transaction_llm "
+             "WHERE gl_account_number = '6000-14' GROUP BY store_name")
+BOUNDED = ("SELECT store_name, SUM(expense_amount) AS total FROM v_r365_financial_transaction_llm "
+           f"WHERE gl_account_number = '6000-14' AND accounting_date >= '{s}' "
+           f"AND accounting_date < '{e}' GROUP BY store_name")
+
+
+def check_data(i):
+    return SimpleNamespace(type="tool_use", id=f"c{i}", name="check_data",
+                           input={"establishment_id": None, "period_start": s, "period_end": e,
+                                  "domains": ["r365_financial_detail"]})
+
+
+Q_HVAC = "Which stores spent most on HVAC repairs in P9 and P10?"
+blocked_script = [resp("tool_use", check_data(1), tool(2, BOUNDED, s, e)),
+                  resp("tool_use", tool(3, UNBOUNDED, s, e))]
+r, f = run(Q_HVAC, blocked_script + [resp("max_tokens", thinking()),
+                                     resp("end_turn", text("Answer from the bounded HVAC rows."))])
+ok_steps = [st for st in r.steps if st.get("sql") == BOUNDED and not st.get("error")]
+rej = [st for st in r.steps if st.get("sql") == UNBOUNDED]
+check("E. the unbounded query is still rejected by the gate, never executed",
+      rej and "explicit date bounds" in rej[0]["error"] and rej[0]["row_count"] is None)
+synth = f.calls[2:]
+check("A. blocked path goes through the common helper (tools off, thinking disabled)",
+      synth and all("tools" not in c and c.get("thinking") == {"type": "disabled"} for c in synth))
+sent = json.dumps(synth[0]["messages"], default=str)
+check("A. earlier successful evidence is in the synthesis context",
+      ok_steps and ok_steps[0]["row_count"] > 0 and "LCF Missouri City" in sent)
+verdict = synth[0]["messages"][-1]["content"]
+check("A. the rejected query's error is passed as context; source not called untrusted",
+      "rejected_query_error" in verdict and '"source_trusted":true' in verdict
+      and "The data source PASSED its trust gate" in verdict
+      and "explicit date bounds" in verdict and "failed its trust gate" not in verdict, verdict[:200])
+check("B/C. thinking-only/max_tokens on the blocked call -> one retry -> visible answer",
+      len(synth) == 2 and r.answer == "Answer from the bounded HVAC rows.", r.answer)
+check("blocked step records the common helper",
+      any(st.get("forced_synthesis") == "blocked" for st in r.steps))
+r, f = run(Q_HVAC, blocked_script + [resp("max_tokens", thinking()), resp("end_turn", text(""))])
+check("D. retry also empty -> explicit fallback, never \"\"",
+      r.answer == C.EMPTY_ANSWER_FALLBACK and len(f.calls) == 4, r.answer)
+r, f = run(Q_HVAC, [resp("tool_use", check_data(1))] * 1 + [resp("end_turn", text("ok"))])
+check("a passing check_data alone does not trigger the blocked path",
+      not any(st.get("forced_synthesis") == "blocked" for st in r.steps))
+Q3_BAD = TPL["Q3"].replace("AND (<PAIRS>)", "").replace(
+    f"WHERE accounting_date >= '{s}' AND accounting_date < '{e}'\n", "WHERE TRUE\n")
+r, f = run(EXACT, [resp("tool_use", tool(1, TPL["Q1"], s, e), tool(2, TPL["Q2"], s, e)),
+                   resp("tool_use", tool(3, Q3_BAD, s, e)),
+                   resp("end_turn", text("Review from Q1 and Q2; drill-down not completed."))])
+done = [st for st in r.steps if st.get("sql") and not st.get("error")]
+bad = [st for st in r.steps if st.get("sql") == Q3_BAD]
+sent = json.dumps(f.calls[-1]["messages"], default=str)
+check("review: Q3 rejected by the gate (unbounded), Q1 + Q2 kept",
+      len(done) == 2 and bad and bad[0]["error"] and "one_margin_point" in sent
+      and "scenario_outliers_to_median_excl_rent" in sent)
+check("review: still answers (with targets) instead of the fallback",
+      r.answer.startswith("Review from Q1 and Q2") and "$83,572.52" in r.answer
+      and r.answer != C.EMPTY_ANSWER_FALLBACK)
+check("only two messages.create call sites remain (main loop + common helper)",
+      open("chat_sql.py").read().count("client.messages.create(") == 2)
 
 failed = [x for x in results if not x[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

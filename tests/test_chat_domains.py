@@ -320,11 +320,15 @@ check("a healthy live profile is not marked blocked",
 
 # The wiring itself: one final tool-free call, and the loop stops.
 _src = open("chat_sql.py").read()
+# The blocked path shares the one final-synthesis helper (tools off, thinking
+# disabled, one retry) with the other final-answer paths.
+_helper = _src[_src.index("def _forced_synthesis("):_src.index("def _fmt_usd(")]
+_blocked_call = 'client, model, system, messages, timings, "blocked",'
 check("the short circuit makes a final model call WITHOUT tools",
-      "anthropic.final_blocked" in _src
-      and "model=model, max_tokens=4096, system=system, messages=messages)" in _src)
+      _blocked_call in _src and "tools=" not in _helper
+      and 'thinking={"type": "disabled"}' in _helper)
 check("the short circuit breaks the tool loop",
-      _src.index("anthropic.final_blocked") < _src.index("break", _src.index("anthropic.final_blocked")))
+      _src.index(_blocked_call) < _src.index("break", _src.index(_blocked_call)))
 check("the verdict is marked authoritative so the model does not re-check",
       "DATA TRUST VERDICT (authoritative, do not re-check)" in _src)
 
