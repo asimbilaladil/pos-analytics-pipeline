@@ -4930,6 +4930,8 @@ SELECT l.gl_account_number, l.gl_account_name, l.account_type, l.analytics_categ
        ROUND(100 * SUM(l.expense_amount) / MAX(t.network_net_sales), 3) AS pct_of_net_sales,
        ROUND(MAX(t.network_net_sales), 2) AS network_net_sales,
        ROUND(MAX(t.network_net_sales) / 100, 2) AS one_margin_point,
+       ROUND(ROUND(MAX(t.network_net_sales) / 100, 2) * 2, 2) AS two_margin_points,
+       ROUND(ROUND(MAX(t.network_net_sales) / 100, 2) * 3, 2) AS three_margin_points,
        ROUND(MAX(t.controllable_total), 2) AS controllable_total,
        ROUND(MAX(t.controllable_total) * 0.05, 2) AS scenario_5pct_of_controllable,
        ROUND(MAX(t.controllable_total) * 0.10, 2) AS scenario_10pct_of_controllable,
@@ -5081,8 +5083,8 @@ and run it once:
 METHOD (all numbers come from the query results; do not compute new totals,
 ratios or sums by hand):
   * % of net sales = account expense / R365 net sales of the same window.
-    1 margin point = one_margin_point dollars (1% of that net sales);
-    2 and 3 points are that figure x2 and x3.
+    Margin TARGET SIZE (not savings): one_margin_point, two_margin_points and
+    three_margin_points from Q1 -- 1%, 2% and 3% of that net sales.
   * HIGH_OUTLIER >= 1.5x and MODERATE_OUTLIER >= 1.25x the median store's
     ratio, among stores with comparable posting coverage. Stores with fewer
     periods posted than their peers are INSUFFICIENT_POSTING_COVERAGE and are
@@ -5116,8 +5118,11 @@ ratios or sums by hand):
 
 ANSWER (concise and decision-oriented: at most 700 words, markdown headings,
 a table is fine):
-  EXECUTIVE SUMMARY -- window; non-food/non-labor expense analysed (sum of Q1
-    totals is not needed: give controllable_total and the largest accounts);
+  EXECUTIVE SUMMARY -- window; network net sales; the three target lines
+    "1 point = $<one_margin_point>", "2 points = $<two_margin_points>",
+    "3 points = $<three_margin_points>" (target size only);
+    non-food/non-labor expense analysed (give controllable_total and the
+    largest accounts);
     largest controllable accounts; strongest store outliers; scenario sizes in
     dollars and margin points; whether 2-3 points looks realistic from this
     evidence alone.
@@ -5133,8 +5138,20 @@ a table is fine):
 End with the conclusion, never with "let me check" or a promise to analyse."""
 
 
+FIN_REVIEW_HYPOTHESIS_SENTENCE = (
+    "The ${scenario} / {points}-point outlier-to-median scenario is the current "
+    "working hypothesis for the 2\u20133 point objective, pending invoice, contract "
+    "and business validation. It is not confirmed savings.")
 FIN_REVIEW_SYNTHESIS_RULES = (
-    "Use the FINANCIAL_WASTE_REVIEW answer structure, AT MOST 700 WORDS. Compare "
+    "Use the FINANCIAL_WASTE_REVIEW answer structure, AT MOST 700 WORDS. In the "
+    "executive summary show the margin targets exactly as returned by Q1: "
+    "\"1 point = $<one_margin_point>\", \"2 points = $<two_margin_points>\", "
+    "\"3 points = $<three_margin_points>\" -- target size only, never savings. "
+    "Describe the outlier-to-median result only with this sentence, filled from "
+    "Q2: \"" + FIN_REVIEW_HYPOTHESIS_SENTENCE.format(
+        scenario="<scenario_outliers_to_median_excl_rent>",
+        points="<scenario_margin_points>") + "\" Never call any figure "
+    "identified, achievable or confirmed savings, or a path to 2-3 points. Compare "
     "stores only through x_median and median_store_pct as returned; no other "
     "multiples. Report each scenario on its own with its margin points -- no "
     "ranges, and no totals added up by hand (not even of documents). If a query failed, answer from the ones "
@@ -5158,21 +5175,56 @@ def _text_of(resp) -> str:
 
 
 def _forced_synthesis(client, model, system, messages, timings, reason: str,
-                      extra: str = "") -> str:
-    """One last call WITHOUT tools and without thinking, so the whole output
-    budget goes to the answer. Used when a call ended without text (output
-    budget spent on thinking), when a tool budget is reached, and when the loop
-    runs out -- in each case the evidence already gathered is kept."""
+                      extra: str = "", instruction: str | None = None) -> str:
+    """The ONE final-answer call: WITHOUT tools and without thinking, so the
+    whole output budget goes to the answer, over `messages` -- i.e. every tool
+    result already gathered. Used when a call ended without text, when a tool
+    budget is reached, when the loop runs out, and on the blocked path.
+    A reply with no text is retried once; "" is returned only if both fail
+    (the caller then saves EMPTY_ANSWER_FALLBACK, never "")."""
     messages.append({"role": "user", "content": (
-        f"{FORCED_SYNTHESIS_PROMPT}{(' ' + extra) if extra else ''}")})
-    _t = time.perf_counter()
-    resp = client.messages.create(model=model, max_tokens=4096, system=system,
-                                  messages=messages, thinking={"type": "disabled"})
-    _timing(timings, f"anthropic.forced_synthesis[{reason}]", time.perf_counter() - _t)
-    text = _text_of(resp)
+        instruction if instruction is not None
+        else f"{FORCED_SYNTHESIS_PROMPT}{(' ' + extra) if extra else ''}")})
+    text = ""
+    for attempt in (1, 2):
+        _t = time.perf_counter()
+        resp = client.messages.create(model=model, max_tokens=4096, system=system,
+                                      messages=messages, thinking={"type": "disabled"})
+        _timing(timings, f"anthropic.forced_synthesis[{reason}]"
+                + ("" if attempt == 1 else "[retry]"), time.perf_counter() - _t)
+        text = _text_of(resp)
+        if text.strip():
+            break
     if resp.stop_reason == "max_tokens" and text.strip():
         text += LENGTH_LIMIT_NOTE          # never end silently mid-sentence
     return text
+
+
+def _fmt_usd(v) -> str:
+    return f"${float(v):,.2f}"
+
+
+def fin_review_guarantee(text: str, evidence: dict) -> str:
+    """Server-side backstop for the review answer: the margin targets and the
+    working-hypothesis sentence come from SQL results, so if the model left
+    either out they are appended verbatim -- never recomputed by the model."""
+    if not text.strip():
+        return text
+    add = []
+    t = evidence.get("targets")
+    if t and not all(_fmt_usd(t[k]) in text for k in
+                     ("one_margin_point", "two_margin_points", "three_margin_points")):
+        add.append("**Margin targets for this window (target size only, not savings):** "
+                   f"1 point = {_fmt_usd(t['one_margin_point'])}; "
+                   f"2 points = {_fmt_usd(t['two_margin_points'])}; "
+                   f"3 points = {_fmt_usd(t['three_margin_points'])}.")
+    sc = evidence.get("scenario")
+    if sc and not ("working hypothesis" in text.lower()
+                   and "not confirmed savings" in text.lower()):
+        add.append(FIN_REVIEW_HYPOTHESIS_SENTENCE.format(
+            scenario=f"{float(sc['scenario_outliers_to_median_excl_rent']):,.2f}",
+            points=sc["scenario_margin_points"]))
+    return text + ("\n\n" + "\n\n".join(add) if add else "")
 
 
 def _log_timings(timings: list, model: str, aborted: bool = False) -> None:
@@ -5238,6 +5290,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     # FINANCIAL_WASTE_REVIEW: a fixed window, three set-based queries and a hard
     # run_sql budget instead of open-ended exploration.
     review = None
+    review_ev: dict = {}                    # SQL-computed targets / scenario
     sql_calls = 0
     if is_financial_waste_review(question):
         try:
@@ -5369,6 +5422,12 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 step["sql_seconds"] = round(time.perf_counter() - _t_exec, 3)
                 _timing(timings, "run_sql", time.perf_counter() - _t_exec)
                 step["row_count"] = out["row_count"]
+                if review is not None and out["rows"]:
+                    _r0 = out["rows"][0]
+                    if "three_margin_points" in _r0:
+                        review_ev["targets"] = _r0
+                    if "scenario_outliers_to_median_excl_rent" in _r0:
+                        review_ev["scenario"] = _r0
                 _fin_note = r365_fin_result_note(gate_meta, sql)
                 if _fin_note:
                     out["r365_financial_note"] = _fin_note
@@ -5398,6 +5457,19 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                          tuple(sorted(domains_for_relations(_relations_in(sql))))))
                     if _gm is not None:
                         blocked = blocked_domain_context(_gm, _gm.get("domains"))
+                        blocked["rejected_query_error"] = step["error"]
+                        if _gm.get("analysis_permitted"):
+                            # The source passed its gate; only this query was
+                            # refused (e.g. missing date bounds). Earlier results
+                            # stay valid evidence -- say so, do not call the
+                            # source untrusted.
+                            blocked["source_trusted"] = True
+                            blocked["instruction"] = (
+                                "The data source PASSED its trust gate; one query "
+                                "was rejected before execution (rejected_query_error). "
+                                "Do NOT retry it. Answer from the results of the "
+                                "queries that already succeeded in this turn, and "
+                                "say which deeper query could not be completed and why.")
                         step["short_circuit"] = True
                 tool_results.append({
                     "type": "tool_result", "tool_use_id": block.id,
@@ -5429,28 +5501,33 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                             c_est, c_start, c_end)
                     except psycopg2.Error as e:
                         blocked["r365_trusted_figures_error"] = str(e).strip()[:200]
-            # Deterministic verdict reached: a required source is untrusted.
-            # One more call, WITHOUT tools, so the model can only explain -- it
-            # cannot spend further round-trips hunting for a usable scope.
-            messages.append({"role": "user", "content": (
-                "DATA TRUST VERDICT (authoritative, do not re-check):\n"
-                + json.dumps(blocked, default=str, separators=(",", ":"))
-                + "\n\nCompose the final answer now. State plainly which source "
-                  "is unusable and why, give the user whatever the trusted "
-                  "source(s) above still support, and do not attempt the "
-                  "comparison that the untrusted source would have required. "
-                  "Quote only figures that appear in the tool results above: "
-                  "you cannot run SQL now, so do not compute new totals, sums "
-                  "or ratios by hand.")})
-            _t = time.perf_counter()
-            resp = client.messages.create(
-                model=model, max_tokens=4096, system=system, messages=messages)
-            _timing(timings, "anthropic.final_blocked",
-                    time.perf_counter() - _t)
-            final_text = "".join(b.text for b in resp.content if b.type == "text")
+            # Deterministic verdict reached. One more call, WITHOUT tools, so
+            # the model can only explain -- it cannot spend further round-trips
+            # hunting for a usable scope. It goes through the common synthesis
+            # helper (thinking off, one retry), over every result gathered so far.
+            if blocked.get("source_trusted"):
+                how = ("Compose the final answer now from the successful tool "
+                       "results above. State which deeper query could not be "
+                       "completed and why (rejected_query_error); do not present "
+                       "its missing result as zero or as a finding.")
+            else:
+                how = ("Compose the final answer now. State plainly which source "
+                       "is unusable and why, give the user whatever the trusted "
+                       "source(s) above still support, and do not attempt the "
+                       "comparison that the untrusted source would have required.")
+            final_text = _forced_synthesis(
+                client, model, system, messages, timings, "blocked",
+                instruction=(
+                    "DATA TRUST VERDICT (authoritative, do not re-check):\n"
+                    + json.dumps(blocked, default=str, separators=(",", ":"))
+                    + "\n\n" + how
+                    + " Quote only figures that appear in the tool results above: "
+                      "you cannot run SQL now, so do not compute new totals, sums "
+                      "or ratios by hand."
+                    + (" " + FIN_REVIEW_SYNTHESIS_RULES if review is not None else "")))
             steps.append({"sql": None, "row_count": None, "error": None,
-                          "short_circuit": True, "blocked_domains": blocked.get(
-                              "question_domains")})
+                          "short_circuit": True, "forced_synthesis": "blocked",
+                          "blocked_domains": blocked.get("question_domains")})
             break
 
         if review is not None and sql_calls >= FIN_REVIEW_SQL_BUDGET:
@@ -5471,6 +5548,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
     _timing(timings, "TOTAL", time.perf_counter() - t_request)
     _log_timings(timings, model)
+    if review is not None:
+        final_text = fin_review_guarantee(final_text, review_ev)
     result = ChatResult(final_text.strip() or EMPTY_ANSWER_FALLBACK, steps)
     result.timings = timings
     return result
