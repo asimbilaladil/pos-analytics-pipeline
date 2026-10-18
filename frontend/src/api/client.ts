@@ -22,7 +22,7 @@ export class ApiError extends Error {
 const SUBMIT_TIMEOUT_MS = 30_000
 
 async function request<T>(path: string, init: RequestInit = {},
-                          timeoutMs?: number): Promise<T> {
+                          timeoutMs?: number, nullable = false): Promise<T> {
   let res: Response
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null
   const timer = ctrl && timeoutMs
@@ -59,6 +59,9 @@ async function request<T>(path: string, init: RequestInit = {},
     const detail = (body && (body.detail || body.message)) || null
     throw new ApiError(res.status, typeof detail === 'string' ? detail : httpFallback(res.status))
   }
+  // A JSON `null` is a real answer for endpoints that may have nothing to
+  // return (no active job); anywhere else it means the body was unreadable.
+  if (nullable && isJson && body === null) return null as T
   if (body === null && res.status !== 204) {
     // 2xx with a missing or unparseable body. Previously this returned null and
     // the caller dereferenced it, producing a confusing TypeError; name it.
@@ -100,10 +103,12 @@ export const api = {
       body: JSON.stringify({ question, model, idempotency_key: idempotencyKey }),
     }, SUBMIT_TIMEOUT_MS),
 
-  askWithFiles: (id: number, question: string, model: string, files: File[]) => {
+  askWithFiles: (id: number, question: string, model: string, files: File[],
+                 idempotencyKey?: string) => {
     const fd = new FormData()
     fd.append('question', question)
     fd.append('model', model)
+    if (idempotencyKey) fd.append('idempotency_key', idempotencyKey)
     files.forEach((f) => fd.append('files', f))
     return request<AskAccepted>(`/api/conversations/${id}/messages/upload`, {
       method: 'POST', body: fd,
@@ -115,7 +120,7 @@ export const api = {
 
   // Lets a reloaded page discover its own pending answer with no client state.
   activeJob: (conversationId: number) =>
-    request<ChatJob | null>(`/api/conversations/${conversationId}/active-job`),
+    request<ChatJob | null>(`/api/conversations/${conversationId}/active-job`, {}, undefined, true),
 
   importConversation: (file: File) => {
     const fd = new FormData()

@@ -20,6 +20,17 @@ with a job_id; generation continues in a detached thread; the client polls
 cheap persisted state and can reattach after a reload, a tab switch, or on a
 different device.
 
+Mobile sleep (2026-10-18)
+-------------------------
+A locked phone freezes the page -- JS, timers and fetch -- often while the
+submission itself is in flight, so the 202 is never read. The job still runs
+(it never depended on the client), but the client used to report a failure
+and its Retry resent the key after the job had COMPLETED, which the active-
+only reuse treated as a new submission: a second conversation and a second
+generation. A client-supplied key now identifies ONE logical submission for
+good: find_for_key() hands back its active or completed job, so a resend is
+a lookup. Only a FAILED job may be retried under the same key.
+
 Restart semantics, stated plainly
 ---------------------------------
 Generation runs in an in-process daemon thread. A process restart therefore
@@ -56,6 +67,26 @@ def _row(sql, params):
     return query(sql, params, fetch="one")
 
 
+def find_for_key(user_id: int, idempotency_key: str,
+                 include_completed: bool = True) -> dict | None:
+    """The job a resend of this submission must land on, or None.
+
+    Active jobs are always reused. A completed job is reused when the key is
+    the client's own per-submission key (include_completed): resending after a
+    lost acknowledgement must find the answer, not generate it again. A failed
+    job is never reused, so Retry after a genuine failure starts a new attempt.
+    """
+    statuses = list(_ACTIVE) + (["completed"] if include_completed else [])
+    job = _row(
+        "SELECT * FROM chat_jobs WHERE user_id = %s AND idempotency_key = %s "
+        "ORDER BY id DESC LIMIT 1", (user_id, idempotency_key))
+    if job and job["status"] in statuses:
+        log.info("chat_job reuse job_id=%s conversation_id=%s status=%s",
+                 job["job_id"], job["conversation_id"], job["status"])
+        return dict(job)
+    return None
+
+
 def create_or_reuse(*, conversation_id: int, user_id: int, question: str,
                     model: str | None, idempotency_key: str,
                     user_message_id: int | None) -> tuple[dict, bool]:
@@ -86,13 +117,29 @@ def create_or_reuse(*, conversation_id: int, user_id: int, question: str,
     # fetching, so the RETURNING row and the commit are the one transaction.
     # Committing on a separate query() call would open a new connection and
     # silently roll this insert back.
+    # Two identical submissions racing (a double tap, or a resend crossing the
+    # original on a flaky network) both pass the SELECT above. The partial
+    # unique index lets exactly one INSERT win; the loser reads the winner's
+    # row instead of surfacing an IntegrityError as a 500.
     job = query(
         "INSERT INTO chat_jobs (job_id, conversation_id, user_id, user_message_id, "
         "status, idempotency_key, question, model, attempt) "
-        "VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s) RETURNING *",
+        "VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s) "
+        "ON CONFLICT (user_id, idempotency_key) "
+        "WHERE status IN ('queued', 'processing') DO NOTHING RETURNING *",
         (str(uuid.uuid4()), conversation_id, user_id, user_message_id,
          idempotency_key, question, model, attempt),
         fetch="one", commit=True)
+    if job is None:
+        winner = _row(
+            "SELECT * FROM chat_jobs WHERE user_id = %s AND idempotency_key = %s "
+            "AND status = ANY(%s) ORDER BY id DESC LIMIT 1",
+            (user_id, idempotency_key, list(_ACTIVE)))
+        if winner:
+            log.info("chat_job reuse job_id=%s conversation_id=%s status=%s (race)",
+                     winner["job_id"], winner["conversation_id"], winner["status"])
+            return dict(winner), False
+        raise RuntimeError("chat job insert conflicted but no active job was found")
     log.info("chat_job created job_id=%s conversation_id=%s attempt=%s",
              job["job_id"], conversation_id, attempt)
     return dict(job), True
@@ -145,19 +192,34 @@ def mark_failed(job_id: str, code: str, message: str,
              job_id, code, duration_ms)
 
 
-def sweep_interrupted() -> int:
+def sweep_interrupted(started_before=None, conversation_id=None) -> int:
     """Fail jobs this process cannot possibly still be running.
 
     Called at startup, and safe to call repeatedly. Without it a job orphaned by
     a restart would poll as 'processing' forever and the spinner would never
     clear -- the exact failure mode this whole change exists to remove.
+
+    started_before: this process's start time. laynes-api runs ONE uvicorn
+    worker and jobs run in its threads, so at startup every active job created
+    before the process existed is dead -- however young. Without it only jobs
+    older than STUCK_AFTER_SECONDS were swept, so a restart inside a job's
+    first 10 minutes left it 'processing' forever. Only server conditions fail a
+    job here; client polling (or its absence) never does.
+
+    conversation_id: limit the sweep to one conversation (used by tests on the
+    shared database, so they can never touch a real in-flight job).
     """
+    if started_before is not None:
+        cond, arg = "created_at < %s", started_before
+    else:
+        cond, arg = "created_at < now() - (%s || ' seconds')::interval", STUCK_AFTER_SECONDS
+    scope, extra = ("", ()) if conversation_id is None else (" AND conversation_id = %s", (conversation_id,))
     rows = query(
         "UPDATE chat_jobs SET status='failed', error_code='interrupted', "
         "error_message='The server restarted while this answer was being "
         "generated. Please try again.', completed_at=now() "
-        "WHERE status = ANY(%s) AND created_at < now() - (%s || ' seconds')::interval "
-        "RETURNING job_id", (list(_ACTIVE), STUCK_AFTER_SECONDS),
+        f"WHERE status = ANY(%s) AND {cond}{scope} "
+        "RETURNING job_id", (list(_ACTIVE), arg, *extra),
         fetch="all", commit=True) or []
     if rows:
         log.warning("chat_job swept %d interrupted job(s): %s",
@@ -192,7 +254,9 @@ def spawn(job_id: str, runner) -> None:
     def _wrap():
         t0 = time.time()
         mark_processing(job_id)
-        log.info("chat_job started job_id=%s", job_id)
+        # execution_source: generation belongs to this server thread from here
+        # on; no client request, socket or poll is involved in finishing it.
+        log.info("chat_job started job_id=%s execution_source=detached_thread", job_id)
         try:
             runner()
         except Exception as exc:                        # noqa: BLE001
