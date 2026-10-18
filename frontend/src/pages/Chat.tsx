@@ -7,7 +7,8 @@ import { WelcomeState } from '../components/WelcomeState'
 import { Header } from '../components/Header'
 import { MessageList, ThinkingMessage, UserMessage } from '../components/ChatMessage'
 import { Sidebar } from '../components/Sidebar'
-import type { ChatJob, Conversation, Message, User } from '../types'
+import type { AskAccepted, ChatJob, Conversation, Message, User } from '../types'
+import { loadResume, mayHaveReachedServer, saveResume, type InflightSend } from '../lib/chatResume'
 
 export function Chat({ user, onSignedOut, onOpenAdmin }: {
   user: User; onSignedOut: () => void; onOpenAdmin?: () => void
@@ -80,35 +81,60 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
     if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null }
   }, [])
 
+  // Persisted IDs are the source of truth after any interruption: a job is
+  // settled at most once, and only one status request is in flight at a time,
+  // however many timers or wake-up events fire together.
+  const settledRef = useRef<Set<string>>(new Set())
+  const pollBusyRef = useRef(false)
+  const inflightRef = useRef<InflightSend | null>(null)
+  const recoveringRef = useRef(false)
+  const resumingRef = useRef(false)
+  const activeIdRef = useRef<number | null>(activeId)
+  activeIdRef.current = activeId
+
+  const rememberConversation = useCallback((id: number | null) => {
+    saveResume(user.id, { activeId: id })
+  }, [user.id])
+
   // One place that turns a finished job into UI. Reloads the transcript from
   // the server rather than trusting anything the client kept, so the answer
   // shown is exactly what was persisted.
   const settleJob = useCallback(async (j: ChatJob) => {
     stopPolling()
+    if (settledRef.current.has(j.job_id)) return
+    settledRef.current.add(j.job_id)
     setJob(null)
+    jobRef.current = null
     setPending(null)
     try {
       const d = await api.conversation(j.conversation_id)
       setActiveId(d.id); setMessages(d.messages)
+      rememberConversation(d.id)
       refreshList()
     } catch (e) { handleError(e) }
     if (j.status === 'failed') {
       setError(j.error_message || 'Something went wrong while analyzing the data. Please try again.')
     }
-  }, [handleError, refreshList, stopPolling])
+  }, [handleError, refreshList, stopPolling, rememberConversation])
 
   const checkJob = useCallback(async () => {
     const current = jobRef.current
-    if (!current) return
+    if (!current || pollBusyRef.current) return
+    pollBusyRef.current = true
     try {
       const j = await api.job(current.job_id)
+      if (jobRef.current?.job_id !== j.job_id) return   // superseded meanwhile
       setJob(j)
       if (j.status === 'completed' || j.status === 'failed') await settleJob(j)
     } catch (e) {
       // A polling hiccup must not discard the job: the answer is still being
       // generated server-side and the next tick can pick it up. Only a 404
       // (job genuinely gone) stops the watch.
-      if (e instanceof ApiError && e.status === 404) { stopPolling(); setJob(null); setPending(null) }
+      if (e instanceof ApiError && e.status === 404) {
+        stopPolling(); setJob(null); jobRef.current = null; setPending(null)
+      }
+    } finally {
+      pollBusyRef.current = false
     }
   }, [settleJob, stopPolling])
 
@@ -121,26 +147,139 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
     }
   }, [checkJob, stopPolling])
 
-  // Backgrounding the tab pauses POLLING only. The server job is untouched --
-  // that is the whole point: on mobile the socket dies when the user switches
-  // apps, and the answer must still be waiting when they come back.
+  // The server accepted (or already had) this submission. Reload the
+  // transcript from the server so the question appears exactly once -- also
+  // when this is a re-send of a question that was persisted, or even answered,
+  // while the phone slept -- then watch or settle the job it points to.
+  const acceptSubmission = useCallback(async (res: AskAccepted) => {
+    inflightRef.current = null
+    saveResume(user.id, { inflight: null, activeId: res.conversation_id })
+    setFailed(null)
+    setActiveId(res.conversation_id)
+    const j: ChatJob = {
+      job_id: res.job_id, conversation_id: res.conversation_id,
+      status: res.status, attempt: 1, created_at: null, completed_at: null,
+      duration_ms: null, error_code: null, error_message: null,
+    }
+    if (res.status === 'completed' || res.status === 'failed') {
+      settledRef.current.delete(j.job_id)
+      await settleJob(j)
+      return
+    }
+    try {
+      const d = await api.conversation(res.conversation_id)
+      setMessages(d.messages)
+    } catch { /* the job watch below still delivers the answer */ }
+    setPending(null)
+    refreshList()
+    startPolling(j)
+  }, [user.id, settleJob, refreshList, startPolling])
+
+  // Re-send an unacknowledged submission with its ORIGINAL key. The server
+  // treats that as a lookup: it returns the existing job (running, or already
+  // finished while the phone slept) and creates nothing new.
+  const recoverSubmission = useCallback(async () => {
+    const inf = inflightRef.current
+    if (!inf || recoveringRef.current || document.visibilityState !== 'visible') return
+    recoveringRef.current = true
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await api.ask(inf.conversationId, inf.question, inf.model, inf.key)
+          await acceptSubmission(res)
+          return
+        } catch (e) {
+          if (!mayHaveReachedServer(e)) {
+            // A real rejection: nothing is generating for this question.
+            inflightRef.current = null
+            saveResume(user.id, { inflight: null })
+            setPending(null)
+            setFailed({ question: inf.question, retryable: true, key: inf.key })
+            handleError(e)
+            return
+          }
+          if (typeof navigator !== 'undefined' && navigator.onLine === false) break
+          await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+        }
+      }
+      // Still unreachable. Keep the send (and its key) so the next wake-up or
+      // reconnect resumes it automatically; Retry re-sends the same key too.
+      setPending(null)
+      setFailed({ question: inf.question, retryable: true, key: inf.key })
+      setError('Cannot reach the server. Your question is safe -- it will be picked up when you reconnect.')
+    } finally {
+      recoveringRef.current = false
+    }
+  }, [acceptSubmission, handleError, user.id])
+
+  // Waking up. Timers from before the sleep are not trusted: stop them, read
+  // the persisted state, and continue from that. Single-flight, because
+  // visibilitychange, pageshow, focus and online often fire together.
+  const resume = useCallback(async () => {
+    if (document.visibilityState !== 'visible' || resumingRef.current) return
+    resumingRef.current = true
+    stopPolling()
+    try {
+      if (inflightRef.current) { await recoverSubmission(); return }
+      const current = jobRef.current
+      if (current) {
+        try {
+          const j = await api.job(current.job_id)
+          if (j.status === 'completed' || j.status === 'failed') await settleJob(j)
+          else startPolling(j)
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 404) { setJob(null); jobRef.current = null }
+          else if (e instanceof ApiError && e.status === 401) handleError(e)
+          else startPolling(current)            // offline for now: keep watching
+        }
+        return
+      }
+      const cid = activeIdRef.current
+      if (cid) {
+        try {
+          const aj = await api.activeJob(cid)
+          if (aj) startPolling(aj)
+          else { const d = await api.conversation(cid); setMessages(d.messages) }
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) handleError(e)
+        }
+      }
+    } finally {
+      resumingRef.current = false
+    }
+  }, [stopPolling, recoverSubmission, settleJob, startPolling, handleError])
+
+  // Backgrounding pauses POLLING only; the server job is untouched. A locked
+  // phone may also freeze or discard the page, so every way back in resumes.
   useEffect(() => {
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        if (jobRef.current) { checkJob(); startPolling(jobRef.current) }
-      } else {
-        stopPolling()
-      }
+      if (document.visibilityState === 'visible') resume()
+      else stopPolling()
     }
+    const onResume = () => { resume() }
     document.addEventListener('visibilitychange', onVisibility)
-    return () => { document.removeEventListener('visibilitychange', onVisibility); stopPolling() }
-  }, [checkJob, startPolling, stopPolling])
+    document.addEventListener('resume', onResume)        // Page Lifecycle API
+    document.addEventListener('freeze', stopPolling)
+    window.addEventListener('pageshow', onResume)         // bfcache restore
+    window.addEventListener('focus', onResume)
+    window.addEventListener('online', onResume)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      document.removeEventListener('resume', onResume)
+      document.removeEventListener('freeze', stopPolling)
+      window.removeEventListener('pageshow', onResume)
+      window.removeEventListener('focus', onResume)
+      window.removeEventListener('online', onResume)
+      stopPolling()
+    }
+  }, [resume, stopPolling])
 
   const openConversation = async (id: number) => {
     setSidebarOpen(false)
     try {
       const d = await api.conversation(id)
       setActiveId(d.id); setMessages(d.messages)
+      rememberConversation(d.id)
       if (d.model) setModel(d.model)
       // A freshly opened conversation always starts at its newest message.
       setAtBottom(true)
@@ -153,13 +292,36 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
         setPending(null)
         startPolling(activeJob)
       } else {
-        stopPolling(); setJob(null)
+        stopPolling(); setJob(null); jobRef.current = null
       }
-    } catch (e) { handleError(e) }
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) rememberConversation(null)
+      handleError(e)
+    }
   }
 
+  // A page the phone discarded (or an app that was killed) comes back here.
+  // Reopen where the user was; an unacknowledged send is re-sent with its key.
+  const restoredRef = useRef(false)
+  useEffect(() => {
+    if (restoredRef.current) return
+    restoredRef.current = true
+    const saved = loadResume(user.id)
+    if (saved.inflight) {
+      inflightRef.current = saved.inflight
+      setPending(saved.inflight.shown)
+      recoverSubmission()
+    } else if (saved.activeId) {
+      openConversation(saved.activeId)
+    }
+    // Runs once per mount; later changes are handled by the events above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const newChat = () => {
-    stopPolling(); setJob(null)
+    stopPolling(); setJob(null); jobRef.current = null
+    inflightRef.current = null
+    saveResume(user.id, { activeId: null, inflight: null })
     setActiveId(null); setMessages([]); setPending(null)
     setError(null); setFailed(null); setSidebarOpen(false); setAtBottom(true)
   }
@@ -167,35 +329,39 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
   const send = async (question: string, files: File[] = [], reuseKey?: string) => {
     // Mirrors how the server stores the turn, so a reload looks the same.
     const shown = question + files.map((f) => `\n\u{1F4CE} ${f.name}`).join('')
-    setError(null); setPending(shown)
+    setError(null); setFailed(null); setPending(shown)
     // Sending is an explicit action, so it always returns you to the end.
     setAtBottom(true)
-    // One key per logical submission. A double-tapped Send reuses it and the
-    // server hands back the SAME job instead of generating twice. A deliberate
-    // Retry after a real failure passes the old key too, which the server
-    // treats as a new attempt because the previous job is no longer active.
+    // One key per logical submission. A double-tapped Send, a re-send after the
+    // phone slept through the acknowledgement, and Retry all reuse it, and the
+    // server hands back the SAME job instead of generating twice.
     const key = reuseKey
       ?? (crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    const inflight: InflightSend = {
+      key, question, shown, conversationId: activeId ?? 0, model, at: Date.now(),
+    }
+    // Files cannot be re-sent from storage, so only text sends are resumable.
+    if (!files.length) {
+      inflightRef.current = inflight
+      saveResume(user.id, { inflight })
+    }
     try {
       const res = files.length
-        ? await api.askWithFiles(activeId ?? 0, question, model, files)
+        ? await api.askWithFiles(activeId ?? 0, question, model, files, key)
         : await api.ask(activeId ?? 0, question, model, key)
-      // Show the question immediately and start watching the job. The answer
-      // arrives through the job, so this request completing or not is no longer
-      // what determines whether the user gets an answer.
-      setActiveId(res.conversation_id)
-      setMessages((prev) => [...prev, { role: 'user', content: shown }])
-      setPending(null)
-      setFailed(null)
-      refreshList()
-      startPolling({
-        job_id: res.job_id, conversation_id: res.conversation_id,
-        status: res.status, attempt: 1, created_at: null, completed_at: null,
-        duration_ms: null, error_code: null, error_message: null,
-      })
+      await acceptSubmission(res)
     } catch (e) {
+      if (!files.length && mayHaveReachedServer(e)) {
+        // The phone may have locked mid-send: the question can already be on
+        // the server. Keep it on screen and re-send with the same key now (or
+        // as soon as the page is visible / back online).
+        await recoverSubmission()
+        return
+      }
       // Only the SUBMISSION failed here, so nothing is generating and the
       // question is genuinely lost unless we keep it.
+      inflightRef.current = null
+      saveResume(user.id, { inflight: null })
       setPending(null)
       setFailed({ question, retryable: files.length === 0, key })
       handleError(e)

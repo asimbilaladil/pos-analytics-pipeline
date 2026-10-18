@@ -52,6 +52,11 @@ from .models import (
     AskAcceptedOut,AdminUserOut, AskIn, AskOut, ConversationDetail, ConversationOut, ImportIn,
                      LoginIn, MessageOut, ModelsOut, NewConversationIn, UserOut)
 
+# Wall-clock start of this process, for the startup job sweep (see
+# jobs.sweep_interrupted): no job created before it can still be running.
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+_PROCESS_STARTED_AT = _dt.now(_tz.utc)
+
 app = FastAPI(title="Laynes Intelligence API", docs_url=None, redoc_url=None)
 
 # In production the SPA is served same-origin by nginx and this list is empty.
@@ -191,6 +196,7 @@ async def _to_block(f: UploadFile) -> dict:
           response_model=AskAcceptedOut, status_code=202)
 async def ask_with_files(cid: int, question: str = Form(...),
                          model: str | None = Form(default=None),
+                         idempotency_key: str | None = Form(default=None),
                          files: list[UploadFile] = File(default=[]),
                          user=Depends(current_user)):
     """Same as ask, plus up to MAX_FILES attachments sent with this turn only."""
@@ -198,7 +204,8 @@ async def ask_with_files(cid: int, question: str = Form(...),
         raise HTTPException(status_code=400, detail=f"Attach at most {MAX_FILES} files.")
     blocks = [await _to_block(f) for f in files]
     names = [f.filename or "file" for f in files]
-    return await run_in_threadpool(_ask, cid, question, model, user, blocks, names)
+    return await run_in_threadpool(_ask, cid, question, model, user, blocks, names,
+                                   idempotency_key)
 
 
 def _ask(cid: int, question: str, model: str | None, user,
@@ -214,6 +221,23 @@ def _ask(cid: int, question: str, model: str | None, user,
         raise HTTPException(status_code=400, detail="Question is too long.")
 
     model = chat_svc.resolve_model(model)
+
+    # A resend of a submission the server already has -- the phone locked
+    # before the 202 was read, or the user tapped Retry -- is a LOOKUP. Checked
+    # before any write, so it creates no conversation, no user message and no
+    # second generation, and it hands back the job's own conversation (for a
+    # new chat the client never learned that id). Client keys only: a derived
+    # key cannot tell a resend from the same question asked again later.
+    if idempotency_key:
+        prior = jobs_svc.find_for_key(user["id"], idempotency_key)
+        if prior:
+            prow = convo.owned(prior["conversation_id"], user["id"])
+            if prow:
+                return AskAcceptedOut(
+                    conversation_id=prior["conversation_id"], title=prow["title"],
+                    job_id=str(prior["job_id"]), status=prior["status"],
+                    user_message_id=prior.get("user_message_id"))
+
     is_new = cid == 0
     if is_new:
         cid = convo.create(user["id"], convo.auto_title(question), model)
@@ -235,13 +259,19 @@ def _ask(cid: int, question: str, model: str | None, user,
     job, created = jobs_svc.create_or_reuse(
         conversation_id=cid, user_id=user["id"], question=question, model=model,
         idempotency_key=key, user_message_id=None)
-    row = convo.owned(cid, user["id"])
     if not created:
-        # This exact submission is already generating. Hand back the SAME job:
-        # no duplicate user message, no second model run.
-        return AskAcceptedOut(conversation_id=cid, title=row["title"],
+        # This exact submission is already generating. Hand back the SAME job
+        # and ITS conversation: no duplicate user message, no second model run.
+        # A new-chat resend that lost the race created an empty conversation a
+        # moment ago; remove it so it never shows up in the sidebar.
+        if is_new and job["conversation_id"] != cid:
+            convo.delete(cid, user["id"])
+        jrow = convo.owned(job["conversation_id"], user["id"])
+        return AskAcceptedOut(conversation_id=job["conversation_id"],
+                              title=jrow["title"] if jrow else "New chat",
                               job_id=str(job["job_id"]), status=job["status"],
                               user_message_id=job.get("user_message_id"))
+    row = convo.owned(cid, user["id"])
 
     user_message_id = convo.add_message_returning_id(cid, "user", stored)
     jobs_svc.attach_user_message(str(job["job_id"]), user_message_id)
@@ -303,6 +333,9 @@ def conversation_active_job(cid: int, user=Depends(current_user)):
     if not convo.owned(cid, user["id"]):
         raise HTTPException(status_code=404, detail="Conversation not found")
     job = jobs_svc.active_for_conversation(cid, user["id"])
+    if job:
+        log.info("chat_job reattach job_id=%s conversation_id=%s status=%s",
+                 job["job_id"], cid, job["status"])
     return JobOut(**jobs_svc.to_public(job)) if job else None
 
 
@@ -315,7 +348,9 @@ def _sweep_interrupted_jobs():
     surfaces the normal Retry affordance instead.
     """
     try:
-        jobs_svc.sweep_interrupted()
+        # Everything created before THIS process started is dead: jobs run in
+        # this single worker's threads. Age alone missed young orphans.
+        jobs_svc.sweep_interrupted(started_before=_PROCESS_STARTED_AT)
     except Exception:                                  # noqa: BLE001
         log.exception("chat_job startup sweep failed")
 
