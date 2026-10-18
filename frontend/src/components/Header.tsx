@@ -39,22 +39,28 @@ export function Header({
       <div className="hidden lg:block" />
 
       <div className="flex shrink-0 items-center gap-2.5">
-        <div className="relative hidden sm:block">
+        {/* Visible at every width: on a phone this is the only place to pick
+            the model. 16px text below sm, because iOS Safari zooms the page
+            when a control under 16px is focused. */}
+        <div className="relative">
           <Sparkles size={13}
-            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-brand-500" />
+            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-brand-500
+                       sm:left-3" />
           <select
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
             aria-label="Assistant model"
             title={model}
             className="h-10 cursor-pointer appearance-none rounded-xl border border-line bg-white
-                       pl-8 pr-9 text-[13px] font-medium text-ink-900 shadow-card
-                       transition-colors hover:border-ink-400/40 focus:outline-none"
+                       pl-7 pr-7 text-base font-medium text-ink-900 shadow-card
+                       transition-colors hover:border-ink-400/40 focus:outline-none
+                       sm:pl-8 sm:pr-9 sm:text-[13px]"
           >
             {models.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
           </select>
           <ChevronDown size={14}
-            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-400" />
+            className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-ink-400
+                       sm:right-3" />
         </div>
 
         <button
