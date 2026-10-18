@@ -4781,6 +4781,400 @@ class ChatTimeout(Exception):
     """The request exceeded its own deadline. Surfaced as a structured error."""
 
 
+# ── FINANCIAL_WASTE_REVIEW: a bounded plan for broad cost-cutting questions ──
+# Measured 2026-10-18 (chat jobs 252-254): "find financial waste ... deep dive
+# at every category across every store" ran 5-9 exploratory queries; then the
+# final call spent its whole max_tokens on thinking, returned no text, and an
+# EMPTY answer was saved as a completed job. SQL was never the problem (every
+# query < 0.1 s). For this intent the server fixes the analysis window, the
+# exclusions and three set-based queries, and stops tool use after
+# FIN_REVIEW_SQL_BUDGET run_sql calls so the next call can only answer.
+
+FIN_REVIEW_SQL_BUDGET = 3
+FIN_REVIEW_MAX_PERIODS = 3
+_FIN_REVIEW_RX = re.compile(
+    r"financial waste|\bwasteful\b|cost[- ]?cutting|\bcut(?:ting)? (?:our |the )?costs?\b"
+    r"|\bcost reduction|\breduc(?:e|ing) (?:our |the )?(?:costs?|expenses?|spend(?:ing)?)\b"
+    r"|points? of margin|\bmargin (?:points?|improvement)|\bimprov(?:e|ing) (?:our |the )?margins?\b"
+    r"|\bexpense (?:review|outliers?|deep[- ]dive)|operating expense review|\bopex review",
+    re.IGNORECASE)
+_FIN_REVIEW_PERIOD_RX = re.compile(r"\b(?:P|period\s*)(\d{1,2})\b", re.IGNORECASE)
+# Food and labor are being worked on by the team (user, 2026-10-18), and sales
+# deductions are not operating expense, so none of them is an opportunity here.
+FIN_REVIEW_EXPENSE_TYPES = ("Operating Expense", "General & Administrative",
+                            "Corporate Overhead", "Other Expenses")
+FIN_REVIEW_EXCLUDED_PREFIXES = ("5500",            # payroll / labor accounts
+                                "4500")            # discounts, comps, promotions
+FIN_REVIEW_EXCLUDED_ACCOUNTS = ("2260-000",)       # sales tax difference
+# Contractual or corporate charges: shown for context, never ranked as waste.
+FIN_REVIEW_CONTEXT_ACCOUNTS = {"8500-07": "Franchise Fee", "94050": "Management Fee",
+                               "94000": "Interest Expense"}
+FIN_REVIEW_RENT_ACCOUNT = "7500-11"                 # lease-driven: not a quick saving
+
+
+def is_financial_waste_review(question: str) -> bool:
+    """Broad waste / cost-cutting / margin questions only. A plain category
+    lookup ("How much electricity did we spend in P10?") does not match."""
+    return bool(_FIN_REVIEW_RX.search(question or ""))
+
+
+def fin_review_window(question: str) -> dict:
+    """The analysis window, chosen in code rather than by the model.
+
+    Eligible periods are COMPLETED fiscal periods where every R365 store has a
+    fully covered sales period (the % of sales denominator) and R365 FINANCIAL
+    is COMPLETE and reconciled for every category. The window is the latest
+    FIN_REVIEW_MAX_PERIODS eligible periods, ending at a period the user names
+    when that period is eligible."""
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=True)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute("""
+                SELECT p.fiscal_year, p.period_number, p.period_label,
+                       p.start_date, p.end_date
+                  FROM v_ayg_business_periods_llm p
+                 WHERE p.period_status = 'COMPLETED'
+                   AND (SELECT COUNT(*) FILTER (WHERE s.period_fully_covered)
+                          FROM v_r365_store_period_llm s
+                         WHERE s.fiscal_year = p.fiscal_year
+                           AND s.period_number = p.period_number)
+                       >= (SELECT MAX(c.expected_store_count)
+                             FROM v_r365_financial_coverage_llm c
+                            WHERE c.fiscal_year = p.fiscal_year
+                              AND c.period_number = p.period_number)
+                   AND NOT EXISTS (
+                        SELECT 1 FROM v_r365_financial_coverage_llm c
+                         WHERE c.fiscal_year = p.fiscal_year
+                           AND c.period_number = p.period_number
+                           AND (c.source_data_status <> 'COMPLETE'
+                                OR NOT c.reconciliation_ok OR c.latest_refresh_failed))
+                   AND EXISTS (SELECT 1 FROM v_r365_financial_coverage_llm c
+                                WHERE c.fiscal_year = p.fiscal_year
+                                  AND c.period_number = p.period_number)
+                 ORDER BY p.fiscal_year DESC, p.period_number DESC""")
+            eligible = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    named = None
+    m = _FIN_REVIEW_PERIOD_RX.search(question or "")
+    if m:
+        named = f"P{int(m.group(1))}"
+    end_at = next((i for i, p in enumerate(eligible) if p["period_label"] == named), None)
+    note = None
+    if named and end_at is None:
+        note = (f"{named} is not an eligible review period (it is not complete, or it "
+                f"lacks R365 net sales for every store), so the latest eligible "
+                f"periods are used instead.")
+    periods = list(reversed(eligible[end_at or 0:][:FIN_REVIEW_MAX_PERIODS]))
+    win = {"named_period": named, "note": note, "periods": [
+        {"label": p["period_label"], "fiscal_year": p["fiscal_year"],
+         "start": str(p["start_date"]), "end": str(p["end_date"])} for p in periods]}
+    if periods:
+        win["start"] = str(periods[0]["start_date"])
+        win["end_exclusive"] = str(periods[-1]["end_date"] + timedelta(days=1))
+    return win
+
+
+def _fin_review_account_filter(alias: str = "t", acct: str = "a") -> str:
+    prefixes = " ".join(f"AND {alias}.gl_account_number NOT LIKE '{p}%'"
+                        for p in FIN_REVIEW_EXCLUDED_PREFIXES)
+    excluded = ", ".join(f"'{a}'" for a in FIN_REVIEW_EXCLUDED_ACCOUNTS)
+    types = ", ".join(f"'{t}'" for t in FIN_REVIEW_EXPENSE_TYPES)
+    return (f"{acct}.account_type IN ({types})\n     {prefixes}\n"
+            f"     AND {alias}.gl_account_number NOT IN ({excluded})")
+
+
+def fin_review_queries(win: dict) -> dict:
+    """The three set-based queries, with the window's literal dates. Every
+    ratio, median, excess and scenario figure is computed here in SQL, so the
+    answer never depends on arithmetic done by hand."""
+    s, e = win["start"], win["end_exclusive"]
+    fy = win["periods"][-1]["fiscal_year"]
+    flt = _fin_review_account_filter()
+    context = ", ".join(f"'{a}'" for a in FIN_REVIEW_CONTEXT_ACCOUNTS)
+    rent = FIN_REVIEW_RENT_ACCOUNT
+    per_period = ",\n       ".join(
+        f"ROUND(SUM(l.expense_amount) FILTER (WHERE l.period_label = '{p['label']}'), 2) "
+        f"AS {p['label'].lower()}_amount" for p in win["periods"])
+    sales_cte = f"""sales AS (
+  SELECT establishment_id, store_name, SUM(net_sales) AS net_sales
+    FROM v_r365_store_period_llm
+   WHERE fiscal_year >= {fy - 1} AND start_date >= '{s}' AND end_date < '{e}'
+     AND period_fully_covered
+   GROUP BY 1, 2
+)"""
+    q1 = f"""WITH {sales_cte}, lines AS (
+  SELECT t.gl_account_number, t.gl_account_name, a.account_type, a.analytics_category,
+         a.mapping_status, t.establishment_id, t.period_label, t.expense_amount
+    FROM v_r365_financial_transaction_llm t
+    JOIN v_r365_financial_account_llm a ON a.account_number = t.gl_account_number
+   WHERE t.accounting_date >= '{s}' AND t.accounting_date < '{e}'
+     AND {flt}
+), tot AS (
+  SELECT (SELECT SUM(net_sales) FROM sales) AS network_net_sales,
+         SUM(expense_amount) FILTER (WHERE gl_account_number NOT IN ({context}, '{rent}'))
+           AS controllable_total
+    FROM lines
+)
+SELECT l.gl_account_number, l.gl_account_name, l.account_type, l.analytics_category,
+       l.mapping_status,
+       CASE WHEN l.gl_account_number IN ({context}) THEN 'CONTRACTUAL_CONTEXT'
+            WHEN l.gl_account_number = '{rent}' THEN 'LEASE_DRIVEN'
+            ELSE 'CONTROLLABLE' END AS review_class,
+       ROUND(SUM(l.expense_amount), 2) AS total, COUNT(*) AS lines,
+       COUNT(DISTINCT l.establishment_id) AS stores_with_posting,
+       COUNT(DISTINCT l.period_label) AS periods_with_posting,
+       {per_period},
+       ROUND(100 * SUM(l.expense_amount) / MAX(t.network_net_sales), 3) AS pct_of_net_sales,
+       ROUND(MAX(t.network_net_sales), 2) AS network_net_sales,
+       ROUND(MAX(t.network_net_sales) / 100, 2) AS one_margin_point,
+       ROUND(MAX(t.controllable_total), 2) AS controllable_total,
+       ROUND(MAX(t.controllable_total) * 0.05, 2) AS scenario_5pct_of_controllable,
+       ROUND(MAX(t.controllable_total) * 0.10, 2) AS scenario_10pct_of_controllable,
+       ROUND(MAX(t.controllable_total) * 0.10 / (MAX(t.network_net_sales) / 100), 2)
+         AS scenario_10pct_margin_points
+  FROM lines l CROSS JOIN tot t
+ GROUP BY 1, 2, 3, 4, 5
+HAVING ABS(SUM(l.expense_amount)) >= 100
+ ORDER BY total DESC"""
+    q2 = f"""WITH {sales_cte}, exp AS (
+  SELECT t.establishment_id, t.gl_account_number, MAX(t.gl_account_name) AS gl_account_name,
+         SUM(t.expense_amount) AS amount, COUNT(DISTINCT t.period_label) AS periods_with_posting
+    FROM v_r365_financial_transaction_llm t
+    JOIN v_r365_financial_account_llm a ON a.account_number = t.gl_account_number
+   WHERE t.accounting_date >= '{s}' AND t.accounting_date < '{e}'
+     AND {flt}
+     AND t.gl_account_number NOT IN ({context})
+   GROUP BY 1, 2
+), accts AS (
+  SELECT gl_account_number, MAX(gl_account_name) AS gl_account_name
+    FROM exp GROUP BY 1 HAVING SUM(amount) >= 2000
+), grid AS (
+  SELECT a.gl_account_number, a.gl_account_name, s.establishment_id, s.store_name,
+         s.net_sales, e.amount, e.periods_with_posting,
+         100 * e.amount / NULLIF(s.net_sales, 0) AS pct
+    FROM accts a CROSS JOIN sales s
+    LEFT JOIN exp e ON e.gl_account_number = a.gl_account_number
+                   AND e.establishment_id = s.establishment_id
+), stats AS (
+  SELECT gl_account_number,
+         (percentile_cont(0.5) WITHIN GROUP (ORDER BY pct))::numeric AS median_pct,
+         MAX(periods_with_posting) AS max_periods, COUNT(amount) AS stores_with_posting
+    FROM grid GROUP BY 1
+), cls AS (
+  SELECT g.*, st.median_pct, st.max_periods, st.stores_with_posting,
+         CASE WHEN g.periods_with_posting < st.max_periods OR st.stores_with_posting < 6
+                   THEN 'INSUFFICIENT_POSTING_COVERAGE'
+              WHEN g.pct >= 1.5 * st.median_pct THEN 'HIGH_OUTLIER'
+              WHEN g.pct >= 1.25 * st.median_pct THEN 'MODERATE_OUTLIER'
+              ELSE 'NORMAL_RANGE' END AS outlier_class,
+         g.amount - st.median_pct / 100 * g.net_sales AS excess_vs_median
+    FROM grid g JOIN stats st USING (gl_account_number)
+   WHERE g.amount IS NOT NULL
+), flagged AS (
+  SELECT c.*,
+         COUNT(*) FILTER (WHERE outlier_class = 'INSUFFICIENT_POSTING_COVERAGE')
+           OVER (PARTITION BY gl_account_number) AS stores_insufficient_coverage,
+         SUM(excess_vs_median) FILTER (WHERE outlier_class IN ('HIGH_OUTLIER', 'MODERATE_OUTLIER')
+                                         AND gl_account_number <> '{rent}') OVER ()
+           AS scenario_outliers_to_median_excl_rent
+    FROM cls c
+)
+SELECT gl_account_number, gl_account_name, establishment_id, store_name, outlier_class,
+       CASE WHEN gl_account_number = '{rent}' THEN 'LEASE_DRIVEN' ELSE 'CONTROLLABLE' END
+         AS review_class,
+       ROUND(amount, 2) AS amount, ROUND(pct, 3) AS pct_of_net_sales,
+       ROUND(median_pct, 3) AS median_store_pct, ROUND(pct / NULLIF(median_pct, 0), 2) AS x_median,
+       ROUND(excess_vs_median, 2) AS excess_vs_median,
+       periods_with_posting, stores_with_posting, stores_insufficient_coverage,
+       ROUND(scenario_outliers_to_median_excl_rent, 2) AS scenario_outliers_to_median_excl_rent,
+       ROUND(scenario_outliers_to_median_excl_rent / ((SELECT SUM(net_sales) FROM sales) / 100), 2)
+         AS scenario_margin_points
+  FROM flagged
+ WHERE outlier_class IN ('HIGH_OUTLIER', 'MODERATE_OUTLIER') AND excess_vs_median >= 250
+ ORDER BY excess_vs_median DESC
+ LIMIT 60"""
+    q3 = f"""WITH docs AS (
+  SELECT store_name, gl_account_number, MAX(gl_account_name) AS gl_account_name,
+         transaction_number, transaction_type, MIN(accounting_date) AS accounting_date,
+         MAX(period_label) AS period_label, COUNT(*) AS lines, SUM(expense_amount) AS amount
+    FROM v_r365_financial_transaction_llm
+   WHERE accounting_date >= '{s}' AND accounting_date < '{e}'
+     AND (<PAIRS>)
+   GROUP BY store_name, gl_account_number, transaction_number, transaction_type
+), ranked AS (
+  SELECT d.*, ROW_NUMBER() OVER (PARTITION BY store_name, gl_account_number
+                                 ORDER BY amount DESC) AS rn,
+         COUNT(*) OVER (PARTITION BY store_name, gl_account_number) AS documents_in_window,
+         SUM(amount) OVER (PARTITION BY store_name, gl_account_number) AS pair_total
+    FROM docs d
+)
+SELECT store_name, gl_account_number, gl_account_name, accounting_date, period_label,
+       transaction_type, transaction_number, lines, ROUND(amount, 2) AS amount,
+       documents_in_window, ROUND(pair_total, 2) AS pair_total
+  FROM ranked WHERE rn <= 12
+ ORDER BY store_name, gl_account_number, amount DESC"""
+    return {"Q1": q1, "Q2": q2, "Q3": q3}
+
+
+def fin_review_plan(win: dict) -> str:
+    """Turn-scoped instructions for a FINANCIAL_WASTE_REVIEW question."""
+    head = ("FINANCIAL_WASTE_REVIEW (this question is a broad cost-cutting / waste / "
+            "margin review). Rigorous consulting-style analysis means evidence from the "
+            "queries below only: no industry benchmarks, no typical percentages, no "
+            "invented savings.\n")
+    if not win.get("periods"):
+        return head + (
+            "No fiscal period currently has both complete R365 FINANCIAL data and R365 "
+            "net sales for every store, so a store comparison cannot be made. Do not run "
+            "SQL. Say so in two or three sentences and ask which period to review.")
+    labels = [p["label"] for p in win["periods"]]
+    dates = "; ".join(f"{p['label']} {p['start']} to {p['end']}" for p in win["periods"])
+    qs = fin_review_queries(win)
+    ctx = ", ".join(f"{n} ({a})" for a, n in FIN_REVIEW_CONTEXT_ACCOUNTS.items())
+    return head + f"""
+WINDOW (chosen by the server; do not query periods or pick another range):
+  {', '.join(labels)} -- {dates}. These are the latest complete fiscal periods with
+  complete R365 FINANCIAL data AND R365 net sales for every store.
+  {win['note'] or ''}
+  State the window in the first line of the answer as
+  "{', '.join(labels)} ({win['start']} to {win['periods'][-1]['end']})", and that a different
+  period can be reviewed on request. '{win['end_exclusive']}' is only the exclusive
+  SQL bound: never write it as a date of the window. If the user named a period, show it in
+  the per-period columns; never compare a CURRENT period.
+  run_sql scope for every query: establishment_id null, period_start
+  '{win['start']}', period_end_exclusive '{win['end_exclusive']}'.
+
+SCOPE:
+  Excluded from opportunities: FOOD (all Cost of Goods Sold accounts, incl.
+  beverage and food paper) and LABOR (Labor accounts and 5500 payroll accounts)
+  -- the team is already working on those -- plus sales deductions (4500
+  discounts/comps/promotions) and sales tax difference. The queries already
+  exclude them; do not add them back or recommend cuts there.
+  review_class CONTRACTUAL_CONTEXT ({ctx}): report as context only, never
+  rank as waste. LEASE_DRIVEN (Rent - Restaurant): occupancy cost; a lease
+  matter, not a quick saving.
+  Only ELECTRICITY, GAS, WATER, RENT, REPAIRS_MAINTENANCE are VERIFIED
+  categories. Every other line is an R365 GL account (mapping_status CANDIDATE
+  or UNMAPPED): call it by its account name, never a verified category.
+
+TOOL BUDGET: at most {FIN_REVIEW_SQL_BUDGET} run_sql calls, then the server ends
+tool use and you must answer. Do not call check_data. Do not run discovery
+queries. Send Q1 and Q2 together in your FIRST response (two run_sql calls),
+then Q3 once, then write the answer.
+
+Q1 -- network overview by GL account (run exactly as written):
+{qs['Q1']}
+
+Q2 -- store outliers vs the median store, % of R365 net sales (run as written):
+{qs['Q2']}
+
+Q3 -- documents behind the largest outliers. Replace <PAIRS> with up to 3
+(store, account) pairs from Q2 -- the largest excess_vs_median rows that are
+not Rent - Restaurant -- written as
+  (establishment_id = 32 AND gl_account_number = '6500-02') OR (...)
+and run it once:
+{qs['Q3']}
+
+METHOD (all numbers come from the query results; do not compute new totals,
+ratios or sums by hand):
+  * % of net sales = account expense / R365 net sales of the same window.
+    1 margin point = one_margin_point dollars (1% of that net sales);
+    2 and 3 points are that figure x2 and x3.
+  * HIGH_OUTLIER >= 1.5x and MODERATE_OUTLIER >= 1.25x the median store's
+    ratio, among stores with comparable posting coverage. Stores with fewer
+    periods posted than their peers are INSUFFICIENT_POSTING_COVERAGE and are
+    never ranked (stores_insufficient_coverage counts them). A store with no
+    posting is NOT $0 and is not a saving; utilities and rent may be billed
+    monthly or quarterly (Downtown Houston electricity is quarterly, owner-
+    confirmed). Never present a posting gap as a cost saving.
+  * Label every figure as one of:
+      OBSERVED OUTLIER -- a ratio from Q2.
+      SCENARIO SAVINGS -- an explicit what-if computed in SQL:
+        scenario_outliers_to_median_excl_rent (every CONTROLLABLE outlier
+        store brought to the median ratio; scenario_margin_points). It
+        ALREADY EXCLUDES Rent - Restaurant: the LEASE_DRIVEN rows in Q2 are
+        context and are not part of that figure. Or
+        scenario_5pct_of_controllable / scenario_10pct_of_controllable (Q1).
+      UNPROVEN OPPORTUNITY -- anything needing invoices, contracts or usage.
+    Never write "savings identified" for a scenario, and never call a
+    scenario a path, a range of achievable points or a credible estimate.
+    Do not promise that 2-3 margin points exist: compare each scenario's
+    margin points with the target and say that converting any of it needs
+    the validation listed.
+  * Posting coverage: quote only stores_with_posting and
+    stores_insufficient_coverage exactly as returned; do not restate them.
+  * No generalisations about how vendors, banks, processors, insurers,
+    contracts or equipment typically behave, and no explanation of WHY a
+    store is high: the data shows amounts, ratios, dates and documents only.
+  * R365 lines carry no vendor, memo or item detail: drill-downs show dates,
+    document types and numbers only. Do not guess vendors or causes.
+  * No square footage, seating, building, lease or opening-date data exists in
+    the database: do not normalise per square foot and do not invent footprints.
+
+ANSWER (concise and decision-oriented: at most 700 words, markdown headings,
+a table is fine):
+  EXECUTIVE SUMMARY -- window; non-food/non-labor expense analysed (sum of Q1
+    totals is not needed: give controllable_total and the largest accounts);
+    largest controllable accounts; strongest store outliers; scenario sizes in
+    dollars and margin points; whether 2-3 points looks realistic from this
+    evidence alone.
+  TOP OPPORTUNITIES -- per item: account, stores, current expense, comparison
+    (median store ratio), scenario, evidence/confidence.
+  STORE OUTLIERS -- comparable coverage only.
+  QUICK WINS -- only evidence-supported actions.
+  NEEDS VALIDATION -- items needing invoice/accounting/business confirmation.
+  INFORMATION NEEDED -- ask for store square footage and any other inputs that
+    would materially change the comparison (vendor contracts, utility service
+    periods, lease/CAM terms, supply purchasing contracts).
+  NEXT 3 ACTIONS -- concrete management actions.
+End with the conclusion, never with "let me check" or a promise to analyse."""
+
+
+FIN_REVIEW_SYNTHESIS_RULES = (
+    "Use the FINANCIAL_WASTE_REVIEW answer structure, AT MOST 700 WORDS. Compare "
+    "stores only through x_median and median_store_pct as returned; no other "
+    "multiples. Report each scenario on its own with its margin points -- no "
+    "ranges, and no totals added up by hand (not even of documents). If a query failed, answer from the ones "
+    "that succeeded and say which figure is missing.")
+LENGTH_LIMIT_NOTE = ("\n\n_(Answer shortened at the length limit -- ask for any "
+                     "section in more detail.)_")
+FORCED_SYNTHESIS_PROMPT = (
+    "Compose the final answer to the user's question now, from the tool results "
+    "above. You cannot run SQL any more. Quote only figures that appear in those "
+    "results -- do not compute new totals, sums or ratios by hand. Keep every rule "
+    "from the system prompt. If something is unresolved, state it as a limitation "
+    "and offer it as the next drill-down; do not say you will check, analyse or "
+    "investigate further.")
+EMPTY_ANSWER_FALLBACK = (
+    "I ran the analysis but could not compose a final answer from it. Please try "
+    "again, or narrow the question to one category, store or period.")
+
+
+def _text_of(resp) -> str:
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+
+def _forced_synthesis(client, model, system, messages, timings, reason: str,
+                      extra: str = "") -> str:
+    """One last call WITHOUT tools and without thinking, so the whole output
+    budget goes to the answer. Used when a call ended without text (output
+    budget spent on thinking), when a tool budget is reached, and when the loop
+    runs out -- in each case the evidence already gathered is kept."""
+    messages.append({"role": "user", "content": (
+        f"{FORCED_SYNTHESIS_PROMPT}{(' ' + extra) if extra else ''}")})
+    _t = time.perf_counter()
+    resp = client.messages.create(model=model, max_tokens=4096, system=system,
+                                  messages=messages, thinking={"type": "disabled"})
+    _timing(timings, f"anthropic.forced_synthesis[{reason}]", time.perf_counter() - _t)
+    text = _text_of(resp)
+    if resp.stop_reason == "max_tokens" and text.strip():
+        text += LENGTH_LIMIT_NOTE          # never end silently mid-sentence
+    return text
+
+
 def _log_timings(timings: list, model: str, aborted: bool = False) -> None:
     """Emit one structured, payload-free timing line per request."""
     total = sum(d for _, d in timings)
@@ -4841,6 +5235,19 @@ def answer_question(history: list[dict], question: str, model: str | None = None
          "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": _system_today()},
     ]
+    # FINANCIAL_WASTE_REVIEW: a fixed window, three set-based queries and a hard
+    # run_sql budget instead of open-ended exploration.
+    review = None
+    sql_calls = 0
+    if is_financial_waste_review(question):
+        try:
+            review = fin_review_window(question)
+        except psycopg2.Error as e:
+            review = {"periods": [], "error": str(e).strip()[:200]}
+        system.append({"type": "text", "text": fin_review_plan(review)})
+        steps.append({"sql": None, "row_count": None, "error": review.get("error"),
+                      "intent": "FINANCIAL_WASTE_REVIEW",
+                      "window": [p["label"] for p in review.get("periods", [])]})
     for _loop in range(MAX_LOOPS):
         elapsed = time.perf_counter() - t_request
         if elapsed > REQUEST_DEADLINE_SECONDS:
@@ -4861,7 +5268,16 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 time.perf_counter() - _t)
 
         if resp.stop_reason != "tool_use":
-            final_text = "".join(b.text for b in resp.content if b.type == "text")
+            final_text = _text_of(resp)
+            # max_tokens: the output budget ran out -- with thinking on, often
+            # before ANY text (jobs 252-254 saved empty answers this way). The
+            # evidence is already in `messages`, so ask once more, tools off.
+            if resp.stop_reason == "max_tokens" or not final_text.strip():
+                final_text = _forced_synthesis(
+                    client, model, system, messages, timings,
+                    str(resp.stop_reason)) or final_text
+                steps.append({"sql": None, "row_count": None, "error": None,
+                              "forced_synthesis": str(resp.stop_reason)})
             break
 
         messages.append({"role": "assistant", "content": resp.content})
@@ -4916,6 +5332,16 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
             sql = block.input.get("sql", "")
             step = {"sql": sql, "row_count": None, "error": None}
+            if review is not None and sql_calls >= FIN_REVIEW_SQL_BUDGET:
+                step["error"] = "not executed: review tool budget reached"
+                tool_results.append({
+                    "type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                    "content": (f"NOT EXECUTED: this review is limited to "
+                                f"{FIN_REVIEW_SQL_BUDGET} queries. Answer from the "
+                                f"results you already have.")})
+                steps.append(step)
+                continue
+            sql_calls += 1
             _t_sql = time.perf_counter()
             try:
                 # A12: the server reconciles the declared scope itself, before
@@ -5026,12 +5452,25 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                           "short_circuit": True, "blocked_domains": blocked.get(
                               "question_domains")})
             break
+
+        if review is not None and sql_calls >= FIN_REVIEW_SQL_BUDGET:
+            final_text = _forced_synthesis(
+                client, model, system, messages, timings, "review_budget",
+                FIN_REVIEW_SYNTHESIS_RULES)
+            steps.append({"sql": None, "row_count": None, "error": None,
+                          "forced_synthesis": "review_budget"})
+            break
     else:
-        final_text = ("I wasn't able to get to a clean answer within a few tries. "
-                      "Try rephrasing, or narrow the question to one location / date range.")
+        # Out of round-trips: keep what was found rather than discard it.
+        final_text = _forced_synthesis(client, model, system, messages, timings,
+                                       "max_loops") or (
+            "I wasn't able to get to a clean answer within a few tries. "
+            "Try rephrasing, or narrow the question to one location / date range.")
+        steps.append({"sql": None, "row_count": None, "error": None,
+                      "forced_synthesis": "max_loops"})
 
     _timing(timings, "TOTAL", time.perf_counter() - t_request)
     _log_timings(timings, model)
-    result = ChatResult(final_text.strip(), steps)
+    result = ChatResult(final_text.strip() or EMPTY_ANSWER_FALLBACK, steps)
     result.timings = timings
     return result
