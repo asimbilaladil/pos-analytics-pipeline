@@ -26,12 +26,14 @@ import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import anthropic
+import anthropic  # noqa: F401  (tests patch chat_sql.anthropic.Anthropic)
 import psycopg2
 import re
 import psycopg2.extras
 from pglast import ast, parse_sql
 from pglast.parser import ParseError
+
+import chat_providers
 
 MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5")
 log = logging.getLogger("laynes.chat")
@@ -5170,13 +5172,12 @@ EMPTY_ANSWER_FALLBACK = (
     "again, or narrow the question to one category, store or period.")
 
 
-def _text_of(resp) -> str:
-    return "".join(b.text for b in resp.content if b.type == "text")
-
-
-def _forced_synthesis(client, model, system, messages, timings, reason: str,
+def _forced_synthesis(provider, model, system, messages, timings, reason: str,
                       extra: str = "", instruction: str | None = None) -> str:
-    """The ONE final-answer call: WITHOUT tools and without thinking, so the
+    """The ONE final-answer call, for every provider: tools off and the
+    lowest reasoning the model accepts (Claude: thinking disabled; OpenAI:
+    tool_choice none + its lowest supported effort -- see chat_providers
+    .final()), so the
     whole output budget goes to the answer, over `messages` -- i.e. every tool
     result already gathered. Used when a call ended without text, when a tool
     budget is reached, when the loop runs out, and on the blocked path.
@@ -5188,14 +5189,13 @@ def _forced_synthesis(client, model, system, messages, timings, reason: str,
     text = ""
     for attempt in (1, 2):
         _t = time.perf_counter()
-        resp = client.messages.create(model=model, max_tokens=4096, system=system,
-                                      messages=messages, thinking={"type": "disabled"})
-        _timing(timings, f"anthropic.forced_synthesis[{reason}]"
+        turn = provider.final(system, messages)
+        _timing(timings, f"{provider.final_label}[{reason}]"
                 + ("" if attempt == 1 else "[retry]"), time.perf_counter() - _t)
-        text = _text_of(resp)
+        text = turn.text
         if text.strip():
             break
-    if resp.stop_reason == "max_tokens" and text.strip():
+    if turn.truncated and text.strip():
         text += LENGTH_LIMIT_NOTE          # never end silently mid-sentence
     return text
 
@@ -5227,12 +5227,15 @@ def fin_review_guarantee(text: str, evidence: dict) -> str:
     return text + ("\n\n" + "\n\n".join(add) if add else "")
 
 
-def _log_timings(timings: list, model: str, aborted: bool = False) -> None:
+def _log_timings(timings: list, model: str, aborted: bool = False,
+                 provider: str | None = None, usage: dict | None = None) -> None:
     """Emit one structured, payload-free timing line per request."""
     total = sum(d for _, d in timings)
     parts = " ".join(f"{lbl}={d:.2f}s" for lbl, d in timings)
-    log.info("chat_timing model=%s aborted=%s stages=%d measured_total=%.2fs %s",
-             model, aborted, len(timings), total, parts)
+    use = " ".join(f"{k}={v}" for k, v in sorted((usage or {}).items()))
+    log.info("chat_timing provider=%s model=%s aborted=%s stages=%d "
+             "measured_total=%.2fs %s %s", provider or "anthropic", model, aborted,
+             len(timings), total, use, parts)
 
 
 def _timing(timings: list, label: str, seconds: float) -> None:
@@ -5250,23 +5253,23 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     """
     history: prior turns as [{"role": "user"|"assistant", "content": str}, ...]
     model: override the default MODEL for this call (e.g. a per-conversation choice).
-    attachments: Anthropic content blocks (image / document / text) sent with
-        this question only; they are not replayed on later turns.
-    Returns ChatResult(answer, steps). Raises anthropic.APIError on API failure.
+    attachments: Anthropic-shaped content blocks (image / document / text) sent
+        with this question only; they are not replayed on later turns. The
+        OpenAI provider converts them to its own input parts.
+    Returns ChatResult(answer, steps). Raises anthropic.APIError (Claude) or
+    chat_providers.ProviderError (OpenAI) on API failure.
+
+    The model id selects the provider (chat_providers.make_provider). Only the
+    transport differs: every tool call below -- check_data, run_sql,
+    enforce_scope, the trust gates, the review budget, the blocked verdict and
+    forced synthesis -- is executed here, identically, for both providers.
     """
-    # Explicit bounds: the SDK defaults (600 s read, 2 retries) can outlive
-    # nginx several times over without the application noticing.
-    client = anthropic.Anthropic(  # ANTHROPIC_API_KEY from env
-        timeout=ANTHROPIC_TIMEOUT_SECONDS, max_retries=ANTHROPIC_MAX_RETRIES)
     model = model or MODEL
-    messages: list[dict] = [
-        {"role": m["role"], "content": m["content"]} for m in history
-    ]
-    if attachments:
-        messages.append({"role": "user", "content": [
-            *attachments, {"type": "text", "text": question}]})
-    else:
-        messages.append({"role": "user", "content": question})
+    provider = chat_providers.make_provider(
+        model, [CHECK_DATA_TOOL, RUN_SQL_TOOL],
+        anthropic_timeout=ANTHROPIC_TIMEOUT_SECONDS,
+        anthropic_max_retries=ANTHROPIC_MAX_RETRIES)
+    messages: list = provider.start(history, question, attachments)
 
     steps: list[dict] = []
     final_text = ""
@@ -5305,38 +5308,39 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         elapsed = time.perf_counter() - t_request
         if elapsed > REQUEST_DEADLINE_SECONDS:
             _timing(timings, "deadline_exceeded", elapsed)
-            _log_timings(timings, model, aborted=True)
+            _log_timings(timings, model, aborted=True, provider=provider.name,
+                         usage=provider.usage)
             raise ChatTimeout(
                 f"analysis exceeded {REQUEST_DEADLINE_SECONDS:.0f}s after "
                 f"{_loop} tool round-trip(s)")
         _t = time.perf_counter()
-        resp = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system,
-            tools=[CHECK_DATA_TOOL, RUN_SQL_TOOL],
-            messages=messages,
-        )
-        _timing(timings, f"anthropic.messages.create[{_loop}]",
+        turn = provider.turn(system, messages)
+        _timing(timings, f"{provider.call_label}[{_loop}]",
                 time.perf_counter() - _t)
 
-        if resp.stop_reason != "tool_use":
-            final_text = _text_of(resp)
-            # max_tokens: the output budget ran out -- with thinking on, often
-            # before ANY text (jobs 252-254 saved empty answers this way). The
-            # evidence is already in `messages`, so ask once more, tools off.
-            if resp.stop_reason == "max_tokens" or not final_text.strip():
+        if turn.stop != "tool_use":
+            final_text = turn.text
+            # max_tokens: the output budget ran out -- with thinking/reasoning
+            # on, often before ANY text (jobs 252-254 saved empty answers this
+            # way). Reasoning alone is never an answer. The evidence is already
+            # in `messages`, so ask once more, tools off.
+            if turn.truncated or not final_text.strip():
                 final_text = _forced_synthesis(
-                    client, model, system, messages, timings,
-                    str(resp.stop_reason)) or final_text
+                    provider, model, system, messages, timings,
+                    turn.stop) or final_text
                 steps.append({"sql": None, "row_count": None, "error": None,
-                              "forced_synthesis": str(resp.stop_reason)})
+                              "forced_synthesis": turn.stop})
             break
 
-        messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
-        for block in resp.content:
-            if block.type != "tool_use":
+        provider.add_assistant(messages, turn)
+        tool_results = []          # (call_id, content, is_error), provider-neutral
+        for block in turn.calls:
+            if block.bad_args:
+                # Malformed arguments are never guessed at or executed.
+                steps.append({"sql": None, "row_count": None,
+                              "error": f"tool arguments rejected: {block.bad_args}"})
+                tool_results.append((block.id, f"ERROR: {block.bad_args}. Call the "
+                                     "tool again with a JSON object of arguments.", True))
                 continue
 
             if block.name == "check_data":
@@ -5366,32 +5370,28 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                         blocked = blocked_domain_context(
                             meta, block.input.get("domains") or meta.get("domains"))
                         step["short_circuit"] = True
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": json.dumps(meta, default=str,
-                                              separators=(",", ":")),
-                    })
+                    tool_results.append((block.id, json.dumps(
+                        meta, default=str, separators=(",", ":")), False))
                 except (psycopg2.Error, KeyError, ValueError) as e:
                     step["error"] = str(e).strip()
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": f"ERROR: {step['error']}", "is_error": True,
-                    })
+                    tool_results.append((block.id, f"ERROR: {step['error']}", True))
                 steps.append(step)
                 continue
 
             if block.name != "run_sql":
+                # Every call gets a result (OpenAI rejects an unanswered call);
+                # only check_data and run_sql exist.
+                tool_results.append((block.id, f"ERROR: unknown tool {block.name!r}", True))
                 continue
 
             sql = block.input.get("sql", "")
             step = {"sql": sql, "row_count": None, "error": None}
             if review is not None and sql_calls >= FIN_REVIEW_SQL_BUDGET:
                 step["error"] = "not executed: review tool budget reached"
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                    "content": (f"NOT EXECUTED: this review is limited to "
-                                f"{FIN_REVIEW_SQL_BUDGET} queries. Answer from the "
-                                f"results you already have.")})
+                tool_results.append((block.id, (
+                    f"NOT EXECUTED: this review is limited to "
+                    f"{FIN_REVIEW_SQL_BUDGET} queries. Answer from the "
+                    f"results you already have."), True))
                 steps.append(step)
                 continue
             sql_calls += 1
@@ -5439,9 +5439,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                          "row_count": out["row_count"], "note": "truncated to 200 rows"},
                         separators=(",", ":"),
                     )
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id, "content": payload,
-                })
+                tool_results.append((block.id, payload, False))
             except ScopeError as e:
                 # Per-scope, not turn-wide: a failed scope stays failed (the
                 # result is cached), but a DIFFERENT scope is free to be
@@ -5471,21 +5469,15 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                                 "queries that already succeeded in this turn, and "
                                 "say which deeper query could not be completed and why.")
                         step["short_circuit"] = True
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
-                    "content": f"REJECTED BEFORE EXECUTION: {step['error']}",
-                    "is_error": True,
-                })
+                tool_results.append(
+                    (block.id, f"REJECTED BEFORE EXECUTION: {step['error']}", True))
                 steps.append(step)
                 continue
             except (SqlError, psycopg2.Error) as e:
                 step["error"] = str(e).strip()
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
-                    "content": f"ERROR: {step['error']}", "is_error": True,
-                })
+                tool_results.append((block.id, f"ERROR: {step['error']}", True))
             steps.append(step)
-        messages.append({"role": "user", "content": tool_results})
+        provider.add_tool_results(messages, tool_results)
 
         if blocked is not None:
             # A trusted R365 scope checked earlier in this turn stays answerable
@@ -5516,7 +5508,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                        "source(s) above still support, and do not attempt the "
                        "comparison that the untrusted source would have required.")
             final_text = _forced_synthesis(
-                client, model, system, messages, timings, "blocked",
+                provider, model, system, messages, timings, "blocked",
                 instruction=(
                     "DATA TRUST VERDICT (authoritative, do not re-check):\n"
                     + json.dumps(blocked, default=str, separators=(",", ":"))
@@ -5532,14 +5524,14 @@ def answer_question(history: list[dict], question: str, model: str | None = None
 
         if review is not None and sql_calls >= FIN_REVIEW_SQL_BUDGET:
             final_text = _forced_synthesis(
-                client, model, system, messages, timings, "review_budget",
+                provider, model, system, messages, timings, "review_budget",
                 FIN_REVIEW_SYNTHESIS_RULES)
             steps.append({"sql": None, "row_count": None, "error": None,
                           "forced_synthesis": "review_budget"})
             break
     else:
         # Out of round-trips: keep what was found rather than discard it.
-        final_text = _forced_synthesis(client, model, system, messages, timings,
+        final_text = _forced_synthesis(provider, model, system, messages, timings,
                                        "max_loops") or (
             "I wasn't able to get to a clean answer within a few tries. "
             "Try rephrasing, or narrow the question to one location / date range.")
@@ -5547,9 +5539,11 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                       "forced_synthesis": "max_loops"})
 
     _timing(timings, "TOTAL", time.perf_counter() - t_request)
-    _log_timings(timings, model)
+    _log_timings(timings, model, provider=provider.name, usage=provider.usage)
     if review is not None:
         final_text = fin_review_guarantee(final_text, review_ev)
     result = ChatResult(final_text.strip() or EMPTY_ANSWER_FALLBACK, steps)
     result.timings = timings
+    result.provider = provider.name
+    result.usage = dict(provider.usage)
     return result

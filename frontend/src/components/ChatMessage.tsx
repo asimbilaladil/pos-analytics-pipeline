@@ -1,6 +1,7 @@
 import { Sparkles } from 'lucide-react'
 import { Markdown } from './Markdown'
 import type { Message } from '../types'
+import { modelLabel, PROVIDER_NAMES, providerOf } from '../lib/format'
 
 /**
  * The two roles are told apart by SHAPE, not by two competing bubbles.
@@ -25,12 +26,19 @@ export function UserMessage({ content }: { content: string }) {
   )
 }
 
-export function AssistantMessage({ content }: { content: string }) {
+export function AssistantMessage({ content, model }: { content: string; model?: string | null }) {
+  const provider = providerOf(model)
   return (
     <div className="flex animate-fade-up gap-3">
       <Avatar />
       <div className="min-w-0 flex-1 rounded-2xl rounded-tl-md border border-line bg-white/90 px-5 py-4 shadow-card">
         <Markdown>{content}</Markdown>
+        {/* Which model wrote this answer -- a conversation can mix providers. */}
+        {model && provider && (
+          <p data-testid="answer-model" className="mt-3 text-[11px] text-ink-400">
+            {modelLabel(model)} · {PROVIDER_NAMES[provider]}
+          </p>
+        )}
       </div>
     </div>
   )
@@ -70,7 +78,7 @@ export function MessageList({ messages }: { messages: Message[] }) {
       {messages.map((m, i) =>
         m.role === 'user'
           ? <UserMessage key={i} content={m.content} />
-          : <AssistantMessage key={i} content={m.content} />,
+          : <AssistantMessage key={i} content={m.content} model={m.model} />,
       )}
     </>
   )

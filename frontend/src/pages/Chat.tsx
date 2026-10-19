@@ -7,7 +7,8 @@ import { WelcomeState } from '../components/WelcomeState'
 import { Header } from '../components/Header'
 import { MessageList, ThinkingMessage, UserMessage } from '../components/ChatMessage'
 import { Sidebar } from '../components/Sidebar'
-import type { AskAccepted, ChatJob, Conversation, Message, User } from '../types'
+import type { AskAccepted, ChatJob, Conversation, Message, ModelOption, ModelsInfo, ProviderInfo, User } from '../types'
+import { modelLabel, providerOfId } from '../lib/format'
 import { loadResume, mayHaveReachedServer, saveResume, type InflightSend } from '../lib/chatResume'
 
 export function Chat({ user, onSignedOut, onOpenAdmin }: {
@@ -17,8 +18,10 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
   const [activeId, setActiveId] = useState<number | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [pending, setPending] = useState<string | null>(null)
-  const [models, setModels] = useState<string[]>([])
+  const [models, setModels] = useState<ModelOption[]>([])
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [model, setModel] = useState('')
+  const [defaultModel, setDefaultModel] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [failed, setFailed] = useState<{ question: string; retryable: boolean; key?: string } | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -43,7 +46,14 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
 
   useEffect(() => {
     refreshList()
-    api.models().then((m) => { setModels(m.models); setModel(m.default) }).catch(handleError)
+    api.models().then((m: ModelsInfo) => {
+      // An older server sends ids only; derive labels for those.
+      setModels(m.options ?? m.models.map((id) => ({
+        id, label: modelLabel(id), provider: providerOfId(id),
+      })))
+      setProviders(m.providers ?? [])
+      setModel(m.default); setDefaultModel(m.default)
+    }).catch(handleError)
   }, [refreshList, handleError])
 
   /* Auto-follow, but only when the reader is already at the end.
@@ -280,7 +290,13 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
       const d = await api.conversation(id)
       setActiveId(d.id); setMessages(d.messages)
       rememberConversation(d.id)
-      if (d.model) setModel(d.model)
+      // Keep the conversation's model only while the server still offers it
+      // (an OpenAI conversation after OpenAI was disabled falls back to the
+      // default rather than leaving the picker on an unsendable value).
+      if (d.model) {
+        const offered = models.length === 0 || models.some((m) => m.id === d.model)
+        setModel(offered || !defaultModel ? d.model : defaultModel)
+      }
       // A freshly opened conversation always starts at its newest message.
       setAtBottom(true)
       requestAnimationFrame(() => scrollToBottom('auto'))
@@ -418,7 +434,7 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
       <div className="flex h-full min-w-0 flex-col overflow-hidden">
         <Header
           user={user}
-          models={models} model={model} onModelChange={setModel}
+          models={models} providers={providers} model={model} onModelChange={setModel}
           onNewChat={newChat} onSignOut={signOut} onOpenAdmin={onOpenAdmin}
           onOpenSidebar={() => setSidebarOpen(true)}
         />

@@ -105,7 +105,9 @@ def me(user=Depends(current_user)):
 # ── models ──────────────────────────────────────────────────────────────────
 @app.get("/api/models", response_model=ModelsOut)
 def models(user=Depends(current_user)):
-    return ModelsOut(models=chat_svc.AVAILABLE_MODELS, default=chat_svc.DEFAULT_MODEL)
+    # Server-approved ids only: Claude's fixed list plus the configured,
+    # verified OpenAI models. The client may only send back one of these.
+    return ModelsOut(**chat_svc.model_options())
 
 
 @app.get("/api/status")
@@ -134,9 +136,17 @@ def get_conversation(cid: int, user=Depends(current_user)):
     row = convo.owned(cid, user["id"])
     if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    msgs = convo.messages(cid, user["id"]) or []
+    msgs = convo.messages(cid, user["id"], with_model=True) or []
     return ConversationDetail(id=row["id"], title=row["title"], model=row["model"],
-                              messages=[MessageOut(**m) for m in msgs])
+                              messages=[_message_out(m) for m in msgs])
+
+
+def _message_out(m: dict) -> MessageOut:
+    """An assistant message carries the model (and so the provider) that
+    produced it, taken from the job that wrote it."""
+    model = m.get("model") if m["role"] == "assistant" else None
+    return MessageOut(role=m["role"], content=m["content"], model=model,
+                      provider=chat_svc.provider_of(model) if model else None)
 
 
 @app.delete("/api/conversations/{cid}", status_code=204)
@@ -220,8 +230,6 @@ def _ask(cid: int, question: str, model: str | None, user,
     if len(question) > 4000:
         raise HTTPException(status_code=400, detail="Question is too long.")
 
-    model = chat_svc.resolve_model(model)
-
     # A resend of a submission the server already has -- the phone locked
     # before the 202 was read, or the user tapped Retry -- is a LOOKUP. Checked
     # before any write, so it creates no conversation, no user message and no
@@ -237,6 +245,22 @@ def _ask(cid: int, question: str, model: str | None, user,
                     conversation_id=prior["conversation_id"], title=prow["title"],
                     job_id=str(prior["job_id"]), status=prior["status"],
                     user_message_id=prior.get("user_message_id"))
+
+    # Validated AFTER the resend lookup: a submission the server already has
+    # keeps the provider it was submitted with, even if that provider has
+    # since been disabled -- its answer is still returned. A NEW submission for
+    # a model that is not offered is refused, never re-routed to the other
+    # provider.
+    try:
+        model = chat_svc.resolve_model(model, strict=True)
+    except chat_svc.ModelUnavailable:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected AI model is not available right now. "
+                   "Please choose another model.")
+    if not chat_svc.provider_configured(model):
+        raise HTTPException(status_code=503,
+                            detail="The selected AI provider is not configured on the server.")
 
     is_new = cid == 0
     if is_new:
@@ -286,8 +310,11 @@ def _ask(cid: int, question: str, model: str | None, user,
         Every existing gate still applies -- chat_svc.ask calls the same
         chat_sql.answer_question, so source-aware gating, the SQL validator,
         HME safety, reconciliation blocking, timing instrumentation and the
-        per-call Anthropic bounds are untouched.
+        per-call provider bounds are untouched. `model` was fixed at
+        submission: changing the picker later never changes this job.
         """
+        log.info("chat_job generate job_id=%s provider=%s model=%s",
+                 job_id, chat_svc.provider_of(model), model)
         answer, steps, dur, error = chat_svc.ask(history, question, model, attachments)
         assistant_id = convo.add_message_returning_id(cid, "assistant", answer)
         convo.touch(cid)
@@ -298,7 +325,7 @@ def _ask(cid: int, question: str, model: str | None, user,
             # error string meant for the log. Record the failure so the client
             # clears its spinner and offers Retry; the answer text is still
             # persisted and readable in the transcript.
-            jobs_svc.mark_failed(job_id, "generation_error", answer, dur)
+            jobs_svc.mark_failed(job_id, chat_svc.failure_code(error), answer, dur)
         else:
             jobs_svc.mark_completed(job_id, assistant_id, dur)
 
@@ -379,7 +406,7 @@ def admin_get_conversation(cid: int, admin=Depends(admin_user)):
         raise HTTPException(status_code=404, detail="Conversation not found")
     row, msgs = found
     return ConversationDetail(id=row["id"], title=row["title"], model=row["model"],
-                              messages=[MessageOut(**m) for m in msgs])
+                              messages=[_message_out(m) for m in msgs])
 
 
 # ── import / export ─────────────────────────────────────────────────────────

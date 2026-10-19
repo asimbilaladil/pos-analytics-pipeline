@@ -140,8 +140,8 @@ def create_or_reuse(*, conversation_id: int, user_id: int, question: str,
                      winner["job_id"], winner["conversation_id"], winner["status"])
             return dict(winner), False
         raise RuntimeError("chat job insert conflicted but no active job was found")
-    log.info("chat_job created job_id=%s conversation_id=%s attempt=%s",
-             job["job_id"], conversation_id, attempt)
+    log.info("chat_job created job_id=%s conversation_id=%s attempt=%s model=%s",
+             job["job_id"], conversation_id, attempt, model)
     return dict(job), True
 
 

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Eye, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
-import type { User } from '../types'
-import { modelLabel } from '../lib/format'
+import type { ModelOption, ProviderInfo, User } from '../types'
+import { PROVIDER_NAMES } from '../lib/format'
 
 /**
  * Light 64px bar. The sidebar owns the branding, so the header carries only
@@ -11,10 +11,13 @@ import { modelLabel } from '../lib/format'
  * because the column itself never scrolls, the header simply never moves.
  */
 export function Header({
-  user, models, model, onModelChange, onNewChat, onSignOut, onOpenSidebar, onOpenAdmin,
+  user, models, providers = [], model, onModelChange, onNewChat, onSignOut, onOpenSidebar,
+  onOpenAdmin,
 }: {
   user: User | null
-  models: string[]
+  /** Server-approved options only; the select can never send anything else. */
+  models: ModelOption[]
+  providers?: ProviderInfo[]
   model: string
   onModelChange: (m: string) => void
   onNewChat: () => void
@@ -27,6 +30,18 @@ export function Header({
   const initials = name
     ? name.split(/[\s._-]+/).filter(Boolean).slice(0, 2).map((p) => p[0]!.toUpperCase()).join('')
     : null
+
+  // Grouped by provider only when more than one is offered; with OpenAI
+  // disabled the picker is exactly the Claude list it always was.
+  const groups = (['anthropic', 'openai'] as const)
+    .map((pid) => ({
+      pid,
+      label: providers.find((p) => p.id === pid)?.label ?? PROVIDER_NAMES[pid],
+      options: models.filter((m) => m.provider === pid),
+    }))
+    .filter((g) => g.options.length > 0)
+  const selected = models.find((m) => m.id === model)
+  const selectedProvider = selected ? PROVIDER_NAMES[selected.provider] : null
 
   return (
     <header className="z-20 flex h-16 shrink-0 items-center justify-between gap-3
@@ -42,6 +57,12 @@ export function Header({
         {/* Visible at every width: on a phone this is the only place to pick
             the model. 16px text below sm, because iOS Safari zooms the page
             when a control under 16px is focused. */}
+        {groups.length > 1 && selectedProvider && (
+          <span data-testid="selected-provider"
+            className="hidden text-[12px] font-medium text-ink-400 md:inline">
+            {selectedProvider}
+          </span>
+        )}
         <div className="relative">
           <Sparkles size={13}
             className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-brand-500
@@ -50,13 +71,19 @@ export function Header({
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
             aria-label="Assistant model"
-            title={model}
+            title={selected ? `${selected.label} \u2014 ${PROVIDER_NAMES[selected.provider]}` : model}
             className="h-10 cursor-pointer appearance-none rounded-xl border border-line bg-white
                        pl-7 pr-7 text-base font-medium text-ink-900 shadow-card
                        transition-colors hover:border-ink-400/40 focus:outline-none
                        sm:pl-8 sm:pr-9 sm:text-[13px]"
           >
-            {models.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
+            {groups.length > 1
+              ? groups.map((g) => (
+                  <optgroup key={g.pid} label={g.label}>
+                    {g.options.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                  </optgroup>
+                ))
+              : models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
           </select>
           <ChevronDown size={14}
             className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-ink-400

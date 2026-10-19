@@ -34,6 +34,9 @@ class ConversationOut(BaseModel):
 class MessageOut(BaseModel):
     role: str
     content: str
+    # Assistant messages: the model / provider that answered (from its job).
+    model: str | None = None
+    provider: str | None = None
 
 
 class ConversationDetail(BaseModel):
@@ -92,9 +95,23 @@ class AskOut(BaseModel):
     duration_ms: int
 
 
+class ModelOption(BaseModel):
+    id: str
+    label: str
+    provider: str
+
+
+class ProviderOut(BaseModel):
+    id: str
+    label: str
+    enabled: bool
+
+
 class ModelsOut(BaseModel):
     models: list[str]
     default: str
+    options: list[ModelOption] = []
+    providers: list[ProviderOut] = []
 
 
 class AdminUserOut(BaseModel):
