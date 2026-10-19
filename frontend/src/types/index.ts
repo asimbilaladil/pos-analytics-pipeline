@@ -16,6 +16,31 @@ export interface Conversation {
 export interface Message {
   role: 'user' | 'assistant'
   content: string
+  /** Assistant turns: the model and provider that wrote this answer. */
+  model?: string | null
+  provider?: string | null
+}
+
+export type ProviderId = 'anthropic' | 'openai'
+
+/** One server-approved model the picker may offer. */
+export interface ModelOption {
+  id: string
+  label: string
+  provider: ProviderId
+}
+
+export interface ProviderInfo {
+  id: ProviderId
+  label: string
+  enabled: boolean
+}
+
+export interface ModelsInfo {
+  models: string[]
+  default: string
+  options?: ModelOption[]
+  providers?: ProviderInfo[]
 }
 
 export interface ConversationDetail {

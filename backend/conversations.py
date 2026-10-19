@@ -40,10 +40,27 @@ def owned(conversation_id, user_id):
     )
 
 
-def messages(conversation_id, user_id):
-    """Messages for a conversation the user owns; None if they do not."""
+def messages(conversation_id, user_id, with_model: bool = False):
+    """Messages for a conversation the user owns; None if they do not.
+
+    with_model adds, for an assistant message, the model of the job that wrote
+    it (chat_jobs.assistant_message_id). Display only: history sent to a model
+    is always plain role/content, whichever provider wrote it.
+    """
     if not owned(conversation_id, user_id):
         return None
+    if with_model:
+        rows = query(
+            # One job writes one assistant message; conversation_id keeps the
+            # join on chat_jobs_conversation_idx.
+            "SELECT m.role, m.content, j.model FROM chat_messages m "
+            "LEFT JOIN chat_jobs j ON j.assistant_message_id = m.id "
+            "  AND j.conversation_id = m.conversation_id "
+            "WHERE m.conversation_id = %s ORDER BY m.created_at, m.id",
+            (conversation_id,),
+        )
+        return [{"role": r["role"], "content": r["content"], "model": r["model"]}
+                for r in rows]
     rows = query(
         "SELECT role, content FROM chat_messages WHERE conversation_id = %s "
         "ORDER BY created_at, id",
@@ -170,7 +187,7 @@ def admin_conversation(conversation_id):
     )
     if not convo:
         return None
-    return convo, messages(conversation_id, convo["user_id"]) or []
+    return convo, messages(conversation_id, convo["user_id"], with_model=True) or []
 
 
 def auto_title(first_prompt: str) -> str:

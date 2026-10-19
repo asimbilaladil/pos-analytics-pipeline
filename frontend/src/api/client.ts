@@ -1,4 +1,4 @@
-import type { AdminUser, AskAccepted, ChatJob, Conversation, ConversationDetail, User } from '../types'
+import type { AdminUser, AskAccepted, ChatJob, Conversation, ConversationDetail, ModelsInfo, User } from '../types'
 
 /**
  * Every call is credentialed so the HttpOnly session cookie travels with it.
@@ -86,7 +86,7 @@ export const api = {
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
   me: () => request<User>('/api/auth/me'),
 
-  models: () => request<{ models: string[]; default: string }>('/api/models'),
+  models: () => request<ModelsInfo>('/api/models'),
   status: () => request<{ assistant_configured: boolean }>('/api/status'),
 
   conversations: () => request<Conversation[]>('/api/conversations'),

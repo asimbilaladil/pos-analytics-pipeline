@@ -323,10 +323,19 @@ _src = open("chat_sql.py").read()
 # The blocked path shares the one final-synthesis helper (tools off, thinking
 # disabled, one retry) with the other final-answer paths.
 _helper = _src[_src.index("def _forced_synthesis("):_src.index("def _fmt_usd(")]
-_blocked_call = 'client, model, system, messages, timings, "blocked",'
+_blocked_call = 'provider, model, system, messages, timings, "blocked",'
+# The transport-specific final call lives in chat_providers: Claude's has no
+# tools and thinking disabled; OpenAI's forbids tool calls (tool_choice none)
+# at the model's lowest reasoning effort.
+_psrc = open("chat_providers.py").read()
+_claude_final = _psrc[_psrc.index("    def final(self, system, messages)"):
+                      _psrc.index("    def add_assistant(self, messages")]
 check("the short circuit makes a final model call WITHOUT tools",
       _blocked_call in _src and "tools=" not in _helper
-      and 'thinking={"type": "disabled"}' in _helper)
+      and "provider.final(" in _helper
+      and "tools=" not in _claude_final
+      and 'thinking={"type": "disabled"}' in _claude_final
+      and 'tool_choice="none"' in _psrc)
 check("the short circuit breaks the tool loop",
       _src.index(_blocked_call) < _src.index("break", _src.index(_blocked_call)))
 check("the verdict is marked authoritative so the model does not re-check",

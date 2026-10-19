@@ -343,8 +343,11 @@ check("review: Q3 rejected by the gate (unbounded), Q1 + Q2 kept",
 check("review: still answers (with targets) instead of the fallback",
       r.answer.startswith("Review from Q1 and Q2") and "$83,572.52" in r.answer
       and r.answer != C.EMPTY_ANSWER_FALLBACK)
-check("only two messages.create call sites remain (main loop + common helper)",
-      open("chat_sql.py").read().count("client.messages.create(") == 2)
+_prov_src = open("chat_providers.py").read()
+check("only two messages.create call sites remain (Claude turn + Claude final), "
+      "and the loop reaches them only through the provider",
+      _prov_src.count("client.messages.create(") == 2
+      and open("chat_sql.py").read().count("client.messages.create(") == 0)
 
 failed = [x for x in results if not x[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

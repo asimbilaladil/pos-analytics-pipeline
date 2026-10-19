@@ -73,10 +73,13 @@ class MockApi:
         self.next_id, self.polls, self.posts, self.conv_gets = 100, 0, [], 0
         self.lose_ack = None          # coroutine run between server work and the reply
         self.models = ["m"]
+        self.options = None           # server-approved options incl. provider (new API)
 
     def complete(self, job_id, text="FINAL ANSWER"):
         j = self.jobs[job_id]
-        self.convs[j["conversation_id"]]["messages"].append({"role": "assistant", "content": text})
+        self.convs[j["conversation_id"]]["messages"].append(
+            {"role": "assistant", "content": text, "model": j.get("model"),
+             "provider": ("openai" if (j.get("model") or "").startswith("gpt-") else "anthropic")})
         j["status"] = "completed"
 
     async def handle(self, route):
@@ -89,6 +92,14 @@ class MockApi:
         if path == "/auth/me":
             return await ok({"id": 7, "email": "t@x", "full_name": "T", "role": "user", "is_admin": False})
         if path == "/models":
+            if self.options is not None:
+                provs = {o["provider"] for o in self.options}
+                return await ok({"models": [o["id"] for o in self.options], "default": self.models[0],
+                                 "options": self.options,
+                                 "providers": [{"id": "anthropic", "label": "Claude \u2014 Anthropic",
+                                                "enabled": True},
+                                               {"id": "openai", "label": "GPT \u2014 OpenAI",
+                                                "enabled": "openai" in provs}]})
             return await ok({"models": self.models, "default": self.models[0]})
         if path == "/conversations" and m == "GET":
             return await ok([{"id": c["id"], "title": c["title"], "model": "m",
@@ -120,7 +131,8 @@ class MockApi:
                     self.convs[cid] = {"id": cid, "title": body["question"][:40], "model": "m", "messages": []}
                 self.convs[cid]["messages"].append({"role": "user", "content": body["question"]})
                 jid = f"job-{len(self.jobs) + 1}"
-                j = {"job_id": jid, "conversation_id": cid, "status": "processing", "attempt": 1}
+                j = {"job_id": jid, "conversation_id": cid, "status": "processing", "attempt": 1,
+                     "model": body.get("model")}
                 self.jobs[jid], self.keys[key] = j, jid
             acc = {"conversation_id": j["conversation_id"], "title": self.convs[j["conversation_id"]]["title"],
                    "job_id": j["job_id"], "status": j["status"], "user_message_id": 1}
@@ -133,6 +145,7 @@ class MockApi:
 
     @staticmethod
     def public(j):
+        j = {k: v for k, v in j.items() if k != "model"}
         return {**j, "created_at": None, "completed_at": None, "duration_ms": None,
                 "error_code": j.get("error_code"), "error_message": j.get("error_message")}
 
@@ -376,6 +389,115 @@ async def main():
                   api.posts and api.posts[-1].get("model") == "claude-opus-5",
                   str(api.posts[-1].get("model") if api.posts else None))
             await ctx.close()
+
+        # ── providers: Claude + OpenAI in one picker ──────────────────────
+        CLAUDE = [{"id": "claude-sonnet-5", "label": "Sonnet 5", "provider": "anthropic"},
+                  {"id": "claude-opus-5", "label": "Opus 5", "provider": "anthropic"},
+                  {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5", "provider": "anthropic"}]
+        GPT = [{"id": "gpt-6-luna", "label": "GPT-6 Luna", "provider": "openai"},
+               {"id": "gpt-6.1-sol", "label": "GPT-6.1 Sol", "provider": "openai"}]
+
+        def provider_api(with_openai=True):
+            api = MockApi()
+            api.models = ["claude-sonnet-5"]
+            api.options = CLAUDE + (GPT if with_openai else [])
+            return api
+
+        api = provider_api(with_openai=False)
+        ctx, p, cdp = await fresh(api)
+        await p.wait_for_selector("header select option", state="attached")
+        groups = await p.evaluate("document.querySelectorAll('header select optgroup').length")
+        opts = await p.evaluate("Array.from(document.querySelectorAll('header select option')).map(o => o.value)")
+        check("OpenAI disabled: picker is the plain Claude list (no groups, no GPT option)",
+              groups == 0 and opts == [o["id"] for o in CLAUDE], f"{groups} {opts}")
+        check("OpenAI disabled: Claude stays the default selection",
+              await p.locator("select[aria-label='Assistant model']").input_value() == "claude-sonnet-5")
+        await ctx.close()
+
+        for width in (390, 320, 1280):
+            api = provider_api()
+            mobile = width < 640
+            ctx, p, cdp = await fresh(api, await browser.new_context(
+                viewport={"width": width, "height": 800}, is_mobile=mobile, has_touch=mobile))
+            sel = p.locator("select[aria-label='Assistant model']")
+            # /api/models is fetched after first paint: wait for the options.
+            await p.wait_for_selector("header select optgroup", state="attached")
+            labels = await p.evaluate("Array.from(document.querySelectorAll('header select optgroup')).map(g => g.label)")
+            check(f"{width}px: picker grouped 'Claude \u2014 Anthropic' / 'GPT \u2014 OpenAI'",
+                  labels == ["Claude \u2014 Anthropic", "GPT \u2014 OpenAI"], str(labels))
+            check(f"{width}px: Claude is still the default", await sel.input_value() == "claude-sonnet-5")
+            await sel.select_option("gpt-6-luna")
+            box = await sel.bounding_box()
+            boxes = await p.evaluate("""() => Array.from(document.querySelectorAll('header button, header select, header [data-testid=selected-provider]'))
+                .filter(e => e.offsetParent !== null).map(e => { const r = e.getBoundingClientRect();
+                  return [r.left, r.right] })""")
+            boxes.sort()
+            overlap = any(a[1] > b[0] + 0.5 for a, b in zip(boxes, boxes[1:]))
+            scroll_w = await p.evaluate("document.documentElement.scrollWidth")
+            check(f"{width}px: GPT selected, header fits (no overlap, no sideways scroll)",
+                  box and box["x"] + box["width"] <= width and not overlap and scroll_w <= width,
+                  f"{boxes} scrollWidth={scroll_w}")
+            title = await sel.get_attribute("title")
+            check(f"{width}px: selection names model and provider", title == "GPT-6 Luna \u2014 OpenAI", title)
+            tag = p.locator("[data-testid=selected-provider]")
+            if width >= 768:
+                check(f"{width}px: provider shown next to the picker",
+                      await tag.is_visible() and (await tag.inner_text()) == "OpenAI")
+            await ask(p)
+            await until(p, lambda u: u["thinking"])
+            check(f"{width}px: the OpenAI model is sent with the question",
+                  api.posts and api.posts[-1].get("model") == "gpt-6-luna")
+            # Switching the picker while the job runs must not touch that job.
+            await sel.select_option("claude-opus-5")
+            await asyncio.sleep(3)
+            api.complete("job-1")
+            u = await until(p, lambda u: u["answers"] == 1 and not u["thinking"])
+            cap = await p.locator("[data-testid=answer-model]").all_inner_texts()
+            check(f"{width}px: answer labelled with the model that wrote it",
+                  u["answers"] == 1 and cap == ["GPT-6 Luna \u00b7 OpenAI"], str(cap))
+            check(f"{width}px: switching mid-job sent nothing new for that job",
+                  len(api.posts) == 1 and api.jobs["job-1"]["model"] == "gpt-6-luna")
+            await ctx.close()
+
+        # Lost 202 while the picker is changed: the resend keeps the ORIGINAL model
+        api = provider_api()
+        ctx, p, cdp = await fresh(api)
+        sel = p.locator("select[aria-label='Assistant model']")
+        await sel.select_option("gpt-6-luna")
+
+        async def lost_and_switch():
+            await sleep_phone(cdp, p)
+            await asyncio.sleep(1.5)
+            api.complete("job-1")
+            asyncio.get_running_loop().call_later(0.5, lambda: asyncio.ensure_future(wake_phone(cdp, p)))
+        api.lose_ack = lost_and_switch
+        await ask(p)
+        await asyncio.sleep(0.2)
+        try:
+            await sel.select_option("claude-haiku-4-5-20251001", timeout=1000)
+        except Exception:                     # frozen page: the switch may land after wake
+            pass
+        u = await until(p, lambda u: u["answers"] == 1 and not u["thinking"], 12)
+        sent = [(x.get("idempotency_key"), x.get("model")) for x in api.posts]
+        check("lost 202 + picker switched: resend uses the same key AND the original model",
+              len(sent) == 2 and sent[0] == sent[1] and sent[0][1] == "gpt-6-luna"
+              and u["answers"] == 1 and len(api.jobs) == 1, str(sent))
+        await ctx.close()
+
+        # Reopening an OpenAI conversation after OpenAI was disabled
+        api = provider_api(with_openai=False)
+        api.convs[60] = {"id": 60, "title": "GPT chat", "model": "gpt-6-luna",
+                         "messages": [{"role": "user", "content": Q},
+                                      {"role": "assistant", "content": "FINAL ANSWER",
+                                       "model": "gpt-6-luna", "provider": "openai"}]}
+        ctx, p, cdp = await fresh(api, await browser.new_context(viewport={"width": 1280, "height": 900}))
+        await p.get_by_text("GPT chat").first.click()
+        await until(p, lambda u: u["answers"] == 1, 5)
+        val = await p.locator("select[aria-label='Assistant model']").input_value()
+        cap = await p.locator("[data-testid=answer-model]").all_inner_texts()
+        check("old GPT conversation, OpenAI now off: history intact, picker falls back to a sendable model",
+              val == "claude-sonnet-5" and cap == ["GPT-6 Luna \u00b7 OpenAI"], f"{val} {cap}")
+        await ctx.close()
         await browser.close()
 
 
