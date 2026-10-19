@@ -57,6 +57,10 @@ def openai_models() -> list[str]:
     return providers.openai_available_models()
 
 
+def warm_models() -> None:
+    providers.warm_availability()
+
+
 def available_models() -> list[str]:
     return list(AVAILABLE_MODELS) + openai_models()
 

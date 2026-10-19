@@ -367,6 +367,16 @@ def conversation_active_job(cid: int, user=Depends(current_user)):
 
 
 @app.on_event("startup")
+def _warm_openai_availability():
+    """Check OpenAI model availability in the background, so no page load
+    ever waits on OpenAI (a no-op while OpenAI is not configured)."""
+    try:
+        chat_svc.warm_models()
+    except Exception:                                  # noqa: BLE001
+        log.exception("openai availability warm-up failed")
+
+
+@app.on_event("startup")
 def _sweep_interrupted_jobs():
     """Generation runs in-process, so a restart orphans in-flight jobs.
 

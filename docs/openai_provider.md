@@ -23,6 +23,7 @@ OpenAI never gets a database tool or connection of its own, and no hosted tools
 |---|---|---|
 | API | Messages | Responses (`openai==3.35.1`), `store=false`, encrypted reasoning passed back each turn |
 | Tool loop call | unchanged: `max_tokens` 4096, model-default thinking | `reasoning.effort` low (or `OPENAI_REASONING_EFFORT` if the model supports it), `max_output_tokens` 12000 |
+| Request bound | MAX_LOOPS 6 + at most 2 final calls, 240 s request deadline | same: at most 8 Responses calls per question, same deadline |
 | Final synthesis | no tools, thinking disabled, 4096 | `tool_choice: "none"`, the lowest effort the model accepts (`none` or `low`), 4096 |
 | Timeout / retries | 90 s / 1 | 90 s / 1 (`CHAT_OPENAI_TIMEOUT_SECONDS`, `CHAT_OPENAI_MAX_RETRIES`) |
 
@@ -50,6 +51,12 @@ Profiles, verified 2026-10-19 against developers.openai.com and openai-python 3.
 | gpt-6-luna | GPT-6 Luna | none, low..max | none |
 
 Any other id in the allowlist is ignored and logged.
+
+**Availability checks never block a request.**
+- The API starts the first check in the background at startup.
+- After that, `/api/models` and submissions read the cache. An expired entry is refreshed by one background thread while the last known answer is served.
+- Only a cold cache (nothing known yet) waits, and for at most 2 s.
+- During an OpenAI outage, GPT simply drops out of the picker after the refresh fails. Claude users never wait on OpenAI. Measured with OpenAI hanging: the first cold call took 2.0 s, and the next 8 concurrent calls answered immediately.
 
 ## Configuration
 
@@ -96,7 +103,10 @@ Nothing else is needed. A restricted project key is recommended.
   - `provider_disabled`
 
   Logs record the class, HTTP status and request id only. Provider error bodies can echo a masked key, so they are never logged.
-- **Each request writes one `chat_timing` log line.** It includes `provider=`, `model=`, `input_tokens`, `output_tokens`, `reasoning_tokens` and per-call latency. It contains no SQL, rows, question text or keys.
+- **Each request writes one `chat_timing` log line.** It includes `provider=`, `model=`, `input_tokens`, `cached_tokens`, `output_tokens`, `reasoning_tokens`, `calls` and per-call latency. It contains no SQL, rows, question text or keys.
+  - For OpenAI, `cached_tokens` is the part of `input_tokens` served from the prompt cache, which is billed at a lower rate.
+  - For Claude, `cached_tokens` counts cache reads, which Anthropic reports separately from `input_tokens`.
+  - OpenAI requests use a fixed `prompt_cache_key` (`laynes-chat-v1`), so requests sharing the ~26k-token system prompt hit the cache together. The key carries no user data.
 
 ## Rollback
 

@@ -83,11 +83,20 @@ class ProviderError(Exception):
         self.user_message = user_message
 
 
-def _add_usage(usage: dict, input_tokens=0, output_tokens=0, reasoning_tokens=0):
-    usage["input_tokens"] = usage.get("input_tokens", 0) + int(input_tokens or 0)
-    usage["output_tokens"] = usage.get("output_tokens", 0) + int(output_tokens or 0)
-    if reasoning_tokens:
-        usage["reasoning_tokens"] = usage.get("reasoning_tokens", 0) + int(reasoning_tokens)
+def _int(v) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _add_usage(usage: dict, input_tokens=0, output_tokens=0, reasoning_tokens=0,
+               cached_tokens=0):
+    """Per-request token totals for the timing log. cached_tokens is the part
+    of input_tokens served from the provider's prompt cache (billed lower), so
+    cost can be estimated from the log without overstating it."""
+    usage["input_tokens"] = usage.get("input_tokens", 0) + _int(input_tokens)
+    usage["output_tokens"] = usage.get("output_tokens", 0) + _int(output_tokens)
+    if _int(reasoning_tokens):
+        usage["reasoning_tokens"] = usage.get("reasoning_tokens", 0) + _int(reasoning_tokens)
+    usage["cached_tokens"] = usage.get("cached_tokens", 0) + _int(cached_tokens)
     usage["calls"] = usage.get("calls", 0) + 1
 
 
@@ -118,8 +127,10 @@ class ClaudeProvider:
     def _record(self, resp):
         u = getattr(resp, "usage", None)
         if u is not None:
+            # Anthropic reports cache reads separately from input_tokens.
             _add_usage(self.usage, getattr(u, "input_tokens", 0),
-                       getattr(u, "output_tokens", 0))
+                       getattr(u, "output_tokens", 0),
+                       cached_tokens=getattr(u, "cache_read_input_tokens", 0))
 
     @staticmethod
     def _text(resp) -> str:
@@ -196,6 +207,7 @@ OPENAI_MODEL_PROFILES: dict[str, OpenAIModelProfile] = {
 # of it before any visible text. An exhausted budget is still caught and sent
 # to forced synthesis, so this bounds cost rather than hiding failures.
 OPENAI_LOOP_MAX_OUTPUT_TOKENS = 12000
+OPENAI_PROMPT_CACHE_KEY = "laynes-chat-v1"
 OPENAI_FINAL_MAX_OUTPUT_TOKENS = 4096
 
 
@@ -245,12 +257,22 @@ def is_openai_model(model: str | None) -> bool:
 
 
 # Availability of each allowlisted model to THIS key, checked with
-# models.retrieve (metadata only, not billed) and cached so /api/models and
-# submissions do not hit OpenAI each time.
+# models.retrieve (metadata only, not billed).
+#
+# The check NEVER runs on a request path once anything is known: /api/models
+# (every page load, Claude users included) and submissions read the cache, and
+# an expired entry is refreshed by ONE background thread while the last known
+# answer is served. Measured before this design: with OpenAI hanging, every
+# page load blocked 5 s once a minute and N concurrent loads made N lookups.
+# Only a cold cache (nothing known yet; warm_availability() runs at API
+# startup) waits, at most AVAIL_COLD_WAIT_SECONDS, for that same refresh.
 _AVAIL_OK_TTL = 600.0
 _AVAIL_FAIL_TTL = 60.0
+AVAIL_CHECK_TIMEOUT_SECONDS = 5.0
+AVAIL_COLD_WAIT_SECONDS = 2.0
 _avail_lock = threading.Lock()
 _avail_cache: dict[str, tuple[bool, float]] = {}
+_avail_refresh: dict = {"thread": None, "done": threading.Event()}
 
 
 def _openai_client(timeout=None, max_retries=None):
@@ -259,35 +281,78 @@ def _openai_client(timeout=None, max_retries=None):
         max_retries=OPENAI_MAX_RETRIES if max_retries is None else max_retries)
 
 
-def openai_available_models(cfg: OpenAIConfig | None = None) -> list[str]:
-    cfg = cfg or openai_config()
-    if not cfg.usable:
-        return []
-    now = time.monotonic()
-    out, client = [], None
-    for m in cfg.allowed:
-        with _avail_lock:
-            hit = _avail_cache.get(m)
-        if hit and hit[1] > now:
-            ok = hit[0]
-        else:
+def _refresh_availability(models: tuple, done: threading.Event) -> None:
+    try:
+        client = _openai_client(timeout=AVAIL_CHECK_TIMEOUT_SECONDS, max_retries=0)
+        for m in models:
             try:
-                client = client or _openai_client(timeout=5.0, max_retries=0)
                 client.models.retrieve(m)
                 ok = True
             except Exception as exc:                  # noqa: BLE001
                 ok = False
                 log.warning("openai_model_unavailable model=%s reason=%s", m, safe_error(exc))
             with _avail_lock:
-                _avail_cache[m] = (ok, now + (_AVAIL_OK_TTL if ok else _AVAIL_FAIL_TTL))
-        if ok:
-            out.append(m)
-    return out
+                _avail_cache[m] = (ok, time.monotonic()
+                                   + (_AVAIL_OK_TTL if ok else _AVAIL_FAIL_TTL))
+    except Exception as exc:                          # noqa: BLE001
+        log.warning("openai_availability_refresh_failed reason=%s", safe_error(exc))
+        with _avail_lock:
+            for m in models:
+                _avail_cache[m] = (False, time.monotonic() + _AVAIL_FAIL_TTL)
+    finally:
+        done.set()
+
+
+def _start_refresh(models: tuple) -> threading.Event:
+    """Single-flight: at most one refresh thread at a time."""
+    with _avail_lock:
+        t = _avail_refresh["thread"]
+        if t is not None and t.is_alive():
+            return _avail_refresh["done"]
+        done = threading.Event()
+        t = threading.Thread(target=_refresh_availability, args=(models, done),
+                             name="openai-availability", daemon=True)
+        _avail_refresh.update(thread=t, done=done)
+        t.start()
+        return done
+
+
+def openai_available_models(cfg: OpenAIConfig | None = None) -> list[str]:
+    cfg = cfg or openai_config()
+    if not cfg.usable:
+        return []
+    now = time.monotonic()
+    with _avail_lock:
+        known = {m: _avail_cache.get(m) for m in cfg.allowed}
+    missing = [m for m, v in known.items() if v is None]
+    if missing or any(v[1] <= now for v in known.values() if v):
+        done = _start_refresh(cfg.allowed)
+        if missing:                                   # cold: bounded wait, once
+            done.wait(AVAIL_COLD_WAIT_SECONDS)
+            with _avail_lock:
+                for m in missing:
+                    # Still unknown: record "unavailable, already stale" so
+                    # later callers serve it at once instead of waiting again;
+                    # the in-flight refresh overwrites it when it finishes.
+                    _avail_cache.setdefault(m, (False, time.monotonic()))
+                known = {m: _avail_cache.get(m) for m in cfg.allowed}
+    # Unknown (cold wait expired) counts as unavailable for now.
+    return [m for m, v in known.items() if v and v[0]]
+
+
+def warm_availability() -> None:
+    """Start the first check in the background (called at API startup)."""
+    cfg = openai_config()
+    if cfg.usable:
+        _start_refresh(cfg.allowed)
 
 
 def reset_availability_cache() -> None:
     with _avail_lock:
         _avail_cache.clear()
+    t = _avail_refresh["thread"]
+    if t is not None:
+        t.join(AVAIL_CHECK_TIMEOUT_SECONDS * 4 + 1)
 
 
 def _openai_tools(tools: list[dict]) -> list[dict]:
@@ -353,7 +418,11 @@ class OpenAIProvider:
 
     def _call(self, system, items, *, final: bool):
         kw = dict(model=self.model, instructions=self._instructions(system), input=items,
-                  tools=self.tools, store=False, include=["reasoning.encrypted_content"])
+                  tools=self.tools, store=False, include=["reasoning.encrypted_content"],
+                  # Same static key for every chat request: the ~26k-token
+                  # system prompt + tools prefix is shared, so routing them
+                  # together raises prompt-cache hits. Carries no user data.
+                  prompt_cache_key=OPENAI_PROMPT_CACHE_KEY)
         if final:
             # No tool may be called: the model can only write the answer, with
             # the lowest reasoning effort this model accepts.
@@ -369,8 +438,10 @@ class OpenAIProvider:
         u = getattr(resp, "usage", None)
         if u is not None:
             det = getattr(u, "output_tokens_details", None)
+            idet = getattr(u, "input_tokens_details", None)
             _add_usage(self.usage, getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
-                       getattr(det, "reasoning_tokens", 0) if det is not None else 0)
+                       getattr(det, "reasoning_tokens", 0) if det is not None else 0,
+                       getattr(idet, "cached_tokens", 0) if idet is not None else 0)
         return resp
 
     @staticmethod

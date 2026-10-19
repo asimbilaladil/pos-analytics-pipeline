@@ -98,12 +98,12 @@ def _id(p):
     return f"{p}_{_n['i']}"
 
 
-def R(output, status="completed", incomplete=None, reasoning_tokens=7):
+def R(output, status="completed", incomplete=None, reasoning_tokens=7, cached_tokens=0):
     return {"id": _id("resp"), "object": "response", "created_at": 1, "status": status,
             "output": output, "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
             "incomplete_details": {"reason": incomplete} if incomplete else None, "error": None,
             "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
-                      "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                      "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
                       "output_tokens_details": {"reasoning_tokens": reasoning_tokens}}}
 
 
@@ -188,7 +188,87 @@ check("/api/models: Claude first and default; OpenAI grouped with provider + lab
 check("/api/models carries no key or secret material",
       FAKE_KEY not in json.dumps(opts) and "api_key" not in json.dumps(opts))
 
+print("2b. OpenAI outage never blocks /api/models (Claude users included)")
+import threading  # noqa: E402
+import time as _time  # noqa: E402
+
+
+class SlowOpenAI(MockOpenAI):
+    """models.retrieve hangs (an outage), then fails like a timeout would."""
+    def __init__(self, delay):
+        super().__init__()
+        self.delay, self.lookups = delay, 0
+
+    def handler(self, req):
+        if "/models/" in req.url.path:
+            self.lookups += 1
+            _time.sleep(self.delay)
+            return httpx2.Response(503, json={"error": {"message": "overloaded", "type": "x"}})
+        return super().handler(req)
+
+
+enable("gpt-6-luna")
+slow = SlowOpenAI(3.0)
+P._openai_client = slow.client
+try:
+    # Known-good but expired: served at once, refreshed in the background.
+    with P._avail_lock:
+        P._avail_cache["gpt-6-luna"] = (True, _time.monotonic() - 1)
+    durs, outs = [], []
+
+    def hit():
+        t0 = _time.perf_counter()
+        outs.append(chat_svc.model_options())
+        durs.append(_time.perf_counter() - t0)
+    ths = [threading.Thread(target=hit) for _ in range(8)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    check("stale cache + hanging OpenAI: 8 concurrent /api/models answer immediately",
+          max(durs) < 0.5, f"max {max(durs):.2f}s")
+    check("... with the last known answer (GPT still listed) and Claude intact",
+          all("gpt-6-luna" in o["models"] and o["default"] == chat_svc.DEFAULT_MODEL
+              and "claude-sonnet-5" in o["models"] for o in outs))
+    P._avail_refresh["thread"].join(10)
+    check("... and ONE background refresh (single-flight), not one per caller",
+          slow.lookups == 1, str(slow.lookups))
+    check("a failed refresh marks the model unavailable (no GPT offered during the outage)",
+          chat_svc.openai_models() == [] and "gpt-6-luna" not in chat_svc.model_options()["models"])
+    # Cold cache (nothing known) + hanging OpenAI: bounded wait, then Claude-only.
+    P.reset_availability_cache()
+    t0 = _time.perf_counter()
+    cold = chat_svc.model_options()
+    cold_s = _time.perf_counter() - t0
+    check("cold cache + hanging OpenAI: bounded by the cold wait, Claude still offered",
+          cold_s < P.AVAIL_COLD_WAIT_SECONDS + 0.5 and "gpt-6-luna" not in cold["models"]
+          and cold["default"] == chat_svc.DEFAULT_MODEL, f"{cold_s:.2f}s")
+    t0 = _time.perf_counter()
+    again = chat_svc.model_options()
+    check("... and callers after the cold wait do not wait again for the same refresh",
+          _time.perf_counter() - t0 < 0.5 and "gpt-6-luna" not in again["models"])
+    check("submitting a Claude model never consults OpenAI availability",
+          chat_svc.resolve_model("claude-opus-5", strict=True) == "claude-opus-5")
+finally:
+    P.reset_availability_cache()
+    P._openai_client = _orig_client
+fast = MockOpenAI()
+P._openai_client = fast.client
+try:
+    P.warm_availability()
+    P._avail_refresh["thread"].join(10)
+    check("startup warm-up fills the cache in the background (no request waits)",
+          chat_svc.openai_models() == ["gpt-6-luna"] and len(fast.paths) == 1)
+finally:
+    P._openai_client = _orig_client
+api_src = open("backend/api.py").read()
+check("API startup warms OpenAI availability", "chat_svc.warm_models()" in api_src)
+
 print("3. Model selection is validated server-side")
+enable("gpt-6-luna,gpt-6-astra")
+P._openai_client = MockOpenAI(available=("gpt-6-luna",)).client
+try:
+    chat_svc.openai_models()                       # luna available, astra not
+finally:
+    P._openai_client = _orig_client
 check("Claude ids unchanged", chat_svc.resolve_model("claude-opus-5", strict=True) == "claude-opus-5")
 check("unknown / retired Claude id -> default (unchanged behaviour)",
       chat_svc.resolve_model("claude-sonnet-4", strict=True) == chat_svc.DEFAULT_MODEL)
@@ -281,6 +361,8 @@ check("instructions = the same system prompt Claude gets",
 check("only the two application function tools; no hosted tools",
       [(t["type"], t["name"]) for t in b["tools"]] == [("function", "check_data"), ("function", "run_sql")]
       and b["tools"][1]["parameters"] == C.RUN_SQL_TOOL["input_schema"])
+check("prompt cache key is static and carries no user data",
+      b["prompt_cache_key"] == P.OPENAI_PROMPT_CACHE_KEY == "laynes-chat-v1")
 check("loop call: low reasoning effort and the provider's own output budget",
       b["reasoning"] == {"effort": "low"} and b["max_output_tokens"] == P.OPENAI_LOOP_MAX_OUTPUT_TOKENS
       and "temperature" not in b)
@@ -615,8 +697,11 @@ class H(logging.Handler):
 
 C.log.addHandler(H())
 C.log.setLevel(logging.INFO)
-r, m = run("Which period is P10?", [R([sql_call("a", PERIOD_SQL)]), R([msg("x")])])
+r, m = run("Which period is P10?", [R([sql_call("a", PERIOD_SQL)]),
+                                    R([msg("x")], cached_tokens=60)])
 line = [x for x in records if x.startswith("chat_timing")][-1]
+check("cached input tokens are accounted (cost is not overstated)",
+      r.usage["cached_tokens"] == 60 and "cached_tokens=60" in line, str(r.usage))
 check("timing line names provider, model and token usage",
       "provider=openai" in line and "model=gpt-6-luna" in line and "input_tokens=200" in line
       and "reasoning_tokens=14" in line and "openai.responses.create[0]" in line, line[:200])
