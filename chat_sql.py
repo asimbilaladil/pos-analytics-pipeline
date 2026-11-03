@@ -34,6 +34,7 @@ from pglast import ast, parse_sql
 from pglast.parser import ParseError
 
 import chat_providers
+import store_scope
 
 MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5")
 log = logging.getLogger("laynes.chat")
@@ -2146,6 +2147,13 @@ def _ro_conn():
 def run_sql(sql: str) -> dict:
     """Execute a validated read-only query. Returns {columns, rows, row_count}."""
     safe = _validate(sql)
+    # MCP credentials restricted to some stores: confine every relation the
+    # statement reads to those stores, in the data layer. No-op for everyone
+    # else (store_scope.current() is None outside an MCP request).
+    try:
+        safe = store_scope.apply_to_sql(safe)
+    except store_scope.StoreScopeError as exc:
+        raise SqlError(str(exc)) from exc
     capped = f"SELECT * FROM (\n{safe}\n) AS _capped LIMIT {MAX_ROWS}"
     conn = _ro_conn()
     try:
@@ -2408,7 +2416,10 @@ _refund_obs_cache: dict = {"value": None, "checked_at": 0.0}
 
 def _refund_observations_all_time() -> int | None:
     now = time.time()
-    if (_refund_obs_cache["value"] is not None
+    # A store-restricted credential gets its own figure and must never read or
+    # write the shared network-wide cache.
+    shared = store_scope.current() is None
+    if (shared and _refund_obs_cache["value"] is not None
             and now - _refund_obs_cache["checked_at"] < _REFUND_OBS_TTL_SECONDS):
         return _refund_obs_cache["value"]
     conn = _ro_conn()
@@ -2416,15 +2427,22 @@ def _refund_observations_all_time() -> int | None:
         conn.set_session(readonly=True, autocommit=False)
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
-            cur.execute("SELECT COALESCE(SUM(refunded_count), 0) "
-                        "FROM v_payments_daily_v2")
+            _pol = store_scope.current()
+            if _pol is None:
+                cur.execute("SELECT COALESCE(SUM(refunded_count), 0) "
+                            "FROM v_payments_daily_v2")
+            else:               # restricted credential: its own stores only
+                cur.execute("SELECT COALESCE(SUM(refunded_count), 0) "
+                            "FROM v_payments_daily_v2 WHERE establishment_id = ANY(%s)",
+                            (sorted(_pol.allowed),))
             value = int(cur.fetchone()[0])
     except psycopg2.Error:
         return None            # unknown beats a wrong reassurance
     finally:
         conn.rollback()
         conn.close()
-    _refund_obs_cache.update({"value": value, "checked_at": now})
+    if shared:
+        _refund_obs_cache.update({"value": value, "checked_at": now})
     return value
 
 
@@ -3149,6 +3167,7 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
     Whole Thursday-aligned weeks read the OFFICIAL weekly rows; any other range
     sums daily rows. Ratios are recomputed from summed parts.
     """
+    store_scope.check_declared_scope(establishment_id)   # no-op without a policy
     start_d, end_d = date.fromisoformat(period_start), date.fromisoformat(period_end)
     whole_weeks = start_d.isoweekday() == 4 and (end_d - start_d).days % 7 == 0
     if whole_weeks:
@@ -4503,6 +4522,7 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
     domain set still computes fresh. It is created per request and discarded
     with it -- there is no cross-request or cross-user reuse.
     """
+    store_scope.check_declared_scope(establishment_id)   # no-op without a policy
     doms = normalise_domains(domains)
     key = (establishment_id, period_start, period_end, tuple(sorted(doms)))
     if cache is not None and key in cache:
@@ -4683,6 +4703,10 @@ def enforce_scope(sql: str, establishment_id, period_start, period_end,
     business = relations - _REFERENCE_RELATIONS
     if not business:
         return None                      # reference-only lookup, no gate
+    try:
+        store_scope.check_declared_scope(establishment_id)
+    except store_scope.StoreScopeError as exc:
+        raise ScopeError(str(exc)) from exc
 
     if not period_start or not period_end:
         raise ScopeError(
@@ -4828,6 +4852,11 @@ def fin_review_window(question: str) -> dict:
     is COMPLETE and reconciled for every category. The window is the latest
     FIN_REVIEW_MAX_PERIODS eligible periods, ending at a period the user names
     when that period is eligible."""
+    if store_scope.current() is not None:
+        # A network-wide comparison: never available to a store-restricted
+        # credential, whatever path reached here (fails closed).
+        raise store_scope.StoreScopeError(
+            "the financial waste review needs access to every store")
     conn = _ro_conn()
     try:
         conn.set_session(readonly=True, autocommit=True)

@@ -1,0 +1,9 @@
+# Direct dependencies of the MCP service. Install ONLY into its own venv
+# (/opt/laynes-mcp/venv) -- never into the API's / pricing checkout's venv.
+# requirements-mcp.lock is the full pinned set that was tested (Python 3.12).
+mcp==1.30.0
+psycopg2-binary==2.9.12
+pglast==8.4
+python-dotenv==1.2.2
+anthropic==1.3.0
+openai==3.35.1
