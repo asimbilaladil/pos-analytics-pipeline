@@ -26,9 +26,14 @@ set -euo pipefail
 # The old aggregate_features.py call is intentionally absent -- it would be
 # a second writer to a now-frozen legacy table, serving no one post-cutover.
 
-APP_DIR="/root/pos-analytics-pipeline"
-LOG_DIR="/var/log/laynes"
-VENV="$APP_DIR/venv"
+# APP_DIR is the checkout this script lives in, so the release checkout runs
+# its own (merged) code. It used to be hardcoded to the development checkout,
+# which meant pointing the unit at the release copy still executed dev code.
+# VENV defaults to $APP_DIR/venv as before; the release checkout has no venv of
+# its own and sets LAYNES_VENV to the shared one (systemd drop-in).
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${LAYNES_LOG_DIR:-/var/log/laynes}"
+VENV="${LAYNES_VENV:-$APP_DIR/venv}"
 DATE=$(date +%Y-%m-%d)
 LOG_FILE="$LOG_DIR/run_$DATE.log"
 
@@ -57,6 +62,20 @@ if "$VENV/bin/python3" "$APP_DIR/pipeline.py" >> "$LOG_FILE" 2>&1; then
 else
     log "ERROR: Revel sync failed — check $LOG_FILE"
     exit 1
+fi
+
+# Step 1b (optional): an extra post-sync refresh, e.g. the materialized price
+# history, which is derived from order_items_v2 and so must run only after a
+# successful sync (the `exit 1` above guarantees that). Configured by
+# environment so this file does not depend on work that is not merged yet.
+# Non-fatal, like steps 3 and 4.
+if [ -n "${PRICE_HISTORY_REFRESH:-}" ]; then
+    log "Step 1b/4: refreshing materialized price history..."
+    if "$VENV/bin/python3" "$PRICE_HISTORY_REFRESH" >> "$LOG_FILE" 2>&1; then
+        log "price history refresh completed successfully"
+    else
+        log "ERROR: price history refresh failed — chat will serve the PREVIOUS price-history snapshot until this succeeds (check $LOG_FILE)"
+    fi
 fi
 
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)

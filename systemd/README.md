@@ -74,3 +74,11 @@ watermark had already advanced, so the next sync never revisited them).
 
       venv/bin/python repair_missing_items.py --establishments 15,54 \
           --start 2026-10-18 --end 2026-10-23 --checkpoint /path/ck.json
+
+# revel-daily-sync from the release checkout
+
+`systemd/revel-daily-sync-release.conf` is installed as
+`/etc/systemd/system/revel-daily-sync.service.d/10-release.conf`. `run.sh`
+now resolves `APP_DIR` from its own location, so the release checkout runs
+its own merged code; the drop-in supplies the shared venv and the optional
+step 1b script. Delete the drop-in and daemon-reload to roll back.
