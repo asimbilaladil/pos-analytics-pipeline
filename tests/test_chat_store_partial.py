@@ -298,6 +298,31 @@ check("tool result: network orders_per_labor_hour scrubbed to null",
       payload["labor"]["orders_per_labor_hour"] is None)
 check("step log records the short circuit", any(s.get("short_circuit") for s in r.steps))
 
+# Regression (2026-11-03 production): the REAL revel_store_breakdown caches
+# itself in scope_cache under a 3-part key, and the blocked path iterated that
+# cache unpacking 4-part scope keys -> ValueError -> "Something went wrong".
+# The loop test above mocked the breakdown, so nothing was ever cached.
+ROWS[:] = [row(40, "LCF Rosenberg", 70000.00, 70000.00, real=3441, hours=945.93),
+           row(6, "LCF Katy", 29500.00, 29900.00, real=1397, hours=422.91)]
+_orig_conn2 = C._ro_conn
+fake = FakeClient([resp("tool_use", check_call(1, 6)), resp("end_turn", text("katy failed; rosenberg 3.64"))])
+orig = C.anthropic.Anthropic
+C.anthropic.Anthropic = lambda **kw: fake
+C.meta_extract = lambda e, s, en: fail_meta(e)
+C._ro_conn = lambda: FakeConn()
+try:
+    r2 = C.answer_question([], "Transactions per labor hour for Katy and Rosenberg, Oct 15-21 2026")
+    err2 = None
+except Exception as e:  # noqa: BLE001
+    r2, err2 = None, f"{type(e).__name__}: {e}"
+finally:
+    C.anthropic.Anthropic = orig
+    C.meta_extract, C._ro_conn = _orig_me, _orig_conn2
+check("blocked path with a REAL cached breakdown does not crash", err2 is None, str(err2))
+instr2 = json.dumps(fake.calls[-1]["messages"][-1]["content"]) if r2 else ""
+check("...and the final call carries the real per-store verdicts",
+      r2 is not None and "LCF Rosenberg" in instr2 and "payment_timing" in instr2)
+
 # system prompt
 sysprompt = C._system_static()
 check("system prompt: reconciliation is per scope, not per source",
