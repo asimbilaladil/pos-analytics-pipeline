@@ -5893,7 +5893,13 @@ def answer_question(history: list[dict], question: str, model: str | None = None
             # A trusted R365 scope checked earlier in this turn stays answerable
             # even though another source just failed: hand its figures over,
             # computed in SQL, because the call below has no tools.
-            for (c_est, c_start, c_end, c_doms), c_meta in list(scope_cache.items()):
+            for c_key, c_meta in list(scope_cache.items()):
+                # scope_cache also holds non-scope entries (the per-store
+                # Revel breakdown is keyed ("store_breakdown", start, end));
+                # only 4-part (est, start, end, domains) keys are scopes.
+                if not (isinstance(c_key, tuple) and len(c_key) == 4):
+                    continue
+                c_est, c_start, c_end, c_doms = c_key
                 if (DOMAIN_R365 in c_doms and "r365_trusted_figures" not in blocked
                         and (c_meta.get("r365") or {}).get("available")
                         and not any(_is_r365_ops_reason(x)
