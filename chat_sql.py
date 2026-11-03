@@ -4852,6 +4852,11 @@ def fin_review_window(question: str) -> dict:
     is COMPLETE and reconciled for every category. The window is the latest
     FIN_REVIEW_MAX_PERIODS eligible periods, ending at a period the user names
     when that period is eligible."""
+    if store_scope.current() is not None:
+        # A network-wide comparison: never available to a store-restricted
+        # credential, whatever path reached here (fails closed).
+        raise store_scope.StoreScopeError(
+            "the financial waste review needs access to every store")
     conn = _ro_conn()
     try:
         conn.set_session(readonly=True, autocommit=True)

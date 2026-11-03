@@ -201,3 +201,12 @@ def test_no_http_route_manages_keys(client, make_key):
     for path in ("/admin", "/keys", "/mcp/keys", "/api/keys", "/mcp/admin"):
         for m in ("GET", "POST"):
             assert client.request(m, path, headers=auth(tok), json={}).status_code == 404
+
+
+def test_tools_list_shows_only_permitted_tools(client, make_key):
+    tok, _ = make_key(tools=["get_labor_metrics", "get_drive_thru_speed"])
+    names = {t["name"] for t in client.post("/mcp", headers=auth(tok),
+                                            json=rpc("tools/list")).json()["result"]["tools"]}
+    assert names == {"get_labor_metrics", "get_drive_thru_speed"}
+    full, _ = make_key()
+    assert len(client.post("/mcp", headers=auth(full), json=rpc("tools/list")).json()["result"]["tools"]) == 5

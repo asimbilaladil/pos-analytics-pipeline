@@ -22,6 +22,7 @@ the proxy). No WebSocket. Origin header is validated (browser origins must be in
   file under `MCP_DATA_DIR` (not the Laynes PostgreSQL database).
 * Each key: id, label, created, optional expiry, revoked status, **tool list**,
   **store list** (explicit ids, or `*`), per-minute rate, daily question cap.
+* `tools/list` shows only the tools the key may call.
 * Default deny: a key with no tool grant can do nothing; store ids outside the
   grant are refused (never silently dropped, never rolled into a network total).
 * Missing / malformed / wrong / unknown / revoked / expired tokens all return the
@@ -152,20 +153,65 @@ parallel) — prefer ≤ 31 days or fewer stores for routine use.
 Files: `deploy/mcp/laynes-mcp.service`, `deploy/mcp/nginx-mcp.location.conf`,
 `deploy/mcp/mcp.env.example`, `requirements-mcp.txt` / `requirements-mcp.lock`.
 
-**Dependency strategy:** the production API currently imports from the pricing
-checkout's venv. The MCP service must *not* join it: create `/opt/laynes-mcp/venv`
-(`python3.12 -m venv`; `pip install -r requirements-mcp.lock`) and check out a merged
-commit to `/opt/laynes-mcp/app` (`git worktree`/archive, not the pricing checkout).
+**Dependency strategy:** the production API imports from the pricing checkout's venv.
+The MCP service does not join it: it uses its own `/opt/laynes-mcp/venv` built from
+`requirements-mcp.lock` and an exported copy of the merged commit in `/opt/laynes-mcp/app`.
+Nothing is installed into any existing venv.
 
-1. After approval and merge: create user `laynes-mcp`; dirs `/opt/laynes-mcp`, `/etc/laynes-mcp`.
-2. Export the merged commit to `/opt/laynes-mcp/app`; build the venv from the lock file.
-3. Create `/etc/laynes-mcp/mcp.env` (0640 root:laynes-mcp) from the example: **RO DB role and provider key only**.
-4. Install the unit, `systemctl daemon-reload && systemctl enable --now laynes-mcp`.
-5. `curl 127.0.0.1:8710/healthz` → `{"status":"ok"}`; unauthenticated `/mcp` → 401.
-6. Create the key with the CLI (§3), then add the nginx location, `nginx -t`, `systemctl reload nginx`. `laynes-api` is never restarted.
-7. Smoke test with curl (§5), then the Grok call.
+### Exact deployment commands (run only after approval, merge and a release SHA)
+```bash
+SHA=<merged commit sha>
+# 1. user + directories
+useradd --system --home /opt/laynes-mcp --shell /usr/sbin/nologin laynes-mcp
+install -d -o root -g laynes-mcp -m 0750 /etc/laynes-mcp
+install -d -o laynes-mcp -g laynes-mcp -m 0755 /opt/laynes-mcp
+# 2. code (export of the merged commit; NOT the pricing checkout)
+git -C /root/pos-analytics-pipeline-release fetch origin   # read-only for the checkout's files
+mkdir -p /opt/laynes-mcp/app && git -C /root/pos-analytics-pipeline-release archive $SHA | tar -x -C /opt/laynes-mcp/app
+chown -R root:root /opt/laynes-mcp/app
+# 3. dedicated venv from the pinned lock file
+python3.12 -m venv /opt/laynes-mcp/venv    # or: uv venv --python 3.12 /opt/laynes-mcp/venv
+/opt/laynes-mcp/venv/bin/pip install -r /opt/laynes-mcp/app/requirements-mcp.lock
+# 4. env file: RO DB role + provider key only (edit values by hand; never commit)
+install -m 0640 -o root -g laynes-mcp /opt/laynes-mcp/app/deploy/mcp/mcp.env.example /etc/laynes-mcp/mcp.env
+$EDITOR /etc/laynes-mcp/mcp.env
+# 5. service (new unit; laynes-api is NOT restarted)
+install -m 0644 /opt/laynes-mcp/app/deploy/mcp/laynes-mcp.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now laynes-mcp
+curl -s 127.0.0.1:8710/healthz                                   # {"status":"ok"}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST 127.0.0.1:8710/mcp   # 401
+# 6. Masroor's key (secret goes to a 0600 file once; hand over securely, then shred)
+A='sudo -u laynes-mcp env MCP_DATA_DIR=/var/lib/laynes-mcp /opt/laynes-mcp/venv/bin/python -m mcp_server.admin'
+$A create --label "Masroor Grok Bot" --tools <approved tools> --stores <approved ids> \
+          --expires <ISO date> --write-secret-file /root/masroor.key
+# 7. nginx: add the rate-limit zone and the exact-match location, test, reload
+cp /etc/nginx/sites-enabled/intelligence /root/deploy-backups/nginx-intelligence.pre-mcp
+install -m 0644 /opt/laynes-mcp/app/deploy/mcp/nginx-mcp-limit.conf /etc/nginx/conf.d/mcp-limit.conf
+#   insert deploy/mcp/nginx-mcp.location.conf above `location / {` in sites-enabled/intelligence
+nginx -t && systemctl reload nginx
+# 8. smoke test (placeholders): see section 5; confirm /api/status and the website still respond.
+```
+The nginx change was dry-run validated (`nginx -t`) on a scratch copy of the live
+config: `location = /mcp` matches only that exact path, so `/api/`, `/assets/`, the SPA
+and the Streamlit locations are unaffected.
 
-No database migration, schema change or change to existing services is required.
+### Rollback
+```bash
+# fastest: cut Grok off only
+$A revoke KEY_ID
+# remove the route
+cp /root/deploy-backups/nginx-intelligence.pre-mcp /etc/nginx/sites-enabled/intelligence
+rm -f /etc/nginx/conf.d/mcp-limit.conf && nginx -t && systemctl reload nginx
+# stop the service
+systemctl disable --now laynes-mcp && rm /etc/systemd/system/laynes-mcp.service && systemctl daemon-reload
+# optional: rm -rf /opt/laynes-mcp /var/lib/laynes-mcp /etc/laynes-mcp
+```
+No database, schema or existing service is changed, so rollback needs nothing else.
+
+## Separate data-quality issues (out of scope here)
+1. **COGS / food cost**: no verified COGS GL mapping, inventory-usage or purchase feed.
+2. **HME ingestion**: `hme-daily-ingest.service` is failed; latest HME date is 2026-10-13
+   and 3 days in 2026-10 failed reconciliation.
 
 ## 11. Troubleshooting
 
@@ -180,9 +226,3 @@ No database migration, schema change or change to existing services is required.
 | status `unavailable`/`partial` | read `coverage`, `blocking_reasons`, `freshness` — usually a source gate or stale ingest |
 | pending job | call `ask_laynes_question` with only `job_id` |
 | 502 from nginx | `systemctl status laynes-mcp`; `journalctl -u laynes-mcp` |
-
-## 12. Rollback
-
-Remove the `location = /mcp` block, `nginx -t && systemctl reload nginx`;
-`systemctl disable --now laynes-mcp`. Nothing else changed. To cut off Grok only:
-`admin revoke KEY_ID`. Data dir `/var/lib/laynes-mcp` can be deleted (credentials only).

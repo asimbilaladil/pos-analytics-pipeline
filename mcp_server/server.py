@@ -195,6 +195,12 @@ def build_mcp() -> FastMCP:
                              idempotency_key, job_id)
         return await _run(ctx, "ask_laynes_question", work)
 
+    # Discovery shows only the tools this credential may call.
+    @mcp._mcp_server.list_tools()
+    async def _list_permitted():
+        p = _principal(mcp.get_context())
+        return [t for t in await mcp.list_tools() if t.name in p.tools]
+
     return mcp
 
 

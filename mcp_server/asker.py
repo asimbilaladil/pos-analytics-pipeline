@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 import store_scope
 
-from . import keystore, settings
+from . import keystore, security, settings
 from .keystore import Principal
 from .security import ToolInputError, chicago_today, parse_range, resolve_stores
 
@@ -189,6 +189,12 @@ def ask(p: Principal, question, store_ids, start_date, end_date, idempotency_key
         row = _fetch(str(job_id), p.key_id)
         if row is None:
             raise ToolInputError("no such job for this credential")
+        # The stored scope must still lie inside the credential's CURRENT grant
+        # (a key narrowed after submission must not read the wider answer).
+        stored = set(json.loads(row["scope_json"]).get("stores") or [])
+        granted = set(security.known_store_ids()) if p.all_stores else set(p.stores)
+        if not stored <= granted:
+            raise ToolInputError("no such job for this credential")
         if row["status"] in ("queued", "processing"):
             row = _wait(row["job_id"], p.key_id, min(wait, 25))
         return _result(row)
@@ -208,7 +214,9 @@ def ask(p: Principal, question, store_ids, start_date, end_date, idempotency_key
     # not narrow the scope. Anything else is confined in the data layer.
     all_known = set(chat_sql.ESTABLISHMENTS)
     allowed = None if (p.all_stores and set(ids) == all_known) else ids
-    if allowed is not None and chat_sql.is_financial_waste_review(q):
+    if allowed is not None and (chat_sql.is_financial_waste_review(q)
+                                or chat_sql.is_financial_waste_review(
+                                    _scope_note(names, start, end, True) + q)):
         raise ToolInputError(
             "the financial waste review compares stores across the network and is "
             "only available to a credential with access to every store")
