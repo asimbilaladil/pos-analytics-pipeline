@@ -66,7 +66,8 @@ def main(argv=None) -> int:
                    help="comma list of establishment ids, or '*' for every store")
     c.add_argument("--expires", help="ISO-8601 UTC expiry, e.g. 2027-01-01T00:00:00+00:00")
     c.add_argument("--rate-per-min", type=int)
-    c.add_argument("--daily-asks", type=int)
+    c.add_argument("--daily-asks", type=int,
+                   help="AI questions per day; 0 = unlimited; omit for the default")
     c.add_argument("--write-secret-file")
     sub.add_parser("list")
     r = sub.add_parser("revoke"); r.add_argument("key_id"); r.add_argument("--reason", default="")

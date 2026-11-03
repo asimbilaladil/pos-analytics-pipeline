@@ -40,6 +40,10 @@ $A create --label "Masroor Grok Bot" --tools all --stores 6,7,14 \
           --expires 2027-06-30T00:00:00+00:00 --write-secret-file /root/masroor.key
 $A list                       # metadata only; never secrets or hashes
 $A usage KEY_ID               # sanitised audit rows
+# --daily-asks N: N>0 caps AI questions/day; 0 = unlimited (rate and concurrency limits still apply);
+#                 omitted = default (40); negative values are rejected.
+# --rate-per-min N: HTTP requests/min for the key. EVERY request counts (initialize, tools/list and
+#                 tools/call each count), so a very low value limits how many tool calls fit per minute.
 $A rotate KEY_ID --write-secret-file /root/masroor2.key [--grace-hours 24]
 $A revoke KEY_ID --reason "left the project"
 ```

@@ -466,3 +466,72 @@ def test_service_never_references_the_rw_database_role():
         s = inspect.getsource(m)
         assert "rw_conn" not in s and "DB_PASS" not in s and "DB_USER" not in s
     assert "_ro_conn" in inspect.getsource(an)
+
+
+# ═══ daily question limits: 0 = unlimited ═══════════════════════════════════
+def test_daily_asks_default_zero_positive_and_negative(make_key):
+    from mcp_server import keystore as ks
+    assert ks.get_key(make_key()[1].key_id).daily_asks == settings.DEFAULT_DAILY_ASKS
+    assert ks.get_key(make_key(daily_asks=0)[1].key_id).daily_asks == 0
+    assert ks.get_key(make_key(daily_asks=7)[1].key_id).daily_asks == 7
+    for bad in (-1, -40, True, 1.5):
+        with pytest.raises(ValueError):
+            make_key(daily_asks=bad)
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            make_key(rate_per_min=bad)
+
+
+def test_unlimited_daily_asks_never_hits_the_daily_cap(make_key, ask_env):
+    p = principal(make_key, daily_asks=0)
+    assert p.daily_asks == 0
+    for i in range(settings.DEFAULT_DAILY_ASKS + 5):          # past the old default of 40
+        r = asker.ask(p, f"question number {i}", None, None, None, f"unl-key-{i:04d}", None)
+        assert r["status"] == "completed"
+    assert ask_env["calls"] == settings.DEFAULT_DAILY_ASKS + 5
+
+
+def test_unlimited_keeps_concurrency_and_rate_limits(make_key, ask_env, client):
+    ask_env["delay"] = 1.0
+    p = principal(make_key, daily_asks=0)
+    asker.ask(p, "slow one", None, None, None, "c-aaaaaaaa1", None, wait_seconds=0.1)
+    asker.ask(p, "slow two", None, None, None, "c-aaaaaaaa2", None, wait_seconds=0.1)
+    with pytest.raises(ToolInputError):                        # concurrency cap still enforced
+        asker.ask(p, "slow three", None, None, None, "c-aaaaaaaa3", None, wait_seconds=0.1)
+    time.sleep(2.2)
+
+
+def test_rate_limit_still_applies_to_an_unlimited_key(client, make_key):
+    from conftest import INIT, auth
+    tok, _ = make_key(daily_asks=0, rate_per_min=5)
+    codes = [client.post("/mcp", headers=auth(tok), json=INIT).status_code for _ in range(7)]
+    assert codes == [200] * 5 + [429, 429]
+
+
+def test_capped_key_still_capped(make_key, ask_env):
+    p = principal(make_key, daily_asks=1)
+    asker.ask(p, "first question", None, None, None, "cap-key-0001", None)
+    with pytest.raises(ToolInputError):
+        asker.ask(p, "second question", None, None, None, "cap-key-0002", None)
+
+
+def test_rotation_preserves_unlimited_and_rate(make_key):
+    from mcp_server import keystore as ks
+    _, rec = make_key(daily_asks=0, rate_per_min=5)
+    _, new = ks.rotate_key(rec.key_id)
+    assert (new.daily_asks, new.rate_per_min) == (0, 5)
+
+
+def test_cli_daily_asks_semantics(tmp_path, capsys):
+    from mcp_server import admin, keystore as ks
+    f = tmp_path / "s"
+    assert admin.main(["create", "--label", "u", "--tools", "all", "--stores", "*",
+                       "--daily-asks", "0", "--rate-per-min", "5", "--write-secret-file", str(f)]) == 0
+    assert admin.main(["create", "--label", "neg", "--tools", "all", "--stores", "6",
+                       "--daily-asks", "-1", "--write-secret-file", str(tmp_path / "n")]) == 1
+    assert admin.main(["create", "--label", "dflt", "--tools", "all", "--stores", "6",
+                       "--write-secret-file", str(tmp_path / "d")]) == 0
+    by = {k.label: k for k in ks.list_keys()}
+    assert by["u"].daily_asks == 0 and by["u"].rate_per_min == 5 and by["u"].stores == "*"
+    assert by["dflt"].daily_asks == settings.DEFAULT_DAILY_ASKS
+    assert "neg" not in by

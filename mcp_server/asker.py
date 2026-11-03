@@ -251,7 +251,9 @@ def ask(p: Principal, question, store_ids, start_date, end_date, idempotency_key
             row = _wait(row["job_id"], p.key_id, wait)
         return _result(row, reused=True)
 
-    if keystore.asks_today(p.key_id) >= p.daily_asks:
+    # daily_asks == 0 means unlimited; the per-minute rate limit, the concurrent-job
+    # limit and the process-wide slots below still apply.
+    if p.daily_asks > 0 and keystore.asks_today(p.key_id) >= p.daily_asks:
         raise ToolInputError("daily question limit reached for this credential")
     with keystore.connect() as c:
         active = c.execute("SELECT count(*) FROM ask_jobs WHERE key_id=? AND status IN "
