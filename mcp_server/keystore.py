@@ -107,7 +107,7 @@ class Principal:
     tools: frozenset
     stores: object                     # frozenset[int] or "*"
     rate_per_min: int
-    daily_asks: int
+    daily_asks: int                   # 0 = unlimited
 
     @property
     def all_stores(self) -> bool:
@@ -162,6 +162,16 @@ def create_key(label: str, tools, stores, *, expires_at: str | None = None,
             raise ValueError("stores must list at least one id, or '*' for all")
     if expires_at:
         datetime.fromisoformat(expires_at)         # validate
+    # None = not supplied (use the default). 0 is meaningful for daily_asks:
+    # it means UNLIMITED. Negative values are never valid.
+    if rate_per_min is None:
+        rate_per_min = settings.DEFAULT_RATE_PER_MIN
+    if isinstance(rate_per_min, bool) or not isinstance(rate_per_min, int) or rate_per_min < 1:
+        raise ValueError("rate_per_min must be an integer of at least 1")
+    if daily_asks is None:
+        daily_asks = settings.DEFAULT_DAILY_ASKS
+    if isinstance(daily_asks, bool) or not isinstance(daily_asks, int) or daily_asks < 0:
+        raise ValueError("daily_asks must be 0 (unlimited) or a positive integer")
     key_id = secrets.token_hex(6)
     secret = secrets.token_urlsafe(32)
     token = f"lmcp_{key_id}_{secret}"
@@ -172,8 +182,7 @@ def create_key(label: str, tools, stores, *, expires_at: str | None = None,
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (key_id, label, _digest(secret), now_iso(), expires_at,
              json.dumps(tools), json.dumps(stores),
-             rate_per_min or settings.DEFAULT_RATE_PER_MIN,
-             daily_asks or settings.DEFAULT_DAILY_ASKS, rotated_from))
+             rate_per_min, daily_asks, rotated_from))
         rec = _row_to_record(c.execute("SELECT * FROM api_keys WHERE key_id=?",
                                        (key_id,)).fetchone())
     return token, rec
