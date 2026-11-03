@@ -272,8 +272,13 @@ check("the numeric reconciliation delta is carried through",
       ctx["revel"]["reconciliation_delta_pct"] == -3.74)
 check("the freshness lag is carried through",
       ctx["revel"]["freshness_lag_hours"] == 31.3)
-check("the model is told not to retry other scopes",
-      "do NOT retry other stores or dates" in ctx["instruction"])
+# 2026-11: the old instruction ("do NOT retry other stores or dates -- the
+# same gate applies to every scope") was false for Revel and made one failed
+# scope refuse every store. The verdict is per scope; the final call is still
+# tool-less, so it cannot probe other scopes either way.
+check("a Revel failure is stated as scope-specific, not source-wide",
+      "FOR THIS SCOPE ONLY" in ctx["instruction"]
+      and "same gate applies to every scope" not in ctx["instruction"])
 check("the model is told not to run further SQL",
       "Do NOT run further SQL" in ctx["instruction"])
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Revel items self-heal at 11:30 and 15:30 America/Chicago
+
+[Timer]
+# After the 09:00 Chicago daily sync (normally done in ~25 min). The second
+# elapse covers a day when the sync ran long and the first one was skipped
+# (exit 75). A no-op run (nothing missing) is a single read-only query.
+OnCalendar=*-*-* 11:30:00 America/Chicago
+OnCalendar=*-*-* 15:30:00 America/Chicago
+Persistent=true
+Unit=revel-items-selfheal.service
+
+[Install]
+WantedBy=timers.target

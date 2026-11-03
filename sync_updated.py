@@ -143,7 +143,8 @@ def _empty_stats():
 
 
 # ─── Orders ─────────────────────────────────────────────────────────────────
-def sync_orders(context, conn, est_id: int, run_id: str, target: str = "production") -> tuple:
+def sync_orders(context, conn, est_id: int, run_id: str, target: str = "production",
+                defer_watermark: bool = False) -> tuple:
     """Returns (touched_order_ids, stats). Raises on any failure (caller
     decides whether to record_sync_failure and continue to the next
     establishment, matching pipeline.py's existing per-establishment
@@ -194,14 +195,40 @@ def sync_orders(context, conn, est_id: int, run_id: str, target: str = "producti
             dirty_date_queue.enqueue_dirty_dates(cur, est_id, dirty_dates, source_run_id=run_id)
     conn.commit()
 
-    with conn.cursor() as cur:
-        record_sync_success(cur, watermark_resource, est_id, start, end, run_id)
-    conn.commit()
-
-    return order_ids, {
+    stats_out = {
         "rows_fetched": len(records), "rows_affected": stats.get("affected", 0),
         "rows_failed": 0, "api_pages": None,
     }
+    if defer_watermark:
+        # 2026-10 incident: the watermark used to advance HERE, before the
+        # dependent OrderItems/OrderHistory for these same orders were fetched.
+        # When the process was OOM-killed during the items fetch (Oct 25/26),
+        # the next run's window started after these orders, so their items
+        # were never fetched and thousands of paid orders sat with no item rows.
+        # With defer_watermark=True the caller advances it via
+        # commit_orders_watermark() only after every dependent resource has
+        # committed. A kill at any point before that leaves the old watermark,
+        # and the next run's window re-covers the same orders.
+        stats_out["_watermark"] = (watermark_resource, start, end)
+    else:
+        with conn.cursor() as cur:
+            record_sync_success(cur, watermark_resource, est_id, start, end, run_id)
+        conn.commit()
+
+    return order_ids, stats_out
+
+
+def commit_orders_watermark(conn, est_id: int, run_id: str, orders_stats: dict) -> bool:
+    """Advance a watermark deferred by sync_orders(defer_watermark=True).
+    Returns False (and does nothing) when there is no deferred watermark."""
+    wm = (orders_stats or {}).pop("_watermark", None)
+    if not wm:
+        return False
+    resource, start, end = wm
+    with conn.cursor() as cur:
+        record_sync_success(cur, resource, est_id, start, end, run_id)
+    conn.commit()
+    return True
 
 
 # ─── Payments ───────────────────────────────────────────────────────────────
@@ -334,7 +361,8 @@ def _update_item_updated_dates(cur, items: list, target: str = "production") -> 
 def sync_order_items_and_modifiers(context, conn, est_id: int, run_id: str,
                                     order_ids: list, modifier_cache: dict,
                                     target: str = "production",
-                                    skip_modifiers: bool = False) -> tuple:
+                                    skip_modifiers: bool = False,
+                                    window_prefix: str = None) -> tuple:
     """Strategy A: OrderItems for the Order IDs touched by sync_orders() this
     run, via the existing verified order__in batching (Task 06). No
     watermark of its own — driven entirely by sync_orders' output, so there
@@ -360,9 +388,44 @@ def sync_order_items_and_modifiers(context, conn, est_id: int, run_id: str,
     if not order_ids:
         return _empty_stats(), _empty_stats()
 
+    # Bounded memory: fetch, upsert and commit ITEM_CHUNK_ORDERS orders at a
+    # time instead of holding every item of every touched order in memory at
+    # once. A busy store/day is ~600 orders and ~4,000 items, and a
+    # multi-day catch-up window can be several times that. Each chunk's upsert
+    # is idempotent (ON CONFLICT), so a crash mid-way loses nothing that a
+    # re-run (same window, see defer_watermark) will not redo.
+    totals_i = {"rows_fetched": 0, "rows_affected": 0, "rows_failed": 0, "api_pages": None}
+    totals_m = {"rows_fetched": 0, "rows_affected": 0, "rows_failed": 0, "api_pages": None,
+                "skipped": skip_modifiers}
+    for i in range(0, len(order_ids), ITEM_CHUNK_ORDERS):
+        si, sm = _sync_items_chunk(context, conn, est_id, run_id, order_ids[i:i + ITEM_CHUNK_ORDERS],
+                                   modifier_cache, target, skip_modifiers,
+                                   _chunk_window_key(window_prefix, i // ITEM_CHUNK_ORDERS))
+        for k in ("rows_fetched", "rows_affected"):
+            totals_i[k] += si[k]
+            totals_m[k] += sm[k]
+    return totals_i, totals_m
+
+
+ITEM_CHUNK_ORDERS = int(os.getenv("REVEL_ITEM_CHUNK_ORDERS", "1000"))
+
+
+def _chunk_window_key(prefix, n):
+    """Raw-archive window key for chunk n. Chunk 0 of an un-prefixed call keeps
+    window_key=None, so a single-chunk run archives exactly where it always
+    did; every other chunk gets its own directory, because raw_archive refuses
+    to overwrite a page already archived under the same run/window."""
+    if prefix is None:
+        return None if n == 0 else f"chunk_{n:03d}"
+    return f"{prefix}_chunk_{n:03d}"
+
+
+def _sync_items_chunk(context, conn, est_id, run_id, order_ids, modifier_cache, target,
+                      skip_modifiers, window_key=None):
     today = date.today()
     items = P.fetch_items_for_orders(context, order_ids, run_id=run_id,
-                                      establishment_id=est_id, archive_date=today)
+                                      establishment_id=est_id, archive_date=today,
+                                      window_key=window_key)
 
     item_rows, modifier_rows = [], []
     dirty_dates = set()
@@ -398,9 +461,9 @@ def sync_order_items_and_modifiers(context, conn, est_id: int, run_id: str,
     conn.commit()
 
     return (
-        {"rows_fetched": len(items), "rows_affected": item_stats.get("affected", 0), "rows_failed": 0, "api_pages": None},
-        {"rows_fetched": len(modifier_rows), "rows_affected": modifier_stats.get("affected", 0) if skip_modifiers else (modifier_rows and len(modifier_rows) or 0),
-         "rows_failed": 0, "api_pages": None, "skipped": skip_modifiers},
+        {"rows_fetched": len(items), "rows_affected": item_stats.get("affected", 0)},
+        {"rows_fetched": len(modifier_rows),
+         "rows_affected": modifier_stats.get("affected", 0) if skip_modifiers else len(modifier_rows)},
     )
 
 
@@ -497,7 +560,7 @@ def fetch_order_history_for_orders(context, order_ids: list, run_id: str,
 
 
 def sync_order_history(context, conn, est_id: int, run_id: str, order_ids: list,
-                        target: str = "production") -> dict:
+                        target: str = "production", window_prefix: str = None) -> dict:
     """target="shadow_v2" (Task 15 coordinated freshness pass): writes go to
     order_history_v2 via pipeline.upsert_order_history's existing target=
     passthrough. No watermark involved either way -- this resource has none
@@ -509,14 +572,19 @@ def sync_order_history(context, conn, est_id: int, run_id: str, order_ids: list,
         return _empty_stats()
 
     today = date.today()
-    records = fetch_order_history_for_orders(context, order_ids, run_id, est_id, today)
-    rows = [build_order_history_row(h) for h in records if h.get("id")]
+    fetched = affected = 0
+    for i in range(0, len(order_ids), ITEM_CHUNK_ORDERS):   # bounded memory, as for items
+        records = fetch_order_history_for_orders(
+            context, order_ids[i:i + ITEM_CHUNK_ORDERS], run_id, est_id, today,
+            window_key=_chunk_window_key(window_prefix, i // ITEM_CHUNK_ORDERS))
+        rows = [build_order_history_row(h) for h in records if h.get("id")]
+        with conn.cursor() as cur:
+            stats = P.upsert_order_history(cur, rows, target=target)
+        conn.commit()
+        fetched += len(records)
+        affected += stats.get("affected", 0)
 
-    with conn.cursor() as cur:
-        stats = P.upsert_order_history(cur, rows, target=target)
-    conn.commit()
-
-    return {"rows_fetched": len(records), "rows_affected": stats.get("affected", 0),
+    return {"rows_fetched": fetched, "rows_affected": affected,
             "rows_failed": 0, "api_pages": None}
 
 
@@ -773,9 +841,11 @@ def run_establishment_updated(context, conn, est_id: int, run_id: str, modifier_
     payments_watermark = "payments" if target == "production" else "payments_v2"
 
     order_ids = []
+    orders_stats = None
     try:
-        order_ids, orders_stats = sync_orders(context, conn, est_id, run_id, target=target)
-        report["orders"] = orders_stats
+        order_ids, orders_stats = sync_orders(context, conn, est_id, run_id, target=target,
+                                              defer_watermark=True)
+        report["orders"] = {k: v for k, v in orders_stats.items() if not k.startswith("_")}
     except Exception as exc:
         conn.rollback()
         log.error("  [orders] est=%s FAILED: %s", est_id, exc)
@@ -794,6 +864,7 @@ def run_establishment_updated(context, conn, est_id: int, run_id: str, modifier_
         conn.commit()
         report["payments"] = {**_empty_stats(), "rows_failed": -1, "error": str(exc)}
 
+    dependents_ok = True
     try:
         item_stats, modifier_stats = sync_order_items_and_modifiers(
             context, conn, est_id, run_id, order_ids, modifier_cache, target=target)
@@ -801,6 +872,7 @@ def run_establishment_updated(context, conn, est_id: int, run_id: str, modifier_
         report["modifier_items"] = modifier_stats
     except Exception as exc:
         conn.rollback()
+        dependents_ok = False
         log.error("  [order_items] est=%s FAILED: %s", est_id, exc)
         report["order_items"] = {**_empty_stats(), "rows_failed": -1, "error": str(exc)}
         report["modifier_items"] = _empty_stats()
@@ -809,7 +881,88 @@ def run_establishment_updated(context, conn, est_id: int, run_id: str, modifier_
         report["order_history"] = sync_order_history(context, conn, est_id, run_id, order_ids, target=target)
     except Exception as exc:
         conn.rollback()
+        dependents_ok = False
         log.error("  [order_history] est=%s FAILED: %s", est_id, exc)
         report["order_history"] = {**_empty_stats(), "rows_failed": -1, "error": str(exc)}
 
+    # The orders watermark advances only now, after the items and history of
+    # every touched order committed. If either failed, it stays where it was
+    # (status='failed') so the next run's window re-covers these orders and
+    # re-fetches their dependents.
+    if orders_stats is not None:
+        if dependents_ok:
+            commit_orders_watermark(conn, est_id, run_id, orders_stats)
+        else:
+            with conn.cursor() as cur:
+                record_sync_failure(cur, orders_watermark, est_id, run_id)
+            conn.commit()
+
+    # Self-heal: paid orders in the lookback window that still have no item
+    # rows (a run killed before this fix shipped, or a dependent fetch that
+    # failed above). Bounded and idempotent; never fails the establishment.
+    try:
+        report["items_self_heal"] = repair_missing_items(
+            context, conn, est_id, run_id, modifier_cache, target=target,
+            window_prefix="selfheal")
+    except Exception as exc:
+        conn.rollback()
+        log.error("  [items_self_heal] est=%s FAILED: %s", est_id, exc)
+        report["items_self_heal"] = {"error": str(exc)}
+
     return report
+
+
+# ─── Self-heal: paid orders with no items ───────────────────────────────────
+SELF_HEAL_LOOKBACK = timedelta(days=int(os.getenv("REVEL_SELF_HEAL_LOOKBACK_DAYS", "7")))
+SELF_HEAL_SETTLE = timedelta(hours=2)      # leave in-flight orders alone
+SELF_HEAL_MAX_ORDERS = int(os.getenv("REVEL_SELF_HEAL_MAX_ORDERS", "6000"))
+
+
+def find_orders_missing_items(cur, est_id: int, since: datetime, until: datetime,
+                              target: str = "shadow_v2", limit: int = SELF_HEAL_MAX_ORDERS) -> list:
+    """Ids of non-deleted orders with a non-zero final_total and NO item rows
+    at all, created in [since, until). An order with money and no items is
+    classified OTHER and drops out of REAL sales, so the reconciliation gate
+    fails for that store. Read-only."""
+    t = P.UPSERT_TARGETS[target]
+    cur.execute(f"""
+        SELECT o.id FROM {t["orders"]} o
+        WHERE o.establishment_id = %s AND o.created_date >= %s AND o.created_date < %s
+          AND o.deleted IS NOT TRUE AND COALESCE(o.final_total, 0) <> 0
+          AND NOT EXISTS (SELECT 1 FROM {t["order_items"]} i WHERE i.order_id = o.id)
+        ORDER BY o.id LIMIT %s""", (est_id, since, until, limit))
+    return [r[0] for r in cur.fetchall()]
+
+
+def repair_missing_items(context, conn, est_id: int, run_id: str, modifier_cache: dict,
+                         target: str = "shadow_v2", since: datetime = None, until: datetime = None,
+                         window_prefix: str = "selfheal", limit: int = SELF_HEAL_MAX_ORDERS) -> dict:
+    """Re-fetch OrderItems (+ nested ModifierItems) and OrderHistory for paid
+    orders that have no items, using the same fetch/upsert path as the daily
+    sync. Never touches orders or payments. Upserts are idempotent, so running
+    it twice is harmless. Returns before/after counts."""
+    now = datetime.now(timezone.utc)
+    since = since or now - SELF_HEAL_LOOKBACK
+    until = until or now - SELF_HEAL_SETTLE
+    with conn.cursor() as cur:
+        ids = find_orders_missing_items(cur, est_id, since, until, target=target, limit=limit)
+    conn.commit()
+    out = {"missing_before": len(ids), "missing_after": 0}
+    if not ids:
+        return out
+    log.info("  [items_self_heal] est=%s %d paid orders without items since %s -- re-fetching",
+             est_id, len(ids), since.isoformat())
+    out["order_items"], out["modifier_items"] = sync_order_items_and_modifiers(
+        context, conn, est_id, run_id, ids, modifier_cache, target=target, window_prefix=window_prefix)
+    out["order_history"] = sync_order_history(context, conn, est_id, run_id, ids, target=target,
+                                              window_prefix=window_prefix)
+    with conn.cursor() as cur:
+        still = find_orders_missing_items(cur, est_id, since, until, target=target, limit=limit)
+    conn.commit()
+    out["missing_after"] = len(still)
+    if still:
+        # Revel itself returned no items for these: leave them for a human,
+        # do not loop on them.
+        log.warning("  [items_self_heal] est=%s %d orders still have no items after re-fetch "
+                    "(first ids: %s)", est_id, len(still), still[:5])
+    return out
