@@ -1,0 +1,41 @@
+# Laynes Intelligence read-only MCP server. NEW unit: does not replace or alter
+# laynes-api.service. Loopback only; nginx is the sole way in.
+[Unit]
+Description=Laynes Intelligence read-only MCP server (Grok bot)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=laynes-mcp
+Group=laynes-mcp
+# Immutable release checkout of a MERGED commit + the service's OWN venv.
+WorkingDirectory=/opt/laynes-mcp/app
+ExecStart=/opt/laynes-mcp/venv/bin/uvicorn mcp_server.server:app \
+    --host 127.0.0.1 --port 8710 --no-access-log \
+    --proxy-headers --forwarded-allow-ips 127.0.0.1
+# Dedicated 0600 env file holding ONLY: DB_HOST/DB_PORT/DB_NAME,
+# DB_RO_USER/DB_RO_PASS (laynes_ro), ANTHROPIC_API_KEY (+ optional OPENAI_*).
+# No DB_USER/DB_PASS (read-write role) and no JWT/session secrets.
+EnvironmentFile=/etc/laynes-mcp/mcp.env
+Environment=MCP_DATA_DIR=/var/lib/laynes-mcp
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=laynes-mcp
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/laynes-mcp
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=768M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
