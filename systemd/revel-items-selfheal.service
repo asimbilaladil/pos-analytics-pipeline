@@ -1,0 +1,25 @@
+[Unit]
+Description=Revel self-heal: re-fetch items/history for paid orders that have no items (last 7 days)
+Documentation=file:///root/pos-analytics-pipeline-release/repair_missing_items.py
+After=network-online.target postgresql.service revel-daily-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs from the RELEASE checkout. revel-daily-sync.service still runs the
+# development checkout's run.sh; until that tree is updated, this unit is
+# what applies the 2026-10 items fix in production. It is safe either way:
+# the repair is an idempotent upsert of items/history only, never orders or
+# payments, and it exits 75 (skipped) while the daily sync is running.
+WorkingDirectory=/root/pos-analytics-pipeline-release
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python3 /root/pos-analytics-pipeline-release/repair_missing_items.py
+SuccessExitStatus=75
+TimeoutStartSec=3600
+# Memory: the host has 3.8 GB and no swap, and the daily sync was killed by
+# the GLOBAL OOM killer on 2026-10-19..26. Cap this unit so a runaway here is
+# contained to this unit instead of taking a neighbour with it.
+MemoryHigh=1200M
+MemoryMax=1536M
+
+[Install]
+WantedBy=multi-user.target

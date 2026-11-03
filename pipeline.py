@@ -215,6 +215,7 @@ def login_and_save(context, page):
     # timeouts that abort the whole run before any establishment is fetched.
     page.wait_for_load_state("networkidle", timeout=60000)
     context.storage_state(path=STATE_FILE)
+    os.chmod(STATE_FILE, 0o600)   # session cookies: owner-only
     log.info("Logged in and session saved")
 
 

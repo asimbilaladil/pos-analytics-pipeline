@@ -47,3 +47,30 @@ Loyalty runs with raw archiving disabled (`resource=None`) because
 
 Daily runs checkpoint under `order_loyalty_v2_daily` and
 `timesheet_entries_v2_daily`, separate from the historical backfill resources.
+
+---
+
+# revel-items-selfheal (service + timer)
+
+Re-fetches OrderItems (+ nested ModifierItems) and OrderHistory for paid
+orders in the last 7 days that have **no item rows**, then drains the
+feature recompute queue. Added after 2026-10-25/26, when OOM kills during the
+items fetch left thousands of paid orders at two stores without items (the orders
+watermark had already advanced, so the next sync never revisited them).
+
+    sudo cp systemd/revel-items-selfheal.* /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now revel-items-selfheal.timer
+    systemctl list-timers revel-items-selfheal.timer   # 16:30/20:30 UTC in CDT, 17:30/21:30 in CST
+
+* Runs from `/root/pos-analytics-pipeline-release`; writes only
+  order_items_v2 / modifier_items_v2 / order_history_v2 (idempotent upserts)
+  and feature_recompute_queue — never orders or payments.
+* Exit 75 = skipped (daily sync running, another repair holds the lock, or
+  low memory) and counts as success; the next elapse retries.
+* A run with nothing missing is a single read-only query and never opens a
+  browser.
+* Manual repair of a dated range (checkpointed, resumable):
+
+      venv/bin/python repair_missing_items.py --establishments 15,54 \
+          --start 2026-10-18 --end 2026-10-23 --checkpoint /path/ck.json

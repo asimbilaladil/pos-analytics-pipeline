@@ -846,6 +846,21 @@ DATA TRUST GATE — enforced by the server, not by you:
   * If the scope fails reconciliation the query never runs. Stop, tell the user
     which checks failed and what that means, and do not analyse that period,
     fall back to partial data, or shop for a different period to get an answer.
+  * RECONCILIATION IS PER SCOPE, NOT PER SOURCE. A network (all-stores) FAIL
+    does not mean every store failed, and a network PASS does not verify any
+    single store: errors in different stores can cancel in the sum. For any
+    per-store or multi-store answer use store_breakdown (returned with every
+    all-stores check, and with a failed verdict): give figures ONLY for stores
+    whose revel_status is PASS, list each FAIL store separately with its
+    failure_category_meaning and reasons, and give no transactions, sales or
+    per-labour-hour figure for it. A sum of verified stores is
+    verified_stores_subtotal, quoted with its label -- never call it the
+    network total unless all_stores_verified is true. Asking for named stores
+    is not shopping for a scope: check each named store on its own.
+  * LABOUR HOURS ARE INDEPENDENT OF THE ORDER RECONCILIATION. When labour is
+    trusted, report its hours even if the store's Revel reconciliation failed,
+    with the labour caveats -- but never a transactions- or sales-per-labour-
+    hour figure built on unverified orders.
   * Lookups against establishments, products, weather_daily and v_store_cohort
     need no scope — "how many stores are there" is a plain question, answer it
     plainly.
@@ -4393,10 +4408,76 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "order_rows": (meta.get("volumes") or {}).get("order_rows"),
         }
     if DOMAIN_LABOR in doms:
-        lab = meta.get("labor") or {}
-        out["labor"] = {"trusted": bool(lab.get("available")),
-                        "store_day_rows": lab.get("store_day_rows"),
-                        "labor_hours": lab.get("labor_hours")}
+        out["labor"] = _labor_trust(meta.get("labor") or {})
+    if DOMAIN_REVEL in doms and not out["revel"]["trusted"]:
+        # The Revel gate is per scope. Saying "the same gate applies to every
+        # scope" made the model refuse every store when one scope failed.
+        out["instruction"] = (
+            "The Revel order/payment reconciliation FAILED FOR THIS SCOPE ONLY "
+            "(see scope). It says nothing about other stores or periods: a "
+            "network FAIL does not mean every store failed, and a network PASS "
+            "does not verify any single store. Do NOT run further SQL. If "
+            "store_breakdown is present, it holds each store's OWN verdict for "
+            "this period: report figures only for stores with revel_status "
+            "PASS, list each FAIL store separately with its "
+            "failure_category_meaning and failure_reasons, and give no "
+            "transaction, sales or per-labour-hour figure for a failed store. "
+            "If you add up verified stores, use verified_stores_subtotal and "
+            "its label verbatim -- never call it the network total unless "
+            "all_stores_verified is true. Labour hours are independent of this "
+            "reconciliation: report them where labour is trusted, with the "
+            "labour caveats. Never compute a ratio yourself.")
+    return out
+
+
+def _attach_store_breakdown(blocked: dict, meta: dict, cache: dict | None) -> None:
+    """On a Revel failure, hand the final (tool-less) call every store's own
+    verdict for the same period, so a multi-store question gets a partial
+    report instead of a blanket refusal. Never raises: a breakdown that
+    cannot be computed is reported as such and the refusal stands."""
+    rv = blocked.get("revel")
+    if not rv or rv.get("trusted"):
+        return
+    sb = meta.get("store_breakdown")
+    if sb is None:
+        sc = meta.get("scope") or {}
+        try:
+            sb = revel_store_breakdown(sc["period_start"], sc["period_end_exclusive"],
+                                       cache=cache)
+        except (psycopg2.Error, KeyError, ValueError) as e:
+            sb = {"error": str(e).strip()[:200]}
+    blocked["store_breakdown"] = sb
+
+
+def _labor_trust(lab: dict) -> dict:
+    """Labour trust from the block's ACTUAL contract.
+
+    Two producers exist: _labor_gate (labour-only questions) sets
+    available=True/False; meta_extract's Revel-path block sets
+    status='available' / 'not_evaluated_scope_too_large' and has no
+    'available' key. Reading only lab.get('available') reported the Revel-path
+    block as untrusted every time, so labour hours were withheld whenever the
+    Revel gate failed -- even though they come from timesheets, not orders.
+    """
+    if "available" in lab:
+        trusted = bool(lab.get("available"))
+    else:
+        trusted = lab.get("status") == "available"
+    hours = lab.get("labor_hours")
+    trusted = trusted and hours is not None
+    out = {"trusted": trusted,
+           "labor_hours": round(float(hours), 1) if trusted else None,
+           "store_day_rows": lab.get("store_day_rows"),
+           "open_shift_count": lab.get("open_shift_count"),
+           "missing_wage_shift_count": lab.get("missing_wage_shift_count"),
+           "caveats": ("labor_hours is elapsed clocked time and INCLUDES unpaid "
+                       "breaks (break data is not recorded); estimated labour "
+                       "cost is hours x wage and is NOT verified payroll "
+                       "expense; open shifts contribute no hours.")}
+    if not trusted:
+        out["reason"] = ("labour scope too large to evaluate"
+                         if lab.get("status") == "not_evaluated_scope_too_large"
+                         else "no labour records for this store and period")
     return out
 
 
@@ -4506,6 +4587,283 @@ def _labor_gate(establishment_id, period_start, period_end) -> tuple[dict, list,
     fails = [] if block["available"] else [
         "no labour records exist for this store and period"]
     return block, fails, []
+
+
+# ─── Per-store Revel verdicts ───────────────────────────────────────────────
+# A network scope is ONE reconciliation over the sum of every store, and a sum
+# proves nothing about its parts in either direction:
+#   * a week failed network-wide because two stores had orders without
+#     items, yet most stores reconciled on their own -- and the assistant
+#     refused every store.
+#   * after the repair the same network PASSES while two stores still fail
+#     on their own: their errors cancel in the sum.
+# So any multi-store answer must use each store's OWN verdict. This computes
+# all of them in two set-based statements, on the identical A12 basis and
+# tolerance as meta_extract/_reconcile (REAL final_total from
+# v_orders_classified vs v_payments_daily_v2 by Chicago business_date).
+#
+# Checks applied per store, mirroring _reconcile's FAIL conditions: no orders;
+# no payments; |delta| > RECON_TOLERANCE_PCT; missing business days; source
+# lag > FRESHNESS_MAX_LAG_HOURS; duplicate order ids; < 99% of REAL orders
+# with line items. The duplicate-item and orphan-item scans are not repeated:
+# order_items_v2 has PRIMARY KEY (id) and a FOREIGN KEY to orders_v2, so both
+# are structurally impossible there. run_sql against a single store still
+# passes the full meta_extract gate on its own.
+_STORE_BREAKDOWN_SQL = """
+WITH scope AS MATERIALIZED (
+    SELECT establishment_id, id, txn_class, final_total, item_count, business_date
+    FROM v_orders_classified
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(ests)s::int[] IS NULL OR establishment_id = ANY(%(ests)s::int[]))
+),
+o AS MATERIALIZED (
+    SELECT establishment_id,
+           COUNT(*)                                              AS order_rows,
+           COUNT(*) - COUNT(DISTINCT id)                         AS duplicate_order_ids,
+           COUNT(*) FILTER (WHERE txn_class = 'REAL')            AS real_count,
+           COUNT(*) FILTER (WHERE txn_class = 'REAL' AND item_count = 0)
+                                                                 AS real_without_items,
+           ROUND(COALESCE(SUM(final_total) FILTER (WHERE txn_class = 'REAL'), 0), 2)
+                                                                 AS computed_total,
+           COUNT(DISTINCT business_date)                         AS days_with_data,
+           COUNT(*) FILTER (WHERE txn_class = 'OTHER' AND final_total <> 0)
+                                                                 AS money_orders_without_items,
+           ROUND(COALESCE(SUM(final_total) FILTER (WHERE txn_class = 'OTHER'
+                                                    AND final_total <> 0), 0), 2)
+                                                                 AS money_without_items_total
+    FROM scope GROUP BY establishment_id
+),
+p AS MATERIALIZED (
+    SELECT establishment_id, ROUND(COALESCE(SUM(payment_amount), 0), 2) AS reference_total
+    FROM v_payments_daily_v2
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(ests)s::int[] IS NULL OR establishment_id = ANY(%(ests)s::int[]))
+    GROUP BY establishment_id
+),
+l AS MATERIALIZED (
+    SELECT establishment_id, COUNT(DISTINCT business_date) AS labor_days,
+           SUM(labor_hours) AS labor_hours,
+           SUM(open_shift_count) AS open_shift_count,
+           SUM(missing_wage_shift_count) AS missing_wage_shift_count
+    FROM v_labor_daily_context
+    WHERE business_date >= %(start)s AND business_date < %(end)s
+      AND (%(ests)s::int[] IS NULL OR establishment_id = ANY(%(ests)s::int[]))
+    GROUP BY establishment_id
+)
+SELECT e.id AS establishment_id, e.name AS store_name,
+       o.order_rows, o.duplicate_order_ids, o.real_count, o.real_without_items,
+       o.computed_total, o.days_with_data, o.money_orders_without_items,
+       o.money_without_items_total, p.reference_total,
+       l.labor_days, l.labor_hours, l.open_shift_count, l.missing_wage_shift_count,
+       (SELECT MAX(created_date) FROM orders_v2 ov WHERE ov.establishment_id = e.id)
+                                                                 AS latest_source_ts
+FROM establishments e
+LEFT JOIN o ON o.establishment_id = e.id
+LEFT JOIN p ON p.establishment_id = e.id
+LEFT JOIN l ON l.establishment_id = e.id
+WHERE (%(ests)s::int[] IS NULL OR e.id = ANY(%(ests)s::int[]))
+  AND (o.establishment_id IS NOT NULL OR p.establishment_id IS NOT NULL
+       OR l.establishment_id IS NOT NULL)
+ORDER BY e.id
+"""
+
+# Only for stores that fail on the payments delta: are the payments FOR these
+# orders present, just dated on another business day? That separates a
+# date-boundary/payment-timing difference from missing data.
+_STORE_LINKED_PAYMENTS_SQL = """
+SELECT c.establishment_id, ROUND(COALESCE(SUM(ps.payment_amount_total), 0), 2) AS linked_total
+FROM v_orders_classified c
+JOIN v_order_payment_summary ps ON ps.order_id = c.id
+WHERE c.business_date >= %(start)s AND c.business_date < %(end)s
+  AND c.txn_class = 'REAL' AND c.establishment_id = ANY(%(ests)s::int[])
+GROUP BY c.establishment_id
+"""
+
+FAILURE_CATEGORIES = {
+    "missing_ingestion": "data missing from ingestion (orders without line items, "
+                         "or business days with no orders)",
+    "payment_timing": "date-boundary / payment-timing difference: the payments for "
+                      "these orders exist but are dated on another business day "
+                      "(e.g. paid after midnight, or an order re-dated in Revel)",
+    "stale_data": "the store's data is stale (a nightly sync was missed)",
+    "reconciliation_mismatch": "genuine reconciliation failure: orders and payments "
+                               "disagree and the difference is not explained by timing",
+    "no_data": "no orders or no payments for this store and period",
+    "integrity": "duplicate order ids",
+}
+
+
+def _f(v):
+    return None if v is None else float(v)
+
+
+def revel_store_breakdown(period_start: str, period_end: str, cache: dict | None = None) -> dict:
+    """Each store's own Revel verdict for one period, plus trusted labour.
+
+    Figures are released ONLY for stores that pass: real_orders / real_sales
+    and orders_per_labor_hour are None for a failed store, and
+    orders_per_labor_hour is None wherever labour is untrusted. Labour hours
+    are independent of the order/payment reconciliation and are released
+    whenever the store's labour coverage is complete. Respects an active MCP
+    store policy: only allowed stores are read or reported.
+    """
+    key = ("store_breakdown", period_start, period_end)
+    if cache is not None and key in cache:
+        return cache[key]
+    pol = store_scope.current()
+    ests = sorted(pol.allowed) if pol is not None else None
+    params = {"start": period_start, "end": period_end, "ests": ests}
+
+    chicago_today = datetime.now(ZoneInfo("America/Chicago")).date()
+    end_effective = min(date.fromisoformat(period_end), chicago_today + timedelta(days=1))
+    expected_days = max(0, (end_effective - date.fromisoformat(period_start)).days)
+
+    conn = _ro_conn()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute(_STORE_BREAKDOWN_SQL, params)
+            rows = [dict(r) for r in cur.fetchall()]
+            off = [r["establishment_id"] for r in rows
+                   if r["reference_total"] and abs(_pct(
+                       float(r["computed_total"] or 0) - float(r["reference_total"]),
+                       r["reference_total"]) or 0) > RECON_TOLERANCE_PCT]
+            linked = {}
+            if off:
+                cur.execute(_STORE_LINKED_PAYMENTS_SQL, {**params, "ests": off})
+                linked = {r["establishment_id"]: float(r["linked_total"]) for r in cur.fetchall()}
+    finally:
+        conn.rollback()
+        conn.close()
+
+    stores = []
+    for r in rows:
+        computed = float(r["computed_total"] or 0)
+        reference = float(r["reference_total"] or 0)
+        real = int(r["real_count"] or 0)
+        delta = round(computed - reference, 2)
+        dpct = _pct(delta, reference)
+        missing_days = max(0, expected_days - int(r["days_with_data"] or 0))
+        lag_h = None
+        if r["latest_source_ts"] is not None:
+            lag_h = round((datetime.now(r["latest_source_ts"].tzinfo)
+                           - r["latest_source_ts"]).total_seconds() / 3600.0, 1)
+        ji = round((real - int(r["real_without_items"] or 0)) / real * 100.0, 3) if real else None
+        money_no_items = int(r["money_orders_without_items"] or 0)
+
+        reasons, category = [], None
+        if not int(r["order_rows"] or 0) or (reference == 0 and computed > 0):
+            category = "no_data"
+            reasons.append("no orders" if not int(r["order_rows"] or 0)
+                           else "no payment records to reconcile against")
+        if int(r["duplicate_order_ids"] or 0):
+            category = category or "integrity"
+            reasons.append(f"{int(r['duplicate_order_ids'])} duplicate order ids")
+        if missing_days:
+            category = category or "missing_ingestion"
+            reasons.append(f"{missing_days} of {expected_days} business days have no orders")
+        if lag_h is not None and lag_h > FRESHNESS_MAX_LAG_HOURS:
+            category = category or "stale_data"
+            reasons.append(f"newest order is {lag_h:.0f}h old")
+        if ji is not None and ji < 99.0:
+            category = category or "missing_ingestion"
+            reasons.append(f"only {ji:.2f}% of REAL orders have line items")
+        if dpct is not None and abs(dpct) > RECON_TOLERANCE_PCT:
+            reasons.append(f"sales reconciliation off by {dpct:+.2f}% (${delta:+,.2f}); "
+                           f"tolerance ±{RECON_TOLERANCE_PCT}%")
+            if category is None:
+                lk = linked.get(r["establishment_id"])
+                if money_no_items and abs(float(r["money_without_items_total"] or 0)) >= abs(delta) * 0.5:
+                    category = "missing_ingestion"
+                    reasons.append(f"{money_no_items} paid orders "
+                                   f"(${float(r['money_without_items_total']):,.2f}) have no "
+                                   "line items, so they are excluded from REAL sales")
+                elif lk is not None and computed and \
+                        abs(_pct(computed - lk, computed) or 0) <= RECON_TOLERANCE_PCT:
+                    category = "payment_timing"
+                    reasons.append(f"payments linked to these orders total ${lk:,.2f} "
+                                   f"(within tolerance of the orders), so the gap is "
+                                   "payments dated on another business day")
+                else:
+                    category = "reconciliation_mismatch"
+        passed = not reasons
+
+        labor_days = int(r["labor_days"] or 0)
+        lh = _f(r["labor_hours"])
+        open_shifts = int(r["open_shift_count"] or 0)
+        labor_ok = bool(lh) and labor_days >= expected_days and expected_days > 0
+        labor = {
+            "trusted": labor_ok,
+            "labor_hours": round(lh, 1) if (labor_ok and lh is not None) else None,
+            "days_with_labor": labor_days,
+            "expected_days": expected_days,
+            "open_shift_count": open_shifts,
+            "missing_wage_shift_count": int(r["missing_wage_shift_count"] or 0),
+            "reason": (None if labor_ok else
+                       f"labour recorded on {labor_days} of {expected_days} days"),
+        }
+        if labor_ok and open_shifts:
+            labor["coverage_note"] = (f"{open_shifts} shift(s) still open contribute no "
+                                      "hours, so labour_hours is understated")
+        stores.append({
+            "establishment_id": r["establishment_id"],
+            "store_name": r["store_name"],
+            "revel_status": "PASS" if passed else "FAIL",
+            "reconciliation_delta_pct_display": None if dpct is None else f"{dpct:+.2f}%",
+            "failure_category": category if not passed else None,
+            "failure_category_meaning": FAILURE_CATEGORIES.get(category) if not passed else None,
+            "failure_reasons": reasons,
+            "real_orders": real if passed else None,
+            "real_sales": round(computed, 2) if passed else None,
+            "labor": labor,
+            "orders_per_labor_hour": (round(real / lh, 2)
+                                      if passed and labor_ok and lh else None),
+            "orders_per_labor_hour_withheld": (
+                None if (passed and labor_ok) else
+                "transaction count is not verified for this store" if not passed
+                else "labour coverage is incomplete"),
+        })
+
+    ok = [s for s in stores if s["revel_status"] == "PASS"]
+    bad = [s for s in stores if s["revel_status"] == "FAIL"]
+    sub_orders = sum(s["real_orders"] for s in ok)
+    sub_hours = sum(s["labor"]["labor_hours"] or 0 for s in ok if s["labor"]["trusted"])
+    out = {
+        "period_start": period_start,
+        "period_end_exclusive": period_end,
+        "basis": _RECON_BASIS + "; each store reconciled on its own",
+        "tolerance_pct": RECON_TOLERANCE_PCT,
+        "stores_total": len(stores),
+        "stores_verified": len(ok),
+        "stores_failed": len(bad),
+        "all_stores_verified": not bad and bool(stores),
+        "failed_store_names": [s["store_name"] for s in bad],
+        "stores": stores,
+        "rules": (
+            "Each store has its OWN verdict. A network PASS does not verify any "
+            "individual store, and a network FAIL does not mean every store failed. "
+            "Report figures ONLY for stores with revel_status PASS; list every FAIL "
+            "store separately with its failure_category_meaning and failure_reasons, "
+            "and give NO transaction, sales or per-labour-hour figure for it. Labour "
+            "hours may be given for any store whose labor.trusted is true, with the "
+            "labour caveats. Never compute orders per labour hour yourself."),
+    }
+    if ok:
+        all_hours = all(s["labor"]["trusted"] for s in ok)
+        out["verified_stores_subtotal"] = {
+            "label": ("NETWORK TOTAL -- every store verified" if not bad else
+                      "SUBTOTAL OF THE %d VERIFIED STORES ONLY -- NOT a network total; "
+                      "excludes %s" % (len(ok), ", ".join(out["failed_store_names"]))),
+            "real_orders": sub_orders,
+            "real_sales": round(sum(s["real_sales"] for s in ok), 2),
+            "labor_hours": round(sub_hours, 1) if all_hours else None,
+            "orders_per_labor_hour": (round(sub_orders / sub_hours, 2)
+                                      if all_hours and sub_hours else None),
+        }
+    if cache is not None:
+        cache[key] = out
+    return out
 
 
 def meta_profile(establishment_id, period_start: str, period_end: str,
@@ -4634,6 +4992,26 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
     meta["blocking_reasons"] = fails
     meta["warnings"] = warns
     meta["analysis_permitted"] = not fails
+
+    if DOMAIN_REVEL in doms:
+        rec = meta.get("reconciliation") or {}
+        lab = meta.get("labor")
+        if rec.get("status") == "FAIL" and isinstance(lab, dict):
+            # The labour block's ratios divide by REAL orders / REAL sales,
+            # which this scope just failed to verify. Hours stay (they come
+            # from timesheets, not orders); the ratios must never be shown.
+            for k in ("orders_per_labor_hour", "sales_per_labor_hour", "labor_pct_sales"):
+                if k in lab:
+                    lab[k] = None
+            lab["ratios_withheld"] = ("Revel order reconciliation failed for this "
+                                      "scope, so ratios over its order counts or "
+                                      "sales are not shown")
+        if establishment_id is None and meta.get("scope_valid", True) is not False:
+            try:
+                meta["store_breakdown"] = revel_store_breakdown(
+                    period_start, period_end, cache=cache)
+            except psycopg2.Error as e:
+                meta["store_breakdown"] = {"error": str(e).strip()[:200]}
     meta["_profile_seconds"] = round(time.perf_counter() - t0, 3)
     meta["_cache"] = "computed"
     if cache is not None:
@@ -5398,6 +5776,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     if not meta["analysis_permitted"] and blocked is None:
                         blocked = blocked_domain_context(
                             meta, block.input.get("domains") or meta.get("domains"))
+                        _attach_store_breakdown(blocked, meta, scope_cache)
                         step["short_circuit"] = True
                     tool_results.append((block.id, json.dumps(
                         meta, default=str, separators=(",", ":")), False))
@@ -5485,6 +5864,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     if _gm is not None:
                         blocked = blocked_domain_context(_gm, _gm.get("domains"))
                         blocked["rejected_query_error"] = step["error"]
+                        if not _gm.get("analysis_permitted"):
+                            _attach_store_breakdown(blocked, _gm, scope_cache)
                         if _gm.get("analysis_permitted"):
                             # The source passed its gate; only this query was
                             # refused (e.g. missing date bounds). Earlier results
