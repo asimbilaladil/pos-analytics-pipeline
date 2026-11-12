@@ -354,3 +354,26 @@ def test_store_id_validation():
 
 def test_num_keeps_none():
     assert security.num(None) is None and security.num(0) == 0.0
+
+
+def test_hme_mapped_store_without_access_is_unavailable_with_reason(db):
+    # Mission Bend (25): VERIFIED-mapped, but the HME account no longer returns
+    # it. Katy (6) has current data. One must not hide or block the other.
+    db.hme_mapped = {6, 25}
+    db.hme = [hme_row(6, D0)]
+    no_access = ("HME NO ACCESS: LCF Mission Bend IS mapped to HME, but the HME account "
+                 "does not return this store at all; its latest loaded HME business date "
+                 "is 2026-10-13. Its drive-thru data is unavailable, not zero")
+    db.gate_for("hme", 25, gate(False, [no_access], hme={"store_status": [
+        {"establishment_id": 25, "latest_business_date": "2026-10-13",
+         "latest_result_date": "2026-11-11", "latest_result_status": "FAILED",
+         "latest_result_reason": "NO_ACCESS"}], "unreconciled_days": []}))
+    r = a.drive_thru_speed([6, 25], D0, D0, None)
+    s6 = next(s for s in r["stores"] if s["store_id"] == 6)
+    s25 = next(s for s in r["stores"] if s["store_id"] == 25)
+    assert s6["status"] == "ok" and s6["drive_thru_cars"] is not None
+    assert s25["status"] == "unavailable" and s25["reason"].startswith("HME NO ACCESS")
+    assert s25["avg_speed_of_service_seconds"] is None and s25["drive_thru_cars"] is None
+    assert s25["hme_latest_business_date"] == "2026-10-13"
+    assert s25["hme_latest_result"]["reason"] == "NO_ACCESS"
+    assert r["not_mapped_to_hme"] == [] and r["status"] == "partial"

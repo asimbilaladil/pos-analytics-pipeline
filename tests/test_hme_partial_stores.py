@@ -377,6 +377,26 @@ import mcp_server.analytics as A  # noqa: E402
 check("MCP drive-thru mapping comes from the maintained mapping, not 'has rows'",
       "v_hme_store_status_llm" in A._HME_MAPPED_SQL and "VERIFIED" in A._HME_MAPPED_SQL)
 
+# A broken HME read must never break a Revel answer (read-only, live).
+_hb = C._hme_block
+
+
+def _broken(cur, *a, **k):
+    cur.execute("SELECT 1 FROM hme_view_that_does_not_exist")
+
+
+C._hme_block = _broken
+try:
+    m = C.meta_extract(15, "2026-11-04", "2026-11-05")
+    check("Revel profile survives a failed HME read (savepoint), HME reported unknown",
+          m.get("reconciliation", {}).get("status") in ("PASS", "WARN", "FAIL")
+          and (m.get("hme") or {}).get("available") is None, str(m.get("hme"))[:120])
+except Exception as e:  # noqa: BLE001
+    check("Revel profile survives a failed HME read (savepoint), HME reported unknown",
+          False, f"{type(e).__name__}: {str(e)[:120]}")
+finally:
+    C._hme_block = _hb
+
 passed = sum(ok for _, ok, _ in results)
 print(f"\nHME partial stores: {passed} passed, {len(results) - passed} failed, {len(results)} total")
 sys.exit(0 if passed == len(results) else 1)

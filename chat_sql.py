@@ -3872,9 +3872,15 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 deep.update(dict(cur.fetchone()))
 
             _cohort_block = _cohort_context(establishment_id)
+            # A savepoint, because a failed HME read otherwise aborts the
+            # whole transaction and every later query in this Revel profile
+            # fails with it -- one HME problem must never break a Revel answer.
+            cur.execute("SAVEPOINT hme_ctx")
             try:
                 _hme = _hme_block(cur, establishment_id, period_start, period_end)
+                cur.execute("RELEASE SAVEPOINT hme_ctx")
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT hme_ctx")
                 # HME is additive context: if it cannot be read, the rest of the
                 # profile must still be produced. Never silently claim HME is
                 # absent -- say the status is unknown.
