@@ -618,7 +618,11 @@ SELECT d.establishment_id, d.business_date, d.drive_thru_cars, d.regular_cars,
    AND d.business_date >= %(start)s AND d.business_date < %(end)s
 """
 
-_HME_MAPPED_SQL = "SELECT DISTINCT establishment_id FROM v_hme_store_daily_llm"
+# Mapping comes from the maintained mapping (migration 61 view), not from
+# "has HME rows": a mapped store the account can no longer see must be
+# reported as unavailable with its reason, not as unmapped.
+_HME_MAPPED_SQL = ("SELECT establishment_id FROM v_hme_store_status_llm "
+                   "WHERE hme_mapping_status = 'VERIFIED'")
 
 HME_DEFINITIONS = {
     "avg_speed_of_service_seconds": (
@@ -689,8 +693,18 @@ def drive_thru_speed(ids: list[int], start: date, end: date, daypart) -> dict:
         st = "ok" if ok and len(days) == len(req_days) and rs else (
             "partial" if rs else "unavailable")
         statuses.append(st)
+        hme_st = next((x for x in (g.get("hme") or {}).get("store_status") or []
+                       if x.get("establishment_id") == i), {})
         stores.append({
             "store_id": i, "store_name": names[i], "status": st,
+            **({"reason": (reasons[0] if reasons else
+                           "no HME rows for this store in the requested period")}
+               if st == "unavailable" else {}),
+            "hme_latest_business_date": hme_st.get("latest_business_date"),
+            "hme_latest_result": ({"date": hme_st.get("latest_result_date"),
+                                   "status": hme_st.get("latest_result_status"),
+                                   "reason": hme_st.get("latest_result_reason")}
+                                  if hme_st else None),
             "daypart": "all (daily grain)",
             "avg_speed_of_service_seconds": wavg("lane_total_avg_seconds"),
             "avg_queue_seconds": wavg("lane_queue_avg_seconds"),

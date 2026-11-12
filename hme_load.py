@@ -32,13 +32,111 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ov
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "hme_load/1.4.0"
+LOADER_VERSION = "hme_load/1.5.0"
 RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 FORBIDDEN_KEYS = ("token", "id_token", "ctx_token", "cookie", "password", "authorization")
 
 
 class LoadAborted(Exception):
     pass
+
+
+# ── per-store grading (partial-store policy) ────────────────────────────────
+FACT_SETS = ("store_daily", "outliers_daily", "trend_store_daily", "goal_observations")
+_MISSING_REASON = {"NOT_VISIBLE": "NO_ACCESS", "NO_DATA": "NO_DATA"}
+
+
+def _is_empty_row(fact_set, r):
+    """A store row that carries no measure at all. Never written: an upsert of
+    it would overwrite a valid historical row with NULLs, and an empty row is
+    absence, not zero."""
+    keys = {
+        "store_daily": ("total_orders", "lane_total_avg_seconds", "lane_queue_avg_seconds"),
+        "outliers_daily": ("all_car_records", "car_departures", "total_outliers"),
+        "trend_store_daily": ("total_cars", "avg_time_seconds"),
+        "goal_observations": ("goal_a_seconds", "goal_b_seconds", "goal_c_seconds",
+                              "goal_d_seconds"),
+    }.get(fact_set, ())
+    return bool(keys) and all(r.get(k) is None for k in keys)
+
+
+def drop_empty_rows(doc):
+    """Remove measure-less rows from every fact set in place. Returns
+    {fact_set: [store numbers dropped]} for the run record."""
+    dropped = {}
+    for fs in FACT_SETS:
+        rows = doc["facts"].get(fs) or []
+        keep = [r for r in rows if not _is_empty_row(fs, r)]
+        gone = [str(r["hme_store_number"]) for r in rows if _is_empty_row(fs, r)]
+        if gone:
+            dropped[fs] = gone
+            doc["facts"][fs] = keep
+    return dropped
+
+
+def grade_stores(doc, mapping, establishments, recon):
+    """One result per Laynes establishment: SUCCESS / PARTIAL / SKIPPED / FAILED.
+
+    mapping: [{hme_store_number, revel_establishment_id, mapping_status}] (active)
+    establishments: [establishment_id] -- every Laynes store
+    recon: the reconcile() detail for the day.
+    Pure: no database access, so the policy is testable on its own.
+    """
+    present = {fs: {str(r["hme_store_number"]) for r in (doc["facts"].get(fs) or [])}
+               for fs in FACT_SETS}
+    missing_detail = {m["hme_store_number"]: m["reason"]
+                      for m in ((doc.get("completeness") or {})
+                                .get("missing_verified_detail") or [])}
+    per_store_mismatch = set()
+    day_failed = []
+    for c in recon.get("checks", []):
+        if c["ok"]:
+            continue
+        if c["check"] in ("trend_total_cars_matches_pa_total_orders_per_store",
+                          "goal_d_matches_pa_threshold"):
+            per_store_mismatch |= set(c.get("stores") or [])
+        else:
+            day_failed.append(c["check"])
+    verified = {m["revel_establishment_id"]: m for m in mapping
+                if (m["mapping_status"] or "").upper() == "VERIFIED"
+                and m["revel_establishment_id"] is not None}
+    out = []
+    for est in sorted(establishments):
+        m = verified.get(est)
+        if m is None:
+            out.append({"revel_establishment_id": est, "hme_store_number": None,
+                        "status": "SKIPPED", "reason_code": "UNMAPPED",
+                        "detail": {"note": "no VERIFIED HME mapping; never guessed"}})
+            continue
+        sn = str(m["hme_store_number"])
+        have = [fs for fs in FACT_SETS if sn in present[fs]]
+        if not have:
+            reason = _MISSING_REASON.get(missing_detail.get(sn), "NO_DATA")
+            out.append({"revel_establishment_id": est, "hme_store_number": sn,
+                        "status": "FAILED", "reason_code": reason,
+                        "detail": {"extractor_reason": missing_detail.get(sn)}})
+            continue
+        lacking = [fs for fs in FACT_SETS if fs not in have]
+        if lacking:
+            out.append({"revel_establishment_id": est, "hme_store_number": sn,
+                        "status": "PARTIAL", "reason_code": "FACT_SET_MISSING",
+                        "detail": {"missing_fact_sets": lacking}})
+        elif sn in per_store_mismatch or day_failed:
+            out.append({"revel_establishment_id": est, "hme_store_number": sn,
+                        "status": "PARTIAL", "reason_code": "RECONCILIATION_MISMATCH",
+                        "detail": {"store_check_failed": sn in per_store_mismatch,
+                                   "day_checks_failed": day_failed}})
+        else:
+            out.append({"revel_establishment_id": est, "hme_store_number": sn,
+                        "status": "SUCCESS", "reason_code": "OK", "detail": None})
+    return out
+
+
+def summarise_results(results):
+    by = {}
+    for r in results:
+        by.setdefault(r["status"], []).append(r["revel_establishment_id"])
+    return {k: sorted(v) for k, v in sorted(by.items())}
 
 
 def connect():
@@ -98,6 +196,7 @@ def reconcile(doc):
     add("trend_total_cars_matches_pa_total_orders_per_store",
         not mismatch, len(mismatch), 0,
         None if not mismatch else f"stores differing: {mismatch[:5]}")
+    checks[-1]["stores"] = sorted(mismatch)
 
     # 4. Regular + Disastrous vs Total -- recorded, never corrected
     delta = (tot.get("total_orders") or 0) - ((tot.get("regular_orders") or 0)
@@ -118,6 +217,7 @@ def reconcile(doc):
             and sd[s]["lane_total_goal_d_seconds"] != goals[s]["goal_d_seconds"]]
     add("goal_d_matches_pa_threshold", not gmis, len(gmis), 0,
         None if not gmis else f"stores differing: {gmis[:5]}")
+    checks[-1]["stores"] = sorted(gmis)
 
     ok = all(c["ok"] for c in checks)
     return ok, {"checks": checks, "warnings": warnings}
@@ -274,7 +374,7 @@ def apply_goal_observation(cur, obs, obs_date, run_id):
     return _close_and_open(cur, sn, obs_date, vals, run_id)
 
 
-def load(doc, conn, dry_run=False):
+def load(doc, conn, dry_run=False, allow_partial_stores=False):
     date = doc["business_date"]
     if doc["business_date"] != doc["requested_date"]:
         raise LoadAborted("business_date != requested_date; date provenance broken")
@@ -283,10 +383,16 @@ def load(doc, conn, dry_run=False):
     assert_no_secrets(doc)
 
     cur = conn.cursor()
-    cur.execute("""SELECT hme_store_number, hme_store_name, mapping_status
+    cur.execute("""SELECT hme_store_number, hme_store_name, mapping_status,
+                          revel_establishment_id
                    FROM hme_store_mapping WHERE active""")
-    inv = {r[0]: {"hme_store_name": r[1], "mapping_status": r[2]} for r in cur.fetchall()}
+    map_rows = cur.fetchall()
+    inv = {r[0]: {"hme_store_name": r[1], "mapping_status": r[2]} for r in map_rows}
+    mapping = [{"hme_store_number": r[0], "mapping_status": r[2],
+                "revel_establishment_id": r[3]} for r in map_rows]
     known = set(inv)
+    # Measure-less rows are absence: drop them before anything counts them.
+    dropped_empty = drop_empty_rows(doc)
 
     payload_stores = set()
     for rows in doc["facts"].values():
@@ -306,7 +412,20 @@ def load(doc, conn, dry_run=False):
     missing = sorted(known - payload_stores)
     missing_verified = [n for n in missing
                         if (inv[n]["mapping_status"] or "").upper() == "VERIFIED"]
-    if missing_verified:
+    graded = {m["hme_store_number"] for m in ((doc.get("completeness") or {})
+                                             .get("missing_verified_detail") or [])}
+    verified_present = [n for n in payload_stores
+                        if (inv[n]["mapping_status"] or "").upper() == "VERIFIED"]
+    if missing_verified and allow_partial_stores and not verified_present:
+        raise LoadAborted("no VERIFIED store present in the extract; an account-wide "
+                          "failure is never loaded as a partial day")
+    # Partial policy: a missing VERIFIED store is accepted ONLY when the
+    # extractor graded it, or when its only rows were measure-less and dropped
+    # here. Anything unexplained still refuses the day.
+    unexplained = [n for n in missing_verified
+                   if n not in graded
+                   and not any(n in v for v in dropped_empty.values())]
+    if missing_verified and (not allow_partial_stores or unexplained):
         raise LoadAborted(
             f"{len(missing_verified)} VERIFIED store(s) absent from the extract "
             f"-> {missing_verified}; refusing to load a day that cannot represent "
@@ -331,6 +450,9 @@ def load(doc, conn, dry_run=False):
             1 for n in payload_stores
             if (inv[n]["mapping_status"] or "").upper() == "OUT_OF_SCOPE"),
         "complete": not missing,
+        "missing_verified_detail": (doc.get("completeness") or {}).get(
+            "missing_verified_detail") or [],
+        "empty_rows_dropped": dropped_empty,
     }
 
     # The extractor's own freshness verdict is honoured here too: an incomplete
@@ -457,7 +579,23 @@ def load(doc, conn, dry_run=False):
     #   reconciliation_ok = false -> 'partial'
     # (Previously both branches returned 'succeeded' -- a no-op conditional that
     # let the 2026-09-16 Trend/PA divergence be recorded as a clean success.)
-    final_status = "succeeded" if (recon_ok and completeness["complete"]) else "partial"
+    cur.execute("SELECT id FROM establishments")
+    est_ids = [r[0] for r in cur.fetchall()]
+    store_results = grade_stores(doc, mapping, est_ids, recon)
+    psycopg2.extras.execute_batch(cur, """
+        INSERT INTO hme_store_ingest_result (run_id, business_date, revel_establishment_id,
+            hme_store_number, status, reason_code, detail)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, [(run_id, date, r["revel_establishment_id"], r["hme_store_number"], r["status"],
+           r["reason_code"], json.dumps(r["detail"]) if r["detail"] is not None else None)
+          for r in store_results])
+    store_failed = [r for r in store_results if r["status"] in ("FAILED", "PARTIAL")]
+
+    final_status = ("succeeded" if (recon_ok and completeness["complete"] and not store_failed)
+                    else "partial")
+    if store_failed:
+        recon["warnings"].append(
+            "run marked PARTIAL: per-store results " + json.dumps(summarise_results(store_results)))
     if not recon_ok:
         failed_checks = [c["check"] for c in recon["checks"] if not c["ok"]]
         recon["warnings"].append(
@@ -487,7 +625,7 @@ def load(doc, conn, dry_run=False):
             "goal_rows": goal_written, "goal_stats": goal_stats,
             "reconciliation_ok": recon_ok, "reconciliation": recon,
             "status": final_status, "completeness": completeness,
-            "store_count": len(payload_stores)}
+            "store_count": len(payload_stores), "store_results": store_results}
 
 
 def main():
