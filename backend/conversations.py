@@ -61,12 +61,15 @@ def messages(conversation_id, user_id, with_model: bool = False):
         )
         return [{"role": r["role"], "content": r["content"], "model": r["model"]}
                 for r in rows]
+    # created_at goes to the chat engine, which dates each earlier turn
+    # (chat_sql.annotate_history) and strips it before the provider call.
     rows = query(
-        "SELECT role, content FROM chat_messages WHERE conversation_id = %s "
+        "SELECT role, content, created_at FROM chat_messages WHERE conversation_id = %s "
         "ORDER BY created_at, id",
         (conversation_id,),
     )
-    return [{"role": r["role"], "content": r["content"]} for r in rows]
+    return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]}
+            for r in rows]
 
 
 def add_message(conversation_id, role, content):

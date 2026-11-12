@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import anthropic  # noqa: F401  (tests patch chat_sql.anthropic.Anthropic)
@@ -315,8 +315,12 @@ METRIC DEFINITIONS — use these exact sources:
   "busiest hour"                     -> peak_hour (0..23 local) / peak_hour_orders
   "network" / "company-wide" / "all locations" -> SUM across all establishment_id
 
-DATE LANGUAGE (America/Chicago, today given below):
-  "yesterday"  -> date = current_date - 1
+DATE LANGUAGE (America/Chicago, today given below). Below, "today" and
+"current_date" mean the literal today date under CURRENT TIME -- never SQL
+current_date, which runs in UTC:
+  "today"      -> the literal today date (America/Chicago); the day is still in
+                  progress, so its figures are so-far, not a full day
+  "yesterday"  -> the literal yesterday date under CURRENT TIME
   "last week"  -> the most recently COMPLETED Thu..Wed business week
   "this week"  -> current Thu..Wed week to date
   "week to date" / "WTD" -> Thursday of the current business week .. today
@@ -785,6 +789,18 @@ TIME — one contract, and it is not the database's clock:
     maintained definition. If asked about a daypart, give the hourly numbers,
     state that no verified daypart mapping exists, and ask which hours they
     mean.
+  * "TODAY" / "MY PRIORITIES TODAY" / "HOW ARE WE DOING" are about NOW, not a
+    trailing week. Check the today date (so far) and yesterday (the latest
+    complete Chicago day) as their own scopes, from CURRENT Revel data and
+    labour where they pass their gates. Use R365 ONLY for dates R365 has
+    actually loaded (latest_daily_date) and label them with their date.
+  * EVERY FIGURE CARRIES ITS SOURCE AND BUSINESS DATE ("Revel, Tue 2026-11-10",
+    "R365, Wed 2026-11-04"). NEVER describe an older date as today, yesterday
+    or "this week" -- a week-old R365 day is "the latest R365 day loaded
+    (Nov 4)", not today's result.
+  * A STALE OR FAILED SOURCE IS REPORTED, NOT A REASON TO STOP. If HME (or R365)
+    fails its gate while Revel/labour pass, say so separately, once, with its
+    latest available date, and answer from the sources that passed.
 """
 
 PAYMENT_RULES = """\
@@ -857,6 +873,10 @@ DATA TRUST GATE — enforced by the server, not by you:
     verified_stores_subtotal, quoted with its label -- never call it the
     network total unless all_stores_verified is true. Asking for named stores
     is not shopping for a scope: check each named store on its own.
+  * EACH SOURCE HAS ITS OWN VERDICT (domain_verdicts). When check_data returns
+    partial_trust, some sources failed and others passed: keep answering from
+    the trusted_domains, never query the untrusted_domains (the server rejects
+    it), and report each failed source separately with its reason.
   * LABOUR HOURS ARE INDEPENDENT OF THE ORDER RECONCILIATION. When labour is
     trusted, report its hours even if the store's Revel reconciliation failed,
     with the labour caveats -- but never a transactions- or sales-per-labour-
@@ -1036,6 +1056,23 @@ SOURCE AUTHORITY:
     mix it with estimated_labor_cost in one number.
   * Other questions that do not name R365 (plain sales, orders, AOV, items,
     drive-thru) keep their existing source. Do not switch them to R365 unasked.
+
+CASH METRICS -- four DIFFERENT figures (all R365, v_r365_store_daily_llm,
+store x day). Never substitute one for another, and never present one under
+another's name:
+  * ACTUAL CASH DEPOSIT = total_deposit: what the store recorded as deposited.
+    A "cash deposit" question is answered with this column and nothing else.
+  * EXPECTED CASH = expected_cash: the cash the POS says should be on hand
+    (daily rows only; there is no weekly expected_cash).
+  * CASH OVER/SHORT = over_short: the difference between counted and expected
+    cash. It is a variance, never a deposit.
+  * PAID IN / PAID OUT = paid_in / paid_out: cash put into / taken out of the
+    drawer outside sales (e.g. petty cash). They are neither deposits nor sales.
+  Revel CANNOT supply any of these: its payment type codes have no verified
+  names, so no Revel amount may be called cash (see PAYMENTS). When the
+  requested date is not yet loaded in R365, say which date IS the latest loaded
+  (latest_daily_date) and when the next load runs; you may offer Revel payment
+  totals by raw payment type code, labelled as codes, never as cash.
 
 R365 DOES NOT HAVE menu items, hours/dayparts, individual orders or individual
 employees. Its finest grain is store x DAY. Asked for R365 by item, by hour or
@@ -1711,7 +1748,10 @@ HME rules — these are not stylistic, they change what is true:
     intervention, say "associated with" or "coincided with". Do not write
     "low staffing caused slower drive-thru" or similar.
   * A store with no VERIFIED HME mapping has no HME data at all. Say it is not
-    mapped to HME — not that it had zero cars or poor performance.
+    mapped to HME — not that it had zero cars or poor performance. ONLY say a
+    store is unmapped when its reason starts "HME NOT MAPPED". "HME DATA NOT
+    LOADED" means the store IS mapped and ingestion is behind: say that, and
+    give the latest loaded HME business date from the reason.
   * HME FRESHNESS IS SCHEDULE-BASED, NOT CALENDAR-BASED. business_date is the
     previous COMPLETED Chicago day and is ingested the NEXT morning at 05:30
     America/Chicago, so being one day behind is structural and two days behind
@@ -1756,6 +1796,57 @@ _CHICAGO = ZoneInfo("America/Chicago")
 def chicago_now() -> datetime:
     """Wall-clock now in the stores' timezone, never the server's."""
     return datetime.now(_CHICAGO)
+
+
+HISTORY_STAMP_PREFIX = "[Asked "
+
+
+def annotate_history(history, now: datetime | None = None) -> tuple[list, str | None]:
+    """Date earlier turns so the model knows WHEN they were said.
+
+    History used to reach the model as bare role/content. In conversation 627
+    a thread resumed seven days later still carried "yesterday (2026-11-03)"
+    and "R365 is loaded through Oct 28" with nothing saying those were old.
+    Each earlier USER turn is prefixed with its America/Chicago send time
+    (assistant text is left untouched so the model does not learn to emit the
+    stamp). Returns (plain role/content list, resume note or None); the note
+    is set when the latest earlier turn is from an earlier Chicago date.
+    Entries without created_at (MCP passes no history) are left as they are.
+    """
+    now = now or chicago_now()
+    out, latest = [], None
+    for m in history or []:
+        content = m["content"]
+        ts = m.get("created_at")
+        if isinstance(ts, datetime):
+            local = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(_CHICAGO)
+            latest = local if latest is None or local > latest else latest
+            if m["role"] == "user" and isinstance(content, str):
+                content = (f"{HISTORY_STAMP_PREFIX}{local:%a %Y-%m-%d %H:%M} "
+                           f"America/Chicago] {content}")
+        out.append({"role": m["role"], "content": content})
+    if latest is None or latest.date() >= now.date():
+        return out, None
+    days = (now.date() - latest.date()).days
+    note = (
+        f"CONVERSATION RESUMED: the previous turn in this conversation was on "
+        f"{latest:%A %Y-%m-%d} ({days} day{'s' if days != 1 else ''} before today, "
+        f"{now.date()}). Earlier turns are dated with [Asked ...] stamps added by "
+        f"the application -- never repeat those stamps. Everything earlier turns "
+        f"said about data availability, freshness, coverage, loaded weeks or "
+        f"'today'/'yesterday' was true ONLY on the date it was said and is NOT "
+        f"evidence about today. Resolve relative dates from CURRENT TIME below, "
+        f"and re-check availability with check_data before repeating or relying "
+        f"on any earlier availability statement or refusal.")
+    return out, note
+
+
+RESUME_RECHECK_PROMPT = (
+    "Before answering: this conversation resumed after a gap, and earlier "
+    "answers about what data was loaded are out of date. If your answer depends "
+    "on data availability or on any figure, call check_data (and run_sql) for "
+    "the dates you are answering about now. If it truly needs no data, give the "
+    "same answer again.")
 
 
 def _system_today() -> str:
@@ -4508,6 +4599,38 @@ def _light_scope(cur, establishment_id, period_start, period_end) -> dict:
     }
 
 
+def hme_unavailable_reason(hme: dict, period_start: str, period_end: str) -> str:
+    """Why HME has no rows for a scope -- unmapped store vs missing ingestion.
+
+    The old single sentence ("a store with no VERIFIED HME mapping has none at
+    all") was given for Shepherd during the Oct-Nov 2026 HME outage, so the
+    assistant told the user a mapped store was unmapped. A store is unmapped
+    only when it is listed in unmapped_establishments; otherwise the store IS
+    mapped and the data simply has not been ingested for the period.
+    """
+    cov = hme.get("mapped_store_coverage") or {}
+    unmapped = cov.get("unmapped_establishments") or []
+    in_scope = cov.get("revel_establishments_in_scope")
+    latest = hme.get("latest_business_date") or "none"
+    status = hme.get("freshness_status")
+    if unmapped and in_scope is not None and len(unmapped) >= in_scope:
+        return ("HME NOT MAPPED: this store has no VERIFIED HME mapping, so it has "
+                "no HME drive-thru data at all (not zero cars)")
+    end_incl = period_end
+    try:
+        end_incl = (date.fromisoformat(period_end) - timedelta(days=1)).isoformat()
+    except (TypeError, ValueError):
+        pass
+    reason = (f"HME DATA NOT LOADED for {period_start}..{end_incl}: the store IS "
+              f"mapped to HME, but HME ingestion has no rows for this period; the "
+              f"latest loaded HME business date is {latest}")
+    if status:
+        reason += f" (HME freshness_status {status})"
+    if unmapped:
+        reason += f"; establishments {unmapped} are separately not mapped to HME"
+    return reason
+
+
 def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list]:
     """HME's own trust gate. Returns (fails, warns).
 
@@ -4520,8 +4643,7 @@ def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list
         fails.append("HME availability could not be determined for this period")
         return fails, warns
     if not hme.get("available"):
-        fails.append("no HME drive-thru data exists for this store and period "
-                     "(a store with no VERIFIED HME mapping has none at all)")
+        fails.append(hme_unavailable_reason(hme, period_start, period_end))
         return fails, warns
 
     days = hme.get("per_day") or []
@@ -4866,6 +4988,93 @@ def revel_store_breakdown(period_start: str, period_end: str, cache: dict | None
     return out
 
 
+def _domain_verdicts(doms, per_domain: dict, common_fails: list, meta: dict) -> dict:
+    """{domain: {"trusted", "reasons"}} from each source's OWN gate.
+
+    Identity is derived from Revel orders, so it shares Revel's verdict.
+    Labour on the Revel path is advisory (never blocks); its trust comes from
+    the block's data contract, as in _labor_trust."""
+    out = {}
+    for d in sorted(doms):
+        if d == DOMAIN_IDENTITY:
+            reasons = list(common_fails) + list(per_domain.get(DOMAIN_REVEL, []))
+        elif d == DOMAIN_LABOR and DOMAIN_LABOR not in per_domain:
+            lt = _labor_trust(meta.get("labor") or {})
+            reasons = list(common_fails) + ([lt["reason"]] if not lt["trusted"] else [])
+            out[d] = {"trusted": not reasons, "reasons": reasons, "advisory": True}
+            continue
+        else:
+            reasons = list(common_fails) + list(per_domain.get(d, []))
+        out[d] = {"trusted": not reasons, "reasons": reasons}
+    return out
+
+
+def _trusted_source_seen(scope_cache: dict, failed: set) -> bool:
+    """True when a source OTHER than `failed` already passed its own gate in
+    this turn -- evidence that the question has a trusted side to answer from,
+    so one failed source must not end the turn. Revel failures never qualify
+    (callers exclude them): they keep the per-store verdict path."""
+    for k, m in scope_cache.items():
+        if not (isinstance(k, tuple) and len(k) == 4) or not isinstance(m, dict):
+            continue
+        for d, v in (m.get("domain_verdicts") or {}).items():
+            if d not in failed and v.get("trusted") and not v.get("advisory"):
+                return True
+    return False
+
+
+# A check_data verdict that fails only some sources lets the turn continue on
+# the sources that passed. Bounded so the model cannot probe scope after scope.
+PARTIAL_TRUST_LIMIT = 3
+
+
+def partial_trust_context(meta: dict, requested_domains) -> dict | None:
+    """When some requested sources failed their own gate and others passed,
+    the instruction that lets the turn continue on the trusted ones.
+
+    Returns None -- keep the existing blocked path -- when no requested source
+    passed, or when Revel itself failed: a Revel failure goes through the
+    per-store verdict path (_attach_store_breakdown), which already reports
+    trusted labour and R365 figures. Nothing here changes a gate: every SQL
+    statement is still reconciled by enforce_scope against the sources IT
+    reads, so a query touching an untrusted source is rejected regardless.
+    """
+    verdicts = meta.get("domain_verdicts") or {}
+    doms = sorted(normalise_domains(requested_domains)) if requested_domains else sorted(verdicts)
+    doms = [d for d in doms if d in verdicts]
+    trusted = [d for d in doms if verdicts[d]["trusted"]]
+    untrusted = [d for d in doms if not verdicts[d]["trusted"]
+                 and not verdicts[d].get("advisory")]
+    if not trusted or not untrusted:
+        return None
+    if DOMAIN_REVEL in untrusted or DOMAIN_IDENTITY in untrusted:
+        return None
+    out = {
+        "trusted_domains": trusted,
+        "untrusted_domains": untrusted,
+        "untrusted_reasons": {d: verdicts[d]["reasons"] for d in untrusted},
+        "instruction": (
+            "PARTIAL TRUST -- each source is judged on its own. "
+            + ", ".join(untrusted) + " FAILED its trust gate for this scope "
+            "(see untrusted_reasons); " + ", ".join(trusted) + " PASSED. "
+            "Continue the analysis with the trusted sources: run SQL against "
+            "them as usual. Do NOT query the failed source(s) -- any statement "
+            "reading them is rejected before it runs -- and do not retry them "
+            "for other dates or stores. In the answer, report each failed "
+            "source separately, once, with its reason and its latest available "
+            "date, and do not let it stop the analysis of the trusted sources."),
+    }
+    if DOMAIN_HME in untrusted:
+        h = meta.get("hme") or {}
+        out["hme_status"] = {
+            "latest_business_date": h.get("latest_business_date"),
+            "freshness_status": h.get("freshness_status"),
+            "freshness_reason": h.get("freshness_reason"),
+            "next_ingest_window": h.get("next_ingest_window"),
+        }
+    return out
+
+
 def meta_profile(establishment_id, period_start: str, period_end: str,
                  domains=None, cache=None) -> dict:
     """Domain-aware completeness/trust profile.
@@ -4889,11 +5098,18 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
         return meta
 
     t0 = time.perf_counter()
+    # Each requested source's OWN gate result. blocking_reasons / analysis_
+    # permitted stay the conjunction (enforce_scope still needs every source a
+    # query reads to pass); domain_verdicts lets the answer loop keep using the
+    # sources that passed when an unrelated one fails.
+    per_domain: dict = {}
+    common_fails: list = []
     if DOMAIN_REVEL in doms:
         # Full legacy path: every Revel check, unchanged.
         meta = meta_extract(establishment_id, period_start, period_end)
         fails = list(meta.get("blocking_reasons") or [])
         warns = list(meta.get("warnings") or [])
+        per_domain[DOMAIN_REVEL] = list(fails)
     else:
         conn = _ro_conn()
         try:
@@ -4916,6 +5132,7 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
         fails, warns = [], []
         if not meta.get("scope_valid"):
             fails.append("the requested period is empty or inverted")
+            common_fails.extend(fails)
 
     if DOMAIN_HME in doms:
         if meta.get("hme") is None:
@@ -4931,6 +5148,7 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
                 conn.close()
         hf, hw = _hme_gate(meta["hme"], period_start, period_end)
         fails += hf
+        per_domain[DOMAIN_HME] = hf
         warns += hw
 
     if DOMAIN_R365 in doms:
@@ -4948,6 +5166,7 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
                 conn.close()
         rf, rw = _r365_gate(meta["r365"])
         fails += rf
+        per_domain[DOMAIN_R365] = rf
         warns += rw
 
     if DOMAIN_R365_FIN in doms:
@@ -4965,6 +5184,7 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
                 conn.close()
         ff, fw = _r365_fin_gate(meta["r365_financial"])
         fails += ff
+        per_domain[DOMAIN_R365_FIN] = ff
         warns += fw
 
     if DOMAIN_R365_FIN_DETAIL in doms:
@@ -4980,18 +5200,21 @@ def meta_profile(establishment_id, period_start: str, period_end: str,
             conn.close()
         df, dw = _r365_fin_detail_gate(meta["r365_financial_detail"])
         fails += df
+        per_domain[DOMAIN_R365_FIN_DETAIL] = df
         warns += dw
 
     if DOMAIN_LABOR in doms and DOMAIN_REVEL not in doms:
         lb, lf, lw = _labor_gate(establishment_id, period_start, period_end)
         meta["labor"] = lb
         fails += lf
+        per_domain[DOMAIN_LABOR] = lf
         warns += lw
 
     meta["domains"] = sorted(doms)
     meta["blocking_reasons"] = fails
     meta["warnings"] = warns
     meta["analysis_permitted"] = not fails
+    meta["domain_verdicts"] = _domain_verdicts(doms, per_domain, common_fails, meta)
 
     if DOMAIN_REVEL in doms:
         rec = meta.get("reconciliation") or {}
@@ -5061,6 +5284,9 @@ def _scope_facts(stmt) -> dict:
 
     walk(stmt)
     return {"dates": dates, "establishment_ids": ests, "relative_dates": relative}
+
+
+SCOPE_STOP_SENTENCE = ". Report this to the user and stop -- do not analyse this period."
 
 
 class ScopeError(SqlError):
@@ -5143,8 +5369,7 @@ def enforce_scope(sql: str, establishment_id, period_start, period_end,
         raise ScopeError(
             "the data for this scope did not pass the "
             + "/".join(sorted(doms)) + " trust gate, so the query was not run: "
-            + "; ".join(meta["blocking_reasons"])
-            + ". Report this to the user and stop -- do not analyse this period.")
+            + "; ".join(meta["blocking_reasons"]) + SCOPE_STOP_SENTENCE)
     return meta
 
 
@@ -5676,7 +5901,11 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         model, [CHECK_DATA_TOOL, RUN_SQL_TOOL],
         anthropic_timeout=ANTHROPIC_TIMEOUT_SECONDS,
         anthropic_max_retries=ANTHROPIC_MAX_RETRIES)
+    history, resume_note = annotate_history(history)
     messages: list = provider.start(history, question, attachments)
+    # A resumed conversation gets at most one nudge to re-check data before
+    # answering from memory of the earlier turns.
+    resume_nudge_pending = resume_note is not None
 
     steps: list[dict] = []
     final_text = ""
@@ -5690,6 +5919,10 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     # more model call, without tools, to explain the verdict -- instead of
     # letting the model probe scope after scope for a usable one.
     blocked: dict | None = None
+    # Sources that failed while others passed (partial_trust_context): the turn
+    # continues on the trusted ones, and these stay unqueryable.
+    partial_untrusted: set = set()
+    partial_events = 0
     last_meta: list[dict] = []              # first gated scope, for the answer
 
     system = [
@@ -5697,6 +5930,8 @@ def answer_question(history: list[dict], question: str, model: str | None = None
          "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": _system_today()},
     ]
+    if resume_note:
+        system.append({"type": "text", "text": resume_note})
     # FINANCIAL_WASTE_REVIEW: a fixed window, three set-based queries and a hard
     # run_sql budget instead of open-ended exploration.
     review = None
@@ -5725,6 +5960,18 @@ def answer_question(history: list[dict], question: str, model: str | None = None
         _timing(timings, f"{provider.call_label}[{_loop}]",
                 time.perf_counter() - _t)
 
+        if (turn.stop != "tool_use" and resume_nudge_pending and not steps
+                and not turn.truncated):
+            # Resumed thread, and the model answered without checking any data:
+            # once, ask it to re-check rather than reuse an old availability
+            # claim. It may still answer as-is if no data is involved.
+            resume_nudge_pending = False
+            provider.add_assistant(messages, turn)
+            messages.append({"role": "user", "content": RESUME_RECHECK_PROMPT})
+            steps.append({"sql": None, "row_count": None, "error": None,
+                          "resume_recheck": True})
+            continue
+        resume_nudge_pending = False
         if turn.stop != "tool_use":
             final_text = turn.text
             # max_tokens: the output budget ran out -- with thinking/reasoning
@@ -5773,13 +6020,26 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     _timing(timings, "check_data["
                             + ",".join(meta.get("domains") or []) + ","
                             + str(meta.get("_cache")) + "]", step["seconds"])
+                    payload_meta = meta
                     if not meta["analysis_permitted"] and blocked is None:
-                        blocked = blocked_domain_context(
-                            meta, block.input.get("domains") or meta.get("domains"))
-                        _attach_store_breakdown(blocked, meta, scope_cache)
-                        step["short_circuit"] = True
+                        req = block.input.get("domains") or meta.get("domains")
+                        partial = (partial_trust_context(meta, req)
+                                   if partial_events < PARTIAL_TRUST_LIMIT else None)
+                        if partial is not None:
+                            # Some sources passed: keep going on those. The
+                            # failed ones stay unqueryable (enforce_scope).
+                            partial_events += 1
+                            partial_untrusted.update(partial["untrusted_domains"])
+                            payload_meta = dict(meta, partial_trust=partial)
+                            step["partial_trust"] = {
+                                "trusted": partial["trusted_domains"],
+                                "untrusted": partial["untrusted_domains"]}
+                        else:
+                            blocked = blocked_domain_context(meta, req)
+                            _attach_store_breakdown(blocked, meta, scope_cache)
+                            step["short_circuit"] = True
                     tool_results.append((block.id, json.dumps(
-                        meta, default=str, separators=(",", ":")), False))
+                        payload_meta, default=str, separators=(",", ":")), False))
                 except (psycopg2.Error, KeyError, ValueError) as e:
                     step["error"] = str(e).strip()
                     tool_results.append((block.id, f"ERROR: {step['error']}", True))
@@ -5861,6 +6121,29 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                          block.input.get("period_start"),
                          block.input.get("period_end_exclusive"),
                          tuple(sorted(domains_for_relations(_relations_in(sql))))))
+                    _failed = ({d for d, v in (_gm.get("domain_verdicts") or {}).items()
+                                if not v["trusted"] and not v.get("advisory")}
+                               if _gm is not None and not _gm.get("analysis_permitted")
+                               else set())
+                    if (_failed and partial_events < PARTIAL_TRUST_LIMIT
+                            and not _failed & {DOMAIN_REVEL, DOMAIN_IDENTITY}
+                            and ((partial_untrusted and _failed <= partial_untrusted)
+                                 or _trusted_source_seen(scope_cache, _failed))):
+                        # A source already reported as failed was queried
+                        # anyway. Refuse that statement only; the trusted
+                        # sources stay usable for the rest of the turn.
+                        partial_events += 1
+                        step["partial_trust_rejection"] = sorted(_failed)
+                        _why = step["error"].replace(SCOPE_STOP_SENTENCE, ".")
+                        tool_results.append((block.id, (
+                            "REJECTED BEFORE EXECUTION (this statement only): " + _why
+                            + " " + ", ".join(sorted(_failed)) + " failed its own "
+                            "trust gate; other sources are judged separately. Do not "
+                            "query " + ", ".join(sorted(_failed)) + " again in this "
+                            "turn; continue with the sources that pass and report the "
+                            "failed source separately, once, with its reason."), True))
+                        steps.append(step)
+                        continue
                     if _gm is not None:
                         blocked = blocked_domain_context(_gm, _gm.get("domains"))
                         blocked["rejected_query_error"] = step["error"]
