@@ -47,7 +47,7 @@ CHICAGO = ingest.CHICAGO
 LOG_DIR = ingest.LOG_DIR
 LOCK_PATH = ingest.LOCK_PATH
 ENV_FILE = ingest.ENV_FILE
-RETRY_VERSION = "hme_reconciliation_retry/1.0.0"
+RETRY_VERSION = "hme_reconciliation_retry/1.1.0"
 
 EXIT_OK = ingest.EXIT_OK
 EXIT_HARD_FAILURE = ingest.EXIT_HARD_FAILURE
@@ -112,6 +112,15 @@ def latest_run(conn, business_date):
                               AND m.active)""", (business_date,))
     unexpected = cur.fetchone()[0]
 
+    # VERIFIED stores the run itself graded NO_ACCESS: the account cannot see
+    # them, so they are a known, separately-alerted condition -- not a reason
+    # to withhold a reconciliation retry for the stores that did return.
+    cur.execute("""
+        SELECT count(*) FROM hme_store_ingest_result
+         WHERE run_id = %s AND status = 'FAILED' AND reason_code = 'NO_ACCESS'
+    """, (rec["run_id"],))
+    no_access = cur.fetchone()[0]
+
     rec["completeness_detail"] = {
         "verified_observed_count": v_obs,
         "verified_expected_count": v_exp,
@@ -119,6 +128,7 @@ def latest_run(conn, business_date):
         "expected_store_count": total_exp,
         "missing_mapping_statuses": missing_statuses,
         "unexpected_store_count": unexpected,
+        "no_access_verified_count": no_access,
     }
     return rec
 
@@ -153,7 +163,8 @@ def assess_retry_eligibility(run, *, verified_expected=None):
     v_exp = c.get("verified_expected_count", verified_expected)
     if v_obs is None or v_exp is None:
         return False, "VERIFIED coverage unknown: fail closed"
-    if v_obs != v_exp:
+    no_access = c.get("no_access_verified_count") or 0
+    if v_obs != v_exp and (v_exp - v_obs) != no_access:
         return False, (f"VERIFIED coverage {v_obs}/{v_exp} is incomplete: "
                        "a missing VERIFIED store needs attention, not a retry")
 
@@ -162,6 +173,9 @@ def assess_retry_eligibility(run, *, verified_expected=None):
                        "allowlist are present: security concern, never retried")
 
     missing = set(c.get("missing_mapping_statuses") or [])
+    if no_access and v_exp - v_obs == no_access:
+        # Every missing VERIFIED store is a graded NO_ACCESS store.
+        missing.discard("VERIFIED")
     if missing - {"OUT_OF_SCOPE"}:
         return False, (f"missing stores include non-OUT_OF_SCOPE {sorted(missing)}: "
                        "fail closed")
@@ -252,7 +266,8 @@ def main():
 
             conn = hme_load.connect()
             try:
-                res = hme_load.load(doc, conn, dry_run=args.dry_run)
+                res = hme_load.load(doc, conn, dry_run=args.dry_run,
+                                    allow_partial_stores=ingest.PARTIAL_STORES)
             except hme_load.LoadAborted as e:
                 conn.rollback()
                 say(f"retry load aborted: {e}")
@@ -285,7 +300,7 @@ def main():
             if not res["reconciliation_ok"]:
                 say("retry did NOT reconcile; mismatches above. Status stays partial.")
                 return EXIT_RECONCILIATION_FAILED
-            return ingest.classify_partial_exit(res, log=say)
+            return ingest.classify_store_results(res, log=say)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()

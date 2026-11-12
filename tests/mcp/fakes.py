@@ -50,7 +50,9 @@ class FakeDB:
 
         def pick(rows):
             return [r for r in rows if r["establishment_id"] in ids]
-        if "DISTINCT establishment_id FROM v_hme_store_daily_llm" in sql:
+        if ("DISTINCT establishment_id FROM v_hme_store_daily_llm" in sql
+                or "FROM v_hme_store_status_llm" in sql):
+            # The maintained HME mapping (VERIFIED establishments).
             return [{"establishment_id": i} for i in self.hme_mapped]
         if "FROM v_orders_classified" in sql:
             return pick(self.revel)

@@ -1718,6 +1718,13 @@ v_hme_day_completeness_llm — one row per business_date
     status, source_complete, reconciliation_ok, observed/expected_store_count,
     verified_observed/expected_count, counts_consistent
 
+v_hme_store_status_llm     — one row per Laynes establishment (no scope needed)
+    establishment_id, store_name, hme_mapping_status (VERIFIED / UNMAPPED),
+    latest_business_date (latest date with HME data for THIS store),
+    latest_result_date, latest_result_status (SUCCESS / PARTIAL / SKIPPED /
+    FAILED), latest_result_reason (OK / FACT_SET_MISSING /
+    RECONCILIATION_MISMATCH / UNMAPPED / NO_ACCESS / NO_DATA / INGEST_ERROR)
+
 HME rules — these are not stylistic, they change what is true:
   * HME is authoritative for drive-thru OPERATIONS (cars, timing, goals,
     outliers). Revel is authoritative for POS sales/orders/products/payments.
@@ -1747,6 +1754,12 @@ HME rules — these are not stylistic, they change what is true:
   * Correlation is not causation. With daily observational data and no
     intervention, say "associated with" or "coincided with". Do not write
     "low staffing caused slower drive-thru" or similar.
+  * HME AVAILABILITY IS PER STORE. A day can be loaded for most stores while one
+    store is unavailable. NO_ACCESS = the store is mapped but the HME account
+    no longer returns it; NO_DATA = visible but no rows; UNMAPPED = no verified
+    mapping. Name each unavailable store with its reason and its own
+    latest_business_date, answer for the stores that have data, and never call
+    a sum over the remaining stores the network total.
   * A store with no VERIFIED HME mapping has no HME data at all. Say it is not
     mapped to HME — not that it had zero cars or poor performance. ONLY say a
     store is unmapped when its reason starts "HME NOT MAPPED". "HME DATA NOT
@@ -1989,6 +2002,9 @@ _ALLOWED_RELATIONS = frozenset({
     # drive_thru_cars are lane vehicle observations, NEVER POS orders.
     "v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
     "v_hme_goal_history_llm", "v_hme_day_completeness_llm",
+    # Per-store HME status (migration 61): mapping, latest loaded date, latest
+    # graded result. Status only -- no figures.
+    "v_hme_store_status_llm",
     # R365 weekly-report facts (migrations 54/55). VERIFIED-mapping-gated views
     # over tables laynes_ro cannot read: r365_store_daily, r365_store_weekly,
     # r365_store_mapping and r365_ingest_run stay denied, so the R365 store id,
@@ -2959,13 +2975,49 @@ def _hme_block(cur, establishment_id, period_start, period_end):
     # Revel establishments in scope vs those with no VERIFIED HME mapping at
     # all. LCF Downtown Houston (48) is the standing example: it must read as
     # "not mapped to HME", never as zero cars.
-    cur.execute("""SELECT id FROM establishments
-                    WHERE (%(est)s::int IS NULL OR id = %(est)s::int)
-                    ORDER BY id""", params)
-    revel_ids = [r["id"] for r in cur.fetchall()]
-    cur.execute("""SELECT DISTINCT establishment_id FROM v_hme_store_daily_llm""")
-    mapped_ids = {r["establishment_id"] for r in cur.fetchall()}
-    unmapped = [i for i in revel_ids if i not in mapped_ids]
+    # Per-store status (migration 61): mapping, latest loaded date and the
+    # latest graded ingestion result. Mapping comes from the maintained
+    # mapping, never from "has data" -- a mapped store the account can no
+    # longer see must read as NO_ACCESS, not as unmapped.
+    cur.execute("""SELECT establishment_id, store_name, hme_mapping_status,
+                          latest_business_date, latest_result_date,
+                          latest_result_status, latest_result_reason
+                     FROM v_hme_store_status_llm
+                    WHERE (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+                    ORDER BY establishment_id""", params)
+    status_rows = [dict(r) for r in cur.fetchall()]
+    revel_ids = [r["establishment_id"] for r in status_rows]
+    unmapped = [r["establishment_id"] for r in status_rows
+                if r["hme_mapping_status"] != "VERIFIED"]
+    store_status = [{
+        "establishment_id": r["establishment_id"], "store_name": r["store_name"],
+        "hme_mapping_status": r["hme_mapping_status"],
+        "latest_business_date": (r["latest_business_date"].isoformat()
+                                 if r["latest_business_date"] else None),
+        "latest_result_date": (r["latest_result_date"].isoformat()
+                               if r["latest_result_date"] else None),
+        "latest_result_status": r["latest_result_status"],
+        "latest_result_reason": r["latest_result_reason"],
+    } for r in status_rows]
+
+    # Which VERIFIED stores in scope have no row on a LOADED day. Judged per
+    # store: one store the source did not return no longer makes every other
+    # store's answer untrustworthy for that date.
+    cur.execute("""
+        SELECT s.establishment_id, c.business_date
+          FROM v_hme_day_completeness_llm c
+          CROSS JOIN v_hme_store_status_llm s
+         WHERE c.business_date >= %(start)s::date AND c.business_date < %(end)s::date
+           AND s.hme_mapping_status = 'VERIFIED'
+           AND (%(est)s::int IS NULL OR s.establishment_id = %(est)s::int)
+           AND NOT EXISTS (SELECT 1 FROM v_hme_store_daily_llm d
+                            WHERE d.establishment_id = s.establishment_id
+                              AND d.business_date = c.business_date)
+         ORDER BY 1, 2""", params)
+    store_missing = {}
+    for r in cur.fetchall():
+        store_missing.setdefault(r["establishment_id"], []).append(
+            r["business_date"].isoformat())
 
     latest = scope["latest_business_date"]
 
@@ -2981,9 +3033,20 @@ def _hme_block(cur, establishment_id, period_start, period_end):
         "counts_consistent": d["counts_consistent"],
     } for d in days]
 
-    missing_verified = [
-        d["business_date"] for d in per_day
-        if (d["verified_expected_count"] or 0) > (d["verified_observed_count"] or 0)]
+    if establishment_id is not None:
+        # Single store: its own missing loaded days stay a hard gate.
+        missing_verified = store_missing.get(establishment_id, [])
+    else:
+        # Network scope: never a blanket FAIL for one absent store. Each absent
+        # store is listed with its reason; its days are unknown, not zero.
+        missing_verified = []
+    by_id = {x["establishment_id"]: x for x in store_status}
+    unavailable_stores = [{
+        "establishment_id": e, "store_name": by_id.get(e, {}).get("store_name"),
+        "missing_loaded_dates": ds,
+        "latest_business_date": by_id.get(e, {}).get("latest_business_date"),
+        "latest_result_reason": by_id.get(e, {}).get("latest_result_reason"),
+    } for e, ds in sorted(store_missing.items())]
 
     # Freshness is judged against the INGESTION SCHEDULE, not the calendar. A
     # full-history view is used rather than the requested window, because a
@@ -3017,6 +3080,8 @@ def _hme_block(cur, establishment_id, period_start, period_end):
         "unreconciled_days": [d["business_date"] for d in per_day
                               if d["reconciliation_ok"] is False],
         "missing_verified_stores": missing_verified,
+        "unavailable_stores_in_scope": unavailable_stores,
+        "store_status": store_status,
         "metric_availability": {
             "store_daily": True,
             "outliers": True,
@@ -3807,9 +3872,15 @@ def meta_extract(establishment_id, period_start: str, period_end: str) -> dict:
                 deep.update(dict(cur.fetchone()))
 
             _cohort_block = _cohort_context(establishment_id)
+            # A savepoint, because a failed HME read otherwise aborts the
+            # whole transaction and every later query in this Revel profile
+            # fails with it -- one HME problem must never break a Revel answer.
+            cur.execute("SAVEPOINT hme_ctx")
             try:
                 _hme = _hme_block(cur, establishment_id, period_start, period_end)
+                cur.execute("RELEASE SAVEPOINT hme_ctx")
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT hme_ctx")
                 # HME is additive context: if it cannot be read, the rest of the
                 # profile must still be produced. Never silently claim HME is
                 # absent -- say the status is unknown.
@@ -4376,6 +4447,9 @@ def _reconcile(meta: dict) -> dict:
 # added deliberately, and defaults to gated.
 _REFERENCE_RELATIONS = frozenset({
     "establishments", "products", "weather_daily", "v_store_cohort",
+    # Per-store HME freshness/status: dates and status codes, no business
+    # figures, so there is no period to reconcile.
+    "v_hme_store_status_llm",
     # Current product -> category reference. Safe to leave ungated because it
     # reads only the mapping table and the product catalogue -- no order, item
     # or payment row -- so there is no period to reconcile. The HISTORICAL view
@@ -4616,6 +4690,22 @@ def hme_unavailable_reason(hme: dict, period_start: str, period_end: str) -> str
     if unmapped and in_scope is not None and len(unmapped) >= in_scope:
         return ("HME NOT MAPPED: this store has no VERIFIED HME mapping, so it has "
                 "no HME drive-thru data at all (not zero cars)")
+    # One mapped store in scope whose own ingestion was graded: say why.
+    sts = [x for x in (hme.get("store_status") or [])
+           if x.get("hme_mapping_status") == "VERIFIED"]
+    if len(sts) == 1 and sts[0].get("latest_result_reason") in ("NO_ACCESS", "NO_DATA"):
+        st = sts[0]
+        own = st.get("latest_business_date") or "none"
+        if st["latest_result_reason"] == "NO_ACCESS":
+            return (f"HME NO ACCESS: {st.get('store_name')} IS mapped to HME, but the HME "
+                    f"account does not return this store at all (not visible to the "
+                    f"account as of the {st.get('latest_result_date')} ingestion); its "
+                    f"latest loaded HME business date is {own}. Its drive-thru data is "
+                    f"unavailable, not zero")
+        return (f"HME NO DATA: {st.get('store_name')} IS mapped to HME and visible to the "
+                f"account, but HME returned no rows for it (latest graded "
+                f"{st.get('latest_result_date')}); its latest loaded HME business date "
+                f"is {own}")
     end_incl = period_end
     try:
         end_incl = (date.fromisoformat(period_end) - timedelta(days=1)).isoformat()
@@ -4652,10 +4742,23 @@ def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list
     # untrustworthy: that is a FAIL, not a warning.
     missing_verified = hme.get("missing_verified_stores") or []
     if missing_verified:
-        fails.append("HME is missing one or more VERIFIED stores on "
+        fails.append("HME has no row for this store on "
                      + ", ".join(missing_verified)
-                     + "; store-level drive-thru answers for those dates are not "
-                       "trustworthy")
+                     + "; its drive-thru answers for those dates are not "
+                       "trustworthy (unknown, not zero)")
+    # Network scope: stores the source did not return are named, with their
+    # reason, and excluded -- they do not block the stores that did return.
+    for u in hme.get("unavailable_stores_in_scope") or []:
+        if hme.get("missing_verified_stores"):
+            break
+        warns.append(
+            f"HME UNAVAILABLE for {u.get('store_name')} on "
+            f"{len(u.get('missing_loaded_dates') or [])} loaded date(s) "
+            f"({(u.get('missing_loaded_dates') or [''])[0]}.."
+            f"{(u.get('missing_loaded_dates') or [''])[-1]}; reason "
+            f"{u.get('latest_result_reason') or 'not returned by HME'}; latest loaded "
+            f"{u.get('latest_business_date')}). Report it as unavailable, exclude it, and "
+            f"never call a sum over the remaining stores the network total")
     unreconciled = hme.get("unreconciled_days") or []
     if unreconciled:
         fails.append("HME cross-source reconciliation failed on "

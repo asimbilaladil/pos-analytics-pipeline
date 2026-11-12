@@ -41,7 +41,7 @@ RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 LOG_DIR = os.environ.get("HME_LOG_DIR", "/var/lib/laynes/hme/logs")
 LOCK_PATH = os.environ.get("HME_LOCK_PATH", "/var/lib/laynes/hme/state/ingest.lock")
 ENV_FILE = os.environ.get("HME_ENV_FILE", "/etc/laynes/hme-downloader.env")
-ORCHESTRATOR_VERSION = "hme_daily_ingest/1.2.0"
+ORCHESTRATOR_VERSION = "hme_daily_ingest/1.3.0"
 
 # --- process exit contract (shared with hme_reconciliation_retry.py) --------
 # systemd's SuccessExitStatus decides which of these light the unit red. The
@@ -58,6 +58,10 @@ ORCHESTRATOR_VERSION = "hme_daily_ingest/1.2.0"
 #      This is the policy working, not a fault -- a chronically absent
 #      OUT_OF_SCOPE store (e.g. Frisco) must not leave the unit red daily,
 #      because a unit that fails every morning stops being a signal.
+#   4  PARTIAL STORES: the day loaded for every store HME returned, but at
+#      least one VERIFIED store FAILED (no access / no data) or is PARTIAL.
+#      Red on purpose: a stale or inaccessible location must keep alerting.
+#      Per-store outcomes are in hme_store_ingest_result.
 #   75 EX_TEMPFAIL: harmless no-op -- another run holds the lock, or the
 #      retry found nothing eligible to do.
 #
@@ -69,7 +73,12 @@ EXIT_OK = 0
 EXIT_HARD_FAILURE = 1
 EXIT_RECONCILIATION_FAILED = 2
 EXIT_ACCEPTED_PARTIAL = 3
+EXIT_PARTIAL_STORES = 4
 EXIT_NOOP = 75
+
+# Per-store partial policy: one absent VERIFIED store no longer refuses the
+# whole day. Set HME_PARTIAL_STORES=0 to restore the all-or-nothing behaviour.
+PARTIAL_STORES = os.environ.get("HME_PARTIAL_STORES", "1") != "0"
 
 MAX_ATTEMPTS = int(os.environ.get("HME_MAX_ATTEMPTS", "3"))
 BACKOFF_SECONDS = [0, 300, 900]   # bounded: immediate, +5 min, +15 min
@@ -176,6 +185,8 @@ def run_extractor(date, env, fh):
     """Returns (returncode, facts_path_or_None)."""
     cmd = [os.path.join(DOWNLOADER, ".venv/bin/python"),
            os.path.join(DOWNLOADER, "hme_querydata.py"), "--date", date]
+    if PARTIAL_STORES:
+        cmd.append("--partial-stores")
     child = dict(os.environ)
     child.update(env)
     child["HME_RAW_DIR"] = RAW_DIR
@@ -195,6 +206,141 @@ def run_extractor(date, env, fh):
     return proc.returncode, (candidates[0] if candidates else None)
 
 
+def classify_store_results(res, log=None):
+    """Exit code for a loaded day, store results first. Fail-closed."""
+    say = log or (lambda m: None)
+    if res["status"] == "succeeded":
+        return EXIT_OK
+    bad = [r for r in res.get("store_results") or []
+           if r["status"] in ("FAILED", "PARTIAL")]
+    if not res.get("reconciliation_ok"):
+        say("exit 2: reconciliation failed -- needs attention or a delayed retry")
+        return EXIT_RECONCILIATION_FAILED
+    if bad:
+        say("exit 4: partial stores -- " + ", ".join(
+            f"{r['revel_establishment_id']}={r['status']}/{r['reason_code']}" for r in bad))
+        return EXIT_PARTIAL_STORES
+    return classify_partial_exit(res, log=log)
+
+
+def ingest_date(target, *, env, fh, max_attempts=MAX_ATTEMPTS, dry_run=False,
+                backoff=None):
+    """Extract -> load ONE business date. Caller holds the lock.
+
+    Returns (exit_code, load_result_or_None, reason). Retries only a failed
+    extraction (no facts produced); a loaded day is never re-extracted here,
+    so a store that is absent for a structural reason (no access) does not
+    burn three attempts and 37 minutes.
+    """
+    backoff = BACKOFF_SECONDS if backoff is None else backoff
+    started = datetime.datetime.now(datetime.timezone.utc)
+    last_reason = "no attempt ran"
+    for attempt in range(1, max(1, max_attempts) + 1):
+        delay = backoff[min(attempt - 1, len(backoff) - 1)]
+        if delay and attempt > 1:
+            log(f"backoff {delay}s before attempt {attempt}", fh)
+            time.sleep(delay)
+        log(f"--- attempt {attempt}/{max_attempts} ---", fh)
+
+        rc, facts_path = run_extractor(target, env, fh)
+        if rc != 0 or not facts_path:
+            last_reason = (f"extractor rc={rc}"
+                           + ("" if facts_path else "; no facts file produced"))
+            log(f"attempt {attempt} failed: {last_reason}", fh)
+            continue
+
+        with open(facts_path) as f:
+            doc = json.load(f)
+        doc["attempt"] = attempt
+        if doc.get("business_date") != target:
+            last_reason = (f"facts business_date {doc.get('business_date')} "
+                           f"!= target {target}")
+            log(f"attempt {attempt} aborted: {last_reason}", fh)
+            break
+
+        conn = hme_load.connect()
+        try:
+            res = hme_load.load(doc, conn, dry_run=dry_run,
+                                allow_partial_stores=PARTIAL_STORES)
+        except hme_load.LoadAborted as e:
+            conn.rollback()
+            last_reason = f"load aborted: {e}"
+            log(f"attempt {attempt}: {last_reason}", fh)
+            status = ("aborted_tenant_scope"
+                      if "tenant" in str(e).lower() or "store" in str(e).lower()
+                      else "partial")
+            rid = hme_load.record_failed_run(
+                conn, target, status=status, reason=str(e), attempt=attempt,
+                started_at=started, tenant_scope_ok=doc.get("tenant_scope_ok"),
+                freshness=doc.get("freshness_detail"),
+                extractor_version=doc.get("extractor_version"))
+            log(f"recorded failed run_id={rid} status={status}", fh)
+            conn.close()
+            return EXIT_HARD_FAILURE, None, last_reason   # never retry a safety abort
+        finally:
+            if not conn.closed:
+                conn.close()
+
+        verdict = "SUCCESS" if res["status"] == "succeeded" else "PARTIAL"
+        log(f"{verdict} run_id={res['run_id']} status={res['status']} "
+            f"stores={res['store_count']} "
+            f"received={res['rows_received']} written={res['rows_written']} "
+            f"goals={res['goal_stats']} recon_ok={res['reconciliation_ok']}", fh)
+        for c in res["reconciliation"]["checks"]:
+            log(f"  recon [{'ok' if c['ok'] else 'FAIL'}] {c['check']}: "
+                f"observed={c['observed']} expected={c['expected']}", fh)
+        for w in res["reconciliation"]["warnings"]:
+            log(f"  warning: {w}", fh)
+        for r in res.get("store_results") or []:
+            log(f"  store {r['revel_establishment_id']:>3} "
+                f"hme={r['hme_store_number'] or '-':>8} {r['status']:8s} {r['reason_code']}", fh)
+        if res["status"] != "succeeded":
+            c = res.get("completeness") or {}
+            why = []
+            if not res["reconciliation_ok"]:
+                why.append("not reconciled")
+            if c and not c.get("complete"):
+                why.append(
+                    f"source incomplete {c.get('observed_store_count')}"
+                    f"/{c.get('expected_store_count')} stores, missing "
+                    f"{c.get('missing_store_numbers')} "
+                    f"{c.get('missing_store_names')} "
+                    f"{c.get('missing_mapping_statuses')} "
+                    f"(VERIFIED {c.get('verified_observed_count')}"
+                    f"/{c.get('verified_expected_count')} present)")
+            log(f"run {res['run_id']} is PARTIAL: facts are loaded and remain "
+                f"idempotently correctable, but " + "; ".join(why or ["store results"]), fh)
+        return classify_store_results(res, log=lambda m: log(m, fh)), res, res["status"]
+
+    # every attempt exhausted
+    log(f"all {max_attempts} attempt(s) failed: {last_reason}", fh)
+    if not dry_run:
+        conn = hme_load.connect()
+        try:
+            rid = hme_load.record_failed_run(
+                conn, target, status="failed", reason=last_reason,
+                attempt=max_attempts, started_at=started)
+            log(f"recorded failed run_id={rid} status=failed", fh)
+        finally:
+            conn.close()
+    return EXIT_HARD_FAILURE, None, last_reason
+
+
+def acquire_lock(fh):
+    """The single HME ingest lock (shared with the retry and backfill jobs).
+    Returns the open lock file, or None if another run holds it."""
+    os.makedirs(os.path.dirname(LOCK_PATH), mode=0o700, exist_ok=True)
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        log("another HME ingest run holds the lock; exiting without action", fh)
+        return None
+    os.chmod(LOCK_PATH, 0o600)
+    return lock
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=None,
@@ -207,7 +353,6 @@ def main():
     datetime.date.fromisoformat(target)
 
     os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(os.path.dirname(LOCK_PATH), mode=0o700, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"daily-ingest-{target}.log")
 
     with open(log_path, "a") as fh:
@@ -217,18 +362,13 @@ def main():
         log(f"chicago now      : {now_chi.isoformat(timespec='seconds')}", fh)
         log(f"host utc now     : {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}", fh)
         log(f"target business_date (Chicago yesterday): {target}", fh)
+        log(f"partial-store policy: {'on' if PARTIAL_STORES else 'off'}", fh)
 
-        # --- single-run lock -------------------------------------------------
-        lock = open(LOCK_PATH, "w")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log("another HME ingest run holds the lock; exiting without action", fh)
+        lock = acquire_lock(fh)
+        if lock is None:
             return EXIT_NOOP
-        os.chmod(LOCK_PATH, 0o600)
         lock.write(f"{os.getpid()} {target}\n")
         lock.flush()
-
         try:
             env = load_env_file(ENV_FILE)
             conn = hme_load.connect()
@@ -236,98 +376,11 @@ def main():
                 inv_n = refresh_tenant_inventory(conn, fh)
             finally:
                 conn.close()
-
-            started = datetime.datetime.now(datetime.timezone.utc)
-            last_reason = "no attempt ran"
-            for attempt in range(1, max(1, args.max_attempts) + 1):
-                delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
-                if delay and attempt > 1:
-                    log(f"backoff {delay}s before attempt {attempt}", fh)
-                    time.sleep(delay)
-                log(f"--- attempt {attempt}/{args.max_attempts} ---", fh)
-
-                rc, facts_path = run_extractor(target, env, fh)
-                if rc != 0 or not facts_path:
-                    last_reason = (f"extractor rc={rc}"
-                                   + ("" if facts_path else "; no facts file produced"))
-                    log(f"attempt {attempt} failed: {last_reason}", fh)
-                    continue
-
-                with open(facts_path) as f:
-                    doc = json.load(f)
-                doc["attempt"] = attempt
-                if doc.get("business_date") != target:
-                    last_reason = (f"facts business_date {doc.get('business_date')} "
-                                   f"!= target {target}")
-                    log(f"attempt {attempt} aborted: {last_reason}", fh)
-                    break
-
-                conn = hme_load.connect()
-                try:
-                    res = hme_load.load(doc, conn, dry_run=args.dry_run)
-                except hme_load.LoadAborted as e:
-                    conn.rollback()
-                    last_reason = f"load aborted: {e}"
-                    log(f"attempt {attempt}: {last_reason}", fh)
-                    status = ("aborted_tenant_scope"
-                              if "tenant" in str(e).lower() or "store" in str(e).lower()
-                              else "partial")
-                    rid = hme_load.record_failed_run(
-                        conn, target, status=status, reason=str(e), attempt=attempt,
-                        started_at=started, tenant_scope_ok=doc.get("tenant_scope_ok"),
-                        freshness=doc.get("freshness_detail"),
-                        extractor_version=doc.get("extractor_version"))
-                    log(f"recorded failed run_id={rid} status={status}", fh)
-                    conn.close()
-                    return EXIT_HARD_FAILURE   # do not retry a safety abort
-                finally:
-                    if not conn.closed:
-                        conn.close()
-
-                # A PARTIAL day is never announced as a successful production
-                # ingestion. Which flavour of partial it is decides the exit
-                # code: see classify_partial_exit and the exit contract above.
-                verdict = "SUCCESS" if res["status"] == "succeeded" else "PARTIAL"
-                log(f"{verdict} run_id={res['run_id']} status={res['status']} "
-                    f"stores={res['store_count']} "
-                    f"received={res['rows_received']} written={res['rows_written']} "
-                    f"goals={res['goal_stats']} recon_ok={res['reconciliation_ok']}", fh)
-                for c in res["reconciliation"]["checks"]:
-                    log(f"  recon [{'ok' if c['ok'] else 'FAIL'}] {c['check']}: "
-                        f"observed={c['observed']} expected={c['expected']}", fh)
-                for w in res["reconciliation"]["warnings"]:
-                    log(f"  warning: {w}", fh)
-                log(f"tenant inventory used: {inv_n} stores", fh)
-                if res["status"] != "succeeded":
-                    c = res.get("completeness") or {}
-                    why = []
-                    if not res["reconciliation_ok"]:
-                        why.append("not reconciled")
-                    if c and not c.get("complete"):
-                        why.append(
-                            f"source incomplete {c.get('observed_store_count')}"
-                            f"/{c.get('expected_store_count')} stores, missing "
-                            f"{c.get('missing_store_numbers')} "
-                            f"{c.get('missing_store_names')} "
-                            f"{c.get('missing_mapping_statuses')} "
-                            f"(VERIFIED {c.get('verified_observed_count')}"
-                            f"/{c.get('verified_expected_count')} present)")
-                    log(f"run {res['run_id']} is PARTIAL: facts are loaded and remain "
-                        f"idempotently correctable, but " + "; ".join(why), fh)
-                    return classify_partial_exit(res, log=lambda m: log(m, fh))
-                return EXIT_OK
-
-            # every attempt exhausted
-            log(f"all {args.max_attempts} attempt(s) failed: {last_reason}", fh)
-            conn = hme_load.connect()
-            try:
-                rid = hme_load.record_failed_run(
-                    conn, target, status="failed", reason=last_reason,
-                    attempt=args.max_attempts, started_at=started)
-                log(f"recorded failed run_id={rid} status=failed", fh)
-            finally:
-                conn.close()
-            return EXIT_HARD_FAILURE
+            code, _res, _why = ingest_date(target, env=env, fh=fh,
+                                           max_attempts=args.max_attempts,
+                                           dry_run=args.dry_run)
+            log(f"tenant inventory used: {inv_n} stores; exit {code}", fh)
+            return code
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()

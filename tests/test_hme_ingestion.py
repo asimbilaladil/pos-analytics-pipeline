@@ -335,7 +335,9 @@ try:
     # HME relation must still be unreadable, so the assertion is now an exact
     # set rather than emptiness -- a new raw grant still fails here.
     SAFE_LLM_VIEWS = {"v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
-                      "v_hme_goal_history_llm", "v_hme_day_completeness_llm"}
+                      "v_hme_goal_history_llm", "v_hme_day_completeness_llm",
+                      # migration 61: per-store status only (no figures)
+                      "v_hme_store_status_llm"}
     cur = conn.cursor()
     # Match HME relations by prefix. A substring match would also catch
     # "establis(hme)nts", which is a Revel table and is legitimately readable.
@@ -345,7 +347,7 @@ try:
                      AND c.relkind IN ('r','v','m')
                      AND has_table_privilege('laynes_ro', c.oid, 'SELECT')""")
     readable = {r[0] for r in cur.fetchall()}
-    check("laynes_ro reads exactly the four safe HME views",
+    check("laynes_ro reads exactly the five safe HME views (raw hme_store_ingest_result stays denied)",
           readable == SAFE_LLM_VIEWS, str(sorted(readable)))
     check("no raw or internal HME relation is readable by laynes_ro",
           not (readable - SAFE_LLM_VIEWS), str(sorted(readable - SAFE_LLM_VIEWS)))
@@ -503,7 +505,7 @@ lockp = "/var/lib/laynes/hme/state/ingest.lock.test"
 held = open(lockp, "w")
 _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
 env = dict(os.environ, HME_LOCK_PATH=lockp)
-pr = _sp.run(["venv/bin/python", "hme_daily_ingest.py", "--date", "2026-09-14", "--dry-run"],
+pr = _sp.run([sys.executable, "hme_daily_ingest.py", "--date", "2026-09-14", "--dry-run"],
              capture_output=True, text=True, env=env, timeout=120)
 check("second concurrent run exits 75 (EX_TEMPFAIL) without acting",
       pr.returncode == 75 and "holds the lock" in pr.stdout,
@@ -825,7 +827,7 @@ finally:
 
 # A PARTIAL load must exit non-zero so systemd/orchestrator cannot show it clean.
 if os.path.exists(LAGGED):
-    pr = subprocess.run(["venv/bin/python", "hme_load.py", "--date", "2026-09-16",
+    pr = subprocess.run([sys.executable, "hme_load.py", "--date", "2026-09-16",
                          "--file", LAGGED, "--dry-run"],
                         capture_output=True, text=True, timeout=300,
                         env=dict(os.environ, HME_RAW_DIR="/var/lib/laynes/hme/raw"))
@@ -836,7 +838,7 @@ if os.path.exists(LAGGED):
     check("PARTIAL load does not print SUCCEEDED status",
           "status=SUCCEEDED" not in pr.stdout)
 if os.path.exists(SETTLED):
-    pr2 = subprocess.run(["venv/bin/python", "hme_load.py", "--date", "2026-09-16",
+    pr2 = subprocess.run([sys.executable, "hme_load.py", "--date", "2026-09-16",
                           "--file", SETTLED, "--dry-run"],
                          capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, HME_RAW_DIR="/var/lib/laynes/hme/raw"))
