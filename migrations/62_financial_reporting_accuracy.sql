@@ -16,7 +16,12 @@
 --      days_in_week / days_in_period    calendar days in the week / period
 --      forecast_coverage_status         FULL | PARTIAL | NONE
 --      sales_on_forecast_days           = forecast_sales_base (R365's figure)
---      sales_on_days_without_forecast   = net_sales - sales_on_forecast_days
+--      sales_on_days_without_forecast   SUM(daily net_sales) over the days of
+--                                       the week whose forecast is NULL/0, read
+--                                       from the daily rows -- NOT derived as
+--                                       net_sales - forecast_sales_base, which
+--                                       only means the same thing while R365's
+--                                       weekly row equals its daily sum
 --    sales_vs_forecast_* are untouched: they remain R365's own calculation.
 --
 -- 2. REVEL SALES METRICS. "Sales" in this project has meant SUM(final_total)
@@ -83,8 +88,7 @@ SELECT w.establishment_id,
             WHEN fc.forecast_days >= (w.week_end - w.week_start + 1) THEN 'FULL'
             ELSE 'PARTIAL' END                                             AS forecast_coverage_status,
        CASE WHEN w.forecasted_sales > 0 THEN w.forecast_sales_base END     AS sales_on_forecast_days,
-       w.net_sales - CASE WHEN w.forecasted_sales > 0
-                          THEN w.forecast_sales_base ELSE 0 END           AS sales_on_days_without_forecast
+       fc.sales_on_days_without_forecast
   FROM r365_store_weekly w
   JOIN r365_store_mapping m ON m.r365_store_id = w.r365_store_id
   JOIN establishments e     ON e.id = w.establishment_id
@@ -92,7 +96,9 @@ SELECT w.establishment_id,
   LEFT JOIN ayg_business_periods p
          ON w.week_start BETWEEN p.start_date AND p.end_date
   LEFT JOIN LATERAL (
-         SELECT count(*) FILTER (WHERE d.forecasted_sales > 0) AS forecast_days
+         SELECT count(*) FILTER (WHERE d.forecasted_sales > 0) AS forecast_days,
+                COALESCE(sum(d.net_sales) FILTER (WHERE COALESCE(d.forecasted_sales, 0) <= 0), 0)
+                                                               AS sales_on_days_without_forecast
            FROM r365_store_daily d
           WHERE d.establishment_id = w.establishment_id
             AND d.business_date BETWEEN w.week_start AND w.week_end
@@ -138,7 +144,8 @@ WITH agg AS (
            sum(w.forecasted_sales)     AS forecasted_sales,
            sum(w.forecast_sales_base)  AS forecast_sales_base,
            sum(w.days_with_data)       AS days_with_data,
-           sum(w.forecast_days)        AS forecast_days
+           sum(w.forecast_days)        AS forecast_days,
+           sum(w.sales_on_days_without_forecast) AS sales_on_days_without_forecast
       FROM v_r365_store_weekly_llm w
      WHERE w.fiscal_year IS NOT NULL
      GROUP BY 1, 2, 3, 4, 5
@@ -178,8 +185,7 @@ SELECT a.establishment_id, a.store_name, a.fiscal_year, a.period_number,
             WHEN a.forecast_days >= (p.end_date - p.start_date + 1) THEN 'FULL'
             ELSE 'PARTIAL' END                                             AS forecast_coverage_status,
        CASE WHEN a.forecasted_sales > 0 THEN a.forecast_sales_base END     AS sales_on_forecast_days,
-       a.net_sales - COALESCE(CASE WHEN a.forecasted_sales > 0
-                                   THEN a.forecast_sales_base END, 0)     AS sales_on_days_without_forecast
+       a.sales_on_days_without_forecast
   FROM agg a
   -- the _llm calendar view carries period_status (Chicago-today derived)
   JOIN v_ayg_business_periods_llm p

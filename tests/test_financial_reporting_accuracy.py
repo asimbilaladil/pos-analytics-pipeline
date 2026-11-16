@@ -506,13 +506,15 @@ check("check_data coverage entry is JSON-safe and exact",
       and fcov["LCF Airtex"]["sales_on_forecast_days"] == 175134.93
       and json.dumps(meta, default=str))
 check("R365 gate verdict for P11 unchanged (PASS)", meta["analysis_permitted"] is True)
+check("check_data says the coverage check itself was VERIFIED",
+      meta["r365"].get("forecast_coverage_check") == "VERIFIED")
 tf = C.r365_trusted_figures(None, P11[0], P11[1])
 check("trusted figures (blocked path) carry sales_on_forecast_days and coverage",
       all("sales_on_forecast_days" in r for r in tf["by_store"])
       and {c["store_name"] for c in tf["forecast_coverage"]} == set(fcov))
 tok = store_scope.activate({32})
 try:
-    scoped = C._guard_coverage([(None, P11[0], P11[1])], {})
+    scoped, _unavail = C._guard_coverage([(None, P11[0], P11[1])], {})
 finally:
     store_scope.deactivate(tok)
 check("store-restricted credential: guard coverage limited to the allowed store",
@@ -598,6 +600,151 @@ check("every summary/verified difference equals the open (unclosed) REAL tickets
       r["differing"] > 0 and r["unexplained"] == 0, str(dict(r)))
 check("no stale summary row: stored total_revenue = live recompute with its own rule",
       r["stale"] == 0, str(dict(r)))
+
+# ═══ H. review findings (PR #34) ════════════════════════════════════════════
+section("H. review findings: store-specific disclosure, unavailable coverage, "
+        "no-forecast sales, timeouts")
+three = [dict(c, store_name=n) for c, n in zip(partial_cov, ("LCF Airtex", "LCF Beaumont", "LCF Ella"))]
+undis = lambda t: {i.row for i in G.check_coverage(t, three) if i.kind == "COVERAGE_UNDISCLOSED"}
+check("H1 an Airtex-only '21 de 28' does not disclose Beaumont or Ella",
+      undis("Airtex: forecast en 21 de 28 días.") == {"LCF Beaumont", "LCF Ella"})
+check("H1 a fraction in a different sentence from the store name does not count",
+      undis("Beaumont tuvo buen mes. La cobertura fue 21 de 28 días para otra tienda.") == {"LCF Airtex", "LCF Beaumont", "LCF Ella"})
+check("H1 one sentence naming all three stores with their fraction discloses all three",
+      undis("Airtex, Beaumont y Ella tuvieron forecast en solo 21 de 28 días.") == set())
+check("H1 per-store table rows disclose each store", undis(CORRECTED_ANSWER.replace("Ella | 21 de 28", "Ella | 21 de 28")) == set())
+check("H1 a table row for Airtex with the fraction does not cover Ella's row without one",
+      undis("| Tienda | Días con forecast |\n|---|---|\n| Airtex | 21 de 28 |\n| Ella | n/a |\n"
+            "Beaumont: 21/28.") == {"LCF Ella"})
+check("H1 store names match whole words only ('Ella' is not found inside 'Estrella')",
+      "LCF Ella" in undis("Estrella: 21 de 28 días."))
+check("H1 the final note lists only the stores still undisclosed",
+      "LCF Ella" in G.final_note(G.check_coverage("Airtex 21/28. Beaumont 21/28.", three), three,
+                                 "Airtex 21/28. Beaumont 21/28.")
+      and "LCF Airtex: forecast on" not in G.final_note(
+          G.check_coverage("Airtex 21/28. Beaumont 21/28.", three), three, "Airtex 21/28. Beaumont 21/28."))
+
+iss_u = G.review("| Store | Sales | Forecast | Difference |\n|---|---|---|---|\n| A | $10.00 | $5.00 | +$5.00 |",
+                 [], coverage_unavailable=True)
+check("H2 unavailable coverage is reported as COVERAGE_UNVERIFIED, not as full coverage",
+      [i.kind for i in iss_u] == ["COVERAGE_UNVERIFIED"])
+check("H2 COVERAGE_UNVERIFIED is not sent back for a rewrite (the model has no facts)",
+      "COVERAGE_UNVERIFIED" not in G.REWRITABLE)
+check("H2 a full-period claim is still flagged while coverage is unverified",
+      "FULL_PERIOD_CLAIM" in [i.kind for i in G.review(
+          "The comparison covers the full period for every store against forecast.", [], True)])
+nu = G.final_note(iss_u, [], "Here are the stores against forecast.")
+check("H2 the note says coverage was not verified and never calls it full-period",
+      "Forecast coverage not verified" in nu and "not as a full-period comparison" in nu)
+orig_fc = G.forecast_coverage
+def _boom(*a, **k):
+    raise psycopg2.OperationalError("simulated coverage read failure")
+G.forecast_coverage = _boom          # only the coverage read fails; the query itself runs
+try:
+    cache = {}
+    cov_f, unav_f = C._guard_coverage([(None, P11[0], P11[1])], cache)
+    res5, fake5 = replay([resp("tool_use", p11_call()), resp("end_turn", text(CORRECTED_ANSWER))])
+finally:
+    G.forecast_coverage = orig_fc
+check("H2 a failed coverage read returns (no rows, unavailable) and caches None, not []",
+      cov_f == [] and unav_f is True and cache[(None, P11[0], P11[1])] is None)
+g5 = [s["financial_guard"] for s in res5.steps if "financial_guard" in s]
+check("H2 replay with the coverage read failing: no rewrite, unverified note appended",
+      len(fake5.calls) == 2 and not any(x.get("action") == "rewrite_requested" for x in g5)
+      and any(x.get("coverage_unavailable") for x in g5) and "Cobertura del forecast no verificada" in res5.answer)
+conn = rw_conn()
+try:
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    orig_fc = G.forecast_coverage
+    G.forecast_coverage = lambda c, *a: c.execute("SELECT * FROM no_such_relation_for_test")
+    try:
+        r = C._r365_forecast_coverage(cur, None, P11[0], P11[1])
+    finally:
+        G.forecast_coverage = orig_fc
+    cur.execute("SELECT 1 AS ok")
+    still_ok = cur.fetchone()["ok"] == 1
+finally:
+    conn.rollback()
+    conn.close()
+check("H2 check_data: a coverage failure says UNAVAILABLE (not an empty 'all FULL' list) "
+      "and the profile transaction survives",
+      r["forecast_coverage_check"] == "UNAVAILABLE" and r["forecast_coverage"] == [] and still_ok, str(r))
+
+conn = rw_conn()
+try:
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    migration_sandbox.install(cur, MIG)
+    cur.execute("""WITH d AS (SELECT establishment_id, week_start,
+                                     COALESCE(sum(net_sales) FILTER (WHERE COALESCE(forecasted_sales, 0) <= 0), 0) nofc
+                                FROM v_r365_store_daily_llm GROUP BY 1, 2)
+                   SELECT count(*) n,
+                          count(*) FILTER (WHERE abs(w.sales_on_days_without_forecast - d.nofc) > 0.005) bad
+                     FROM v_r365_store_weekly_llm w JOIN d USING (establishment_id, week_start)""")
+    r1 = cur.fetchone()
+    cur.execute("""SELECT count(*) n, count(*) FILTER (WHERE abs(p.sales_on_days_without_forecast - x.s) > 0.005) bad
+                     FROM v_r365_store_period_llm p
+                     JOIN (SELECT establishment_id, fiscal_year, period_number,
+                                  COALESCE(sum(net_sales) FILTER (WHERE COALESCE(forecasted_sales, 0) <= 0), 0) s
+                             FROM v_r365_store_daily_llm WHERE fiscal_year IS NOT NULL GROUP BY 1, 2, 3) x
+                    USING (establishment_id, fiscal_year, period_number)""")
+    r2 = cur.fetchone()
+    cur.execute("""SELECT sales_on_days_without_forecast s FROM v_r365_store_period_llm
+                    WHERE fiscal_year = 2026 AND period_number = 11 AND store_name = 'LCF Airtex'""")
+    r3 = cur.fetchone()
+finally:
+    conn.rollback()
+    conn.close()
+check("H3 weekly sales_on_days_without_forecast = SUM(daily net_sales) on no-forecast days",
+      r1["n"] >= 156 and r1["bad"] == 0, str(dict(r1)))
+check("H3 period sales_on_days_without_forecast = the same, from the daily rows",
+      r2["n"] >= 48 and r2["bad"] == 0, str(dict(r2)))
+check("H3 Airtex P11: equals its uncovered week's sales (61,758.01)", money(r3["s"]) == money("61758.01"))
+check("H3 the migration no longer derives it as net_sales - forecast_sales_base",
+      "w.net_sales - CASE WHEN" not in MIG and "a.net_sales - COALESCE(" not in MIG
+      and "FILTER (WHERE COALESCE(d.forecasted_sales, 0) <= 0)" in MIG)
+
+orig_to = C.STATEMENT_TIMEOUT_MS
+C.STATEMENT_TIMEOUT_MS = 50
+err = None
+try:
+    C.run_sql("SELECT establishment_id, sum(final_total) FROM v_orders_classified "
+              "WHERE business_date >= '2026-08-13' AND business_date < '2026-11-13' GROUP BY 1")
+except Exception as e:
+    err = e
+finally:
+    C.STATEMENT_TIMEOUT_MS = orig_to
+check("H4 a real statement timeout (50 ms) is recognised as a timeout",
+      err is not None and G.is_timeout_error(err), repr(err)[:120])
+import psycopg2.errors as PE  # noqa: E402
+orig_run = C.run_sql
+def _slow(sql):
+    raise PE.QueryCanceled("canceling statement due to statement timeout")
+C.run_sql = _slow
+try:
+    rev_sql = ("SELECT establishment_id, sum(net_sales_excluding_tax) FROM v_orders_classified "
+               "WHERE business_date >= '2026-08-13' AND business_date < '2026-11-13' GROUP BY 1")
+    res6, fake6 = replay([resp("tool_use", tool("run_sql", sql=rev_sql, establishment_id=None,
+                                                period_start="2026-08-13", period_end_exclusive="2026-11-13")),
+                          resp("end_turn", text("Lo siento, las ventas de la red no están disponibles para ese rango."))],
+                         question="ventas netas sin impuesto de la red, ago-nov")
+    res7, _ = replay([resp("tool_use", tool("run_sql", sql=rev_sql, establishment_id=None,
+                                            period_start="2026-08-13", period_end_exclusive="2026-11-13")),
+                      resp("end_turn", text("That query was too large; I'll need one month at a time."))],
+                     question="network net sales Aug-Nov")
+finally:
+    C.run_sql = orig_run
+tr = [m for m in fake6.calls[-1]["messages"] if m["role"] == "user" and isinstance(m["content"], list)]
+tr_txt = json.dumps(tr)
+gate_ran = any(s.get("timeout") for s in res6.steps)
+check("H4 the model is told: timed out, NOT missing data, narrow and retry",
+      gate_ran and "QUERY TIMED OUT" in tr_txt and "NOT missing or unavailable data" in tr_txt,
+      str([(s.get("gate"), s.get("error")) for s in res6.steps if s.get("sql")])[:200])
+check("H4 an answer claiming 'no están disponibles' after a timeout gets the timeout note",
+      "una consulta superó el tiempo límite" in res6.answer)
+check("H4 an answer that already explains the timeout gets no extra note",
+      res7.answer == "That query was too large; I'll need one month at a time.")
+check("H4 prompt documents the Revel view cost and that a timeout is not missing data",
+      "can exceed the 15 s statement" in sp and "NEVER evidence that data is missing" in sp)
 
 passed = sum(ok for _, ok, _ in results)
 print(f"\nFinancial reporting accuracy: {passed} passed, {len(results) - passed} failed, {len(results)} total")

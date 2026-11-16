@@ -1741,6 +1741,10 @@ v_revel_sales_metrics_daily_llm — establishment_id x business_date (Chicago da
       real_transactions, comp_tickets, open_real_tickets, open_real_ticket_total
     Use it whenever the user names gross, net, pre-tax, excluding/including tax,
     tax, discounts, comps or payments, and quote the column name's meaning.
+    COST: it aggregates order rows, like v_orders_classified. A network-wide
+    query over more than about two months can exceed the 15 s statement
+    timeout: query one month or one store at a time. A timeout means the query
+    was too big -- it is NEVER evidence that data is missing or unavailable.
     None of these is verified against a Revel UI report: if the user quotes a
     Revel screen figure that differs, say which definition you used and that the
     Revel report's definition is not verified here -- never pick whichever
@@ -3184,6 +3188,9 @@ R365_SEMANTICS = [
     "forecast_coverage lists every store whose forecast does NOT cover every day "
     "in scope: beside forecast and variance show sales_on_forecast_days, give "
     "full-period net_sales separately, and state the coverage as 'N of M days'.",
+    "forecast_coverage_check UNAVAILABLE means coverage could NOT be checked: say so, "
+    "and never call a forecast comparison full-period. An empty forecast_coverage "
+    "list means every store is FULL only when forecast_coverage_check is VERIFIED.",
     "Roll ratios up from summed numerators/denominators; never average store "
     "percentages.",
 ]
@@ -3368,8 +3375,8 @@ def _r365_block(cur, establishment_id, period_start, period_end):
         "special_status_days_in_scope": special,
         "metric_availability": dict(R365_METRIC_AVAILABILITY),
         "semantics": list(R365_SEMANTICS),
-        "forecast_coverage": _r365_forecast_coverage(
-            cur, establishment_id, period_start, period_end) if per_date else [],
+        **(_r365_forecast_coverage(cur, establishment_id, period_start, period_end)
+           if per_date else {"forecast_coverage": [], "forecast_coverage_check": "NO_DATA"}),
     }
 
 
@@ -3382,10 +3389,13 @@ def _r365_forecast_coverage(cur, establishment_id, period_start, period_end):
         cov = financial_guard.forecast_coverage(cur, establishment_id,
                                                 period_start, period_end)
         cur.execute("RELEASE SAVEPOINT r365_fc")
-        return forecast_coverage_payload(cov)
+        return {"forecast_coverage": forecast_coverage_payload(cov),
+                "forecast_coverage_check": "VERIFIED"}
     except psycopg2.Error as e:
         cur.execute("ROLLBACK TO SAVEPOINT r365_fc")
-        return [{"error": type(e).__name__}]
+        # An empty list would read as "every store FULL": say UNAVAILABLE.
+        return {"forecast_coverage": [], "forecast_coverage_check": "UNAVAILABLE",
+                "forecast_coverage_error": type(e).__name__}
 
 
 _R365_FIGURES_METRICS = """
@@ -3449,8 +3459,14 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
                               "end": period_end})
             rows = [{k: (round(float(v), 2) if isinstance(v, decimal.Decimal) else v)
                      for k, v in r.items()} for r in cur.fetchall()]
-            coverage = financial_guard.forecast_coverage(
-                cur, establishment_id, period_start, period_end)
+            cur.execute("SAVEPOINT r365_fc")
+            try:
+                coverage = financial_guard.forecast_coverage(
+                    cur, establishment_id, period_start, period_end)
+                cur.execute("RELEASE SAVEPOINT r365_fc")
+            except psycopg2.Error:
+                cur.execute("ROLLBACK TO SAVEPOINT r365_fc")
+                coverage = None
     finally:
         conn.rollback()
         conn.close()
@@ -3462,7 +3478,8 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
         "by_store": [r for r in rows if r["store_name"] is not None],
         "network_total": network[0] if network and establishment_id is None else None,
         # sales_vs_forecast_amount compares sales_on_forecast_days, NOT net_sales.
-        "forecast_coverage": forecast_coverage_payload(coverage),
+        "forecast_coverage": forecast_coverage_payload(coverage or []),
+        "forecast_coverage_check": "VERIFIED" if coverage is not None else "UNAVAILABLE",
     }
 
 
@@ -6088,11 +6105,16 @@ def _timing(timings: list, label: str, seconds: float) -> None:
     timings.append((label, round(seconds, 3)))
 
 
-def _guard_coverage(scopes: list, cache: dict) -> list[dict]:
+def _guard_coverage(scopes: list, cache: dict) -> tuple[list[dict], bool]:
     """Forecast coverage for the declared scopes of this turn's R365 forecast
     queries, read as laynes_ro from the allowlisted daily view. Cached per
-    request. A store-restricted credential only ever sees its own stores."""
+    request. A store-restricted credential only ever sees its own stores.
+
+    Returns (coverage, unavailable). A failed read is cached as None and
+    reported as unavailable -- never as an empty list, which would read as
+    "every store fully covered"."""
     out: list[dict] = []
+    unavailable = False
     pol = store_scope.current()
     for sc in scopes:
         if sc not in cache:
@@ -6109,12 +6131,15 @@ def _guard_coverage(scopes: list, cache: dict) -> list[dict]:
                     conn.close()
             except (psycopg2.Error, ValueError) as e:
                 log.warning("financial_guard coverage unavailable: %s", type(e).__name__)
-                cache[sc] = []
+                cache[sc] = None
+        if cache[sc] is None:
+            unavailable = True
+            continue
         for c in cache[sc]:
             if pol is not None and int(c["establishment_id"]) not in pol.allowed:
                 continue
             out.append(c)
-    return out
+    return out, unavailable
 
 
 def _financial_guard_final(text: str, scopes: list, cache: dict, steps: list) -> str:
@@ -6123,18 +6148,25 @@ def _financial_guard_final(text: str, scopes: list, cache: dict, steps: list) ->
     append the server-computed facts instead of sending the report as is."""
     if not text or not text.strip():
         return text
-    coverage = _guard_coverage(scopes, cache) if scopes else []
-    issues = financial_guard.review(text, coverage)
+    coverage, unavailable = _guard_coverage(scopes, cache) if scopes else ([], False)
+    issues = financial_guard.review(text, coverage, unavailable)
+    timed_out = sum(1 for s in steps if s.get("timeout"))
+    tnote = financial_guard.timeout_note(text, timed_out)
+    if tnote:
+        steps.append({"sql": None, "row_count": None, "error": None,
+                      "timeout_note": True, "timed_out_queries": timed_out})
     if not issues:
         if scopes:
             steps.append({"sql": None, "row_count": None, "error": None,
                           "financial_guard": {"action": "passed"}})
-        return text
+        return text + ("\n\n" + tnote if tnote else "")
     note = financial_guard.final_note(issues, coverage, text)
     steps.append({"sql": None, "row_count": None, "error": None,
                   "financial_guard": {"action": "note_appended" if note else "flagged",
+                                      "coverage_unavailable": unavailable,
                                       "issues": [f"{i.kind}: {i.row}" for i in issues]}})
-    return text + ("\n\n" + note if note else "")
+    extra = [x for x in (note, tnote) if x]
+    return text + ("\n\n" + "\n\n".join(extra) if extra else "")
 
 
 def answer_question(history: list[dict], question: str, model: str | None = None,
@@ -6250,8 +6282,9 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 # Deterministic financial-report check: a table whose sales,
                 # forecast and difference do not add up, or partial forecast
                 # coverage left unstated, goes back ONCE with the facts.
-                coverage = _guard_coverage(forecast_scopes, guard_cov)
-                issues = financial_guard.review(final_text, coverage)
+                coverage, cov_unavailable = _guard_coverage(forecast_scopes, guard_cov)
+                issues = [i for i in financial_guard.review(final_text, coverage, cov_unavailable)
+                          if i.kind in financial_guard.REWRITABLE]
                 if issues:
                     guard_retry_used = True
                     provider.add_assistant(messages, turn)
@@ -6452,7 +6485,14 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 continue
             except (SqlError, psycopg2.Error) as e:
                 step["error"] = str(e).strip()
-                tool_results.append((block.id, f"ERROR: {step['error']}", True))
+                if financial_guard.is_timeout_error(e):
+                    # A timeout is a query-size problem, never evidence that
+                    # data is missing: say so to the model explicitly.
+                    step["timeout"] = True
+                    tool_results.append((block.id, financial_guard.TIMEOUT_TOOL_MESSAGE.format(
+                        seconds=STATEMENT_TIMEOUT_MS / 1000), True))
+                else:
+                    tool_results.append((block.id, f"ERROR: {step['error']}", True))
             steps.append(step)
         provider.add_tool_results(messages, tool_results)
 

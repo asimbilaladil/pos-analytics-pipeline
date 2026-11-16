@@ -253,24 +253,45 @@ _PARTIAL_WORDS = re.compile(r"(only|solo|s[oó]lamente|partial|parcial|not the f
                             r"sin forecast|no forecast|without (a )?forecast)", re.I)
 
 
+def _fraction_re(fd: int, n: int):
+    return re.compile(rf"\b{fd}\s*/\s*{n}\b|\b{fd}\s+of\s+(the\s+)?{n}\b|"
+                      rf"\b{fd}\s+de\s+(los\s+)?{n}\b", re.I)
+
+
 def _disclosed(text: str, fd: int, n: int) -> bool:
-    t = text or ""
-    pats = (rf"\b{fd}\s*/\s*{n}\b", rf"\b{fd}\s+of\s+(the\s+)?{n}\b", rf"\b{fd}\s+de\s+(los\s+)?{n}\b")
-    return any(re.search(p, t, re.I) for p in pats)
+    """The fraction appears anywhere (used only where no store is named)."""
+    return bool(_fraction_re(fd, n).search(text or ""))
 
 
-def check_coverage(text: str, coverage: list[dict]) -> list[Issue]:
-    issues: list[Issue] = []
-    partial = [c for c in coverage if c["coverage_status"] == "PARTIAL"]
-    if not partial:
-        return issues
-    for c in partial:
-        if not _disclosed(text, c["forecast_days"], c["days_in_scope"]):
-            issues.append(Issue(
-                "COVERAGE_UNDISCLOSED", c["store_name"],
-                f"forecast covers {c['forecast_days']} of {c['days_in_scope']} days; "
-                "the answer does not say so", {"forecast_days": c["forecast_days"],
-                                                "days": c["days_in_scope"]}))
+def store_aliases(store_name: str) -> list[str]:
+    """'LCF Airtex' -> ['lcf airtex', 'airtex'] (accent/case folded)."""
+    full = _fold(store_name)
+    short = re.sub(r"^lcf\s+", "", full)
+    return [a for a in dict.fromkeys((full, short)) if a]
+
+
+def _segments(text: str) -> list[str]:
+    """Table rows, and prose split into sentences / clauses, each folded."""
+    out = []
+    for line in (text or "").splitlines():
+        if line.strip().startswith("|"):
+            out.append(_fold(line))
+        else:
+            out.extend(_fold(x) for x in re.split(r"(?<=[.!?;])\s+", line) if x.strip())
+    return out
+
+
+def disclosed_for_store(text: str, store_name: str, fd: int, n: int) -> bool:
+    """Coverage counts as disclosed for THIS store only when one table row or
+    one sentence names the store AND states its own 'fd of n' fraction. A
+    '21 of 28 days' written for Airtex never satisfies Beaumont."""
+    frac = _fraction_re(fd, n)
+    names = [re.compile(rf"(?<![a-z0-9]){re.escape(a)}(?![a-z0-9])") for a in store_aliases(store_name)]
+    return any(frac.search(seg) and any(nm.search(seg) for nm in names)
+               for seg in _segments(text))
+
+
+def _full_period_claim(text: str) -> str | None:
     prose = "\n".join(l for l in (text or "").splitlines() if not l.strip().startswith("|"))
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", prose):
         # "..., no parcial" / "not partial" asserts completeness; it is not a
@@ -278,17 +299,43 @@ def check_coverage(text: str, coverage: list[dict]) -> list[Issue]:
         hedge = re.sub(r"\b(no|not|ni)\s+(es\s+|is\s+)?(parcial|partial)\b", "", sentence, flags=re.I)
         if (_CLAIM_FULL.search(sentence) and _CLAIM_CTX.search(sentence)
                 and not _PARTIAL_WORDS.search(hedge)):
+            return sentence.strip()
+    return None
+
+
+def check_coverage(text: str, coverage: list[dict], unavailable: bool = False) -> list[Issue]:
+    issues: list[Issue] = []
+    if unavailable:
+        # The check could not run: never treat that as "every store FULL".
+        issues.append(Issue("COVERAGE_UNVERIFIED", "(scope)",
+                            "forecast coverage could not be read, so it is unverified"))
+        claim = _full_period_claim(text)
+        if claim:
+            issues.append(Issue("FULL_PERIOD_CLAIM", "(scope)",
+                                "a sentence presents the forecast comparison as full-period "
+                                "while coverage is unverified: " + claim[:160]))
+    partial = [c for c in coverage if c["coverage_status"] == "PARTIAL"]
+    if not partial:
+        return issues
+    for c in partial:
+        if not disclosed_for_store(text, c["store_name"], c["forecast_days"], c["days_in_scope"]):
             issues.append(Issue(
-                "FULL_PERIOD_CLAIM", ", ".join(c["store_name"] for c in partial),
-                "a sentence presents the forecast comparison as full-period: "
-                + sentence.strip()[:160]))
-            break
+                "COVERAGE_UNDISCLOSED", c["store_name"],
+                f"forecast covers {c['forecast_days']} of {c['days_in_scope']} days; "
+                "the answer does not say so", {"forecast_days": c["forecast_days"],
+                                                "days": c["days_in_scope"]}))
+    claim = _full_period_claim(text)
+    if claim and not unavailable:
+        issues.append(Issue(
+            "FULL_PERIOD_CLAIM", ", ".join(c["store_name"] for c in partial),
+            "a sentence presents the forecast comparison as full-period: " + claim[:160]))
     return issues
 
 
 # ── rendering ───────────────────────────────────────────────────────────────
 
-_ES = re.compile(r"\b(las|los|del|ventas|tienda|tiendas|período|periodo|semana|cumplieron)\b", re.I)
+_ES = re.compile(r"\b(las|los|del|ventas|tienda|tiendas|período|periodo|semana|cumplieron|"
+                 r"están|está|para|pero|según|días|día|siento|rango|esta|este|ese|con)\b", re.I)
 
 
 def is_spanish(text: str) -> bool:
@@ -382,12 +429,25 @@ def final_note(issues: list[Issue], coverage: list[dict], text: str) -> str:
     """Deterministic note appended to an answer that still needs it."""
     es = is_spanish(text)
     out = []
+    if any(i.kind == "COVERAGE_UNVERIFIED" for i in issues):
+        out.append("**Cobertura del forecast no verificada:** la verificación automática no pudo "
+                   "leer qué días tienen forecast. Lea cualquier comparación con el forecast como "
+                   "limitada a los días con forecast, no como una comparación del período completo."
+                   if es else
+                   "**Forecast coverage not verified:** the automatic check could not read which "
+                   "days have a forecast. Read any forecast comparison as limited to forecast "
+                   "days, not as a full-period comparison.")
     cov_needed = [c for c in coverage if c["coverage_status"] == "PARTIAL"
-                  and not _disclosed(text, c["forecast_days"], c["days_in_scope"])]
+                  and not disclosed_for_store(text, c["store_name"], c["forecast_days"],
+                                              c["days_in_scope"])]
     if cov_needed or any(i.kind == "FULL_PERIOD_CLAIM" for i in issues):
         out.append("**Cobertura del forecast (verificación automática):**" if es
                    else "**Forecast coverage (automatic check):**")
-        out.extend(coverage_lines([c for c in coverage if c["coverage_status"] != "FULL"], es))
+        # Only the stores still undisclosed; on a full-period claim, every
+        # PARTIAL store (the claim is wrong for all of them).
+        claim = any(i.kind == "FULL_PERIOD_CLAIM" for i in issues)
+        out.extend(coverage_lines(
+            [c for c in coverage if c["coverage_status"] == "PARTIAL"] if claim else cov_needed, es))
         out.append("La comparación con el forecast cubre solo los días con forecast; no es "
                    "una comparación del período completo." if es else
                    "The forecast comparison covers forecast days only; it is not a "
@@ -404,8 +464,13 @@ def final_note(issues: list[Issue], coverage: list[dict], text: str) -> str:
     return "\n".join(out)
 
 
-def review(text: str, coverage: list[dict] | None) -> list[Issue]:
-    return check_tables(text) + check_coverage(text, coverage or [])
+# Issues a rewrite can fix. COVERAGE_UNVERIFIED cannot be fixed by the model
+# (there are no facts to give it); it is disclosed in the final note instead.
+REWRITABLE = ("ARITHMETIC", "PERCENT", "COVERAGE_UNDISCLOSED", "FULL_PERIOD_CLAIM")
+
+
+def review(text: str, coverage: list[dict] | None, coverage_unavailable: bool = False) -> list[Issue]:
+    return check_tables(text) + check_coverage(text, coverage or [], coverage_unavailable)
 
 
 # ── which SQL needs a coverage check ────────────────────────────────────────
@@ -417,3 +482,35 @@ _FORECAST_COL = re.compile(r"\b(forecasted_sales|forecast_sales_base|sales_vs_fo
 
 def needs_forecast_check(sql: str) -> bool:
     return bool(sql and _R365_STORE_VIEW.search(sql) and _FORECAST_COL.search(sql))
+
+
+# ── query timeouts ──────────────────────────────────────────────────────────
+
+TIMEOUT_TOOL_MESSAGE = (
+    "QUERY TIMED OUT (statement timeout {seconds:.0f} s). This is NOT missing or "
+    "unavailable data -- the query was too large to finish in time. Narrow it and "
+    "retry: one store at a time, or one month at a time (e.g. per calendar month), "
+    "or a coarser aggregate. Never tell the user the data does not exist or is "
+    "unavailable because of a timeout.")
+
+
+def is_timeout_error(exc) -> bool:
+    import psycopg2.errors as E  # local: keep this module importable without a DB
+    return isinstance(exc, E.QueryCanceled) or "statement timeout" in str(exc).lower()
+
+
+_UNAVAILABLE_CLAIM = re.compile(
+    r"(no (est[aá]n? )?disponible|not available|unavailable|no data|no hay datos|sin datos|"
+    r"no existe|does not exist|could not (be )?(find|retrieve|obtain)|no se pudo obtener)", re.I)
+
+
+def timeout_note(text: str, timed_out: int) -> str:
+    """If a query timed out and the answer reads as 'data unavailable', say
+    plainly that it was a timeout, not missing data."""
+    if not timed_out or not _UNAVAILABLE_CLAIM.search(text or ""):
+        return ""
+    if is_spanish(text):
+        return ("**Nota:** una consulta superó el tiempo límite y se canceló. Eso no significa "
+                "que los datos falten: pida un rango más corto o una tienda a la vez.")
+    return ("**Note:** a query exceeded the time limit and was cancelled. That does not mean "
+            "the data is missing: ask for a shorter range or one store at a time.")
