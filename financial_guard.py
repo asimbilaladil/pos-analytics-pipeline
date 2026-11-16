@@ -230,8 +230,13 @@ def forecast_coverage(cur, establishment_id, start: str, end_exclusive: str) -> 
     for r in cur.fetchall():
         r = dict(r)
         fd = int(r["forecast_days"] or 0)
-        status = "NONE" if fd == 0 else ("FULL" if fd >= n_days else "PARTIAL")
-        out.append({**r, "forecast_days": fd, "days_in_scope": n_days,
+        loaded = int(r["days_loaded"] or 0)
+        # Coverage is measured against the days R365 has LOADED: a day that is
+        # not loaded yet (the current period) is unknown, not "no forecast" --
+        # it is reported separately as days_not_loaded.
+        status = "NONE" if fd == 0 else ("FULL" if fd >= loaded else "PARTIAL")
+        out.append({**r, "forecast_days": fd, "days_in_scope": loaded,
+                    "days_requested": n_days, "days_not_loaded": max(n_days - loaded, 0),
                     "coverage_status": status,
                     "days_without_forecast": ranges(r.get("days_without_forecast") or [])})
     return out
@@ -319,6 +324,9 @@ def coverage_lines(coverage: list[dict], es: bool) -> list[str]:
                 + f"{_usd(c['net_sales'])}.")
             continue
         miss = _span(c["days_without_forecast"], es)
+        if c.get("days_not_loaded"):
+            miss += (f"; {c['days_not_loaded']} días del rango aún no cargados" if es else
+                     f"; {c['days_not_loaded']} days of the range not loaded yet")
         if es:
             lines.append(
                 f"- {c['store_name']}: forecast en {c['forecast_days']} de "

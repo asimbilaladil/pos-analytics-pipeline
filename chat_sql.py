@@ -3477,6 +3477,8 @@ def forecast_coverage_payload(coverage: list[dict]) -> list[dict]:
         "coverage_status": c["coverage_status"],
         "forecast_days": c["forecast_days"],
         "days_in_scope": c["days_in_scope"],
+        "days_not_loaded": c.get("days_not_loaded", 0),
+        "coverage_basis": "loaded R365 days; days not loaded yet are unknown, not 'no forecast'",
         "days_without_forecast": [[a.isoformat(), b.isoformat()]
                                   for a, b in c["days_without_forecast"]],
         "sales_on_forecast_days": money(c["sales_on_forecast_days"]),

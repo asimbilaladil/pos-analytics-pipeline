@@ -360,6 +360,19 @@ check("P11 coverage: Airtex/Beaumont/Ella PARTIAL 21/28, Downtown NONE, 8 FULL",
       and cov["LCF Downtown Houston"]["coverage_status"] == "NONE"
       and sum(c["coverage_status"] == "FULL" for c in cov.values()) == 8
       and all(cov[s]["forecast_days"] == 21 for s in ("LCF Airtex", "LCF Beaumont", "LCF Ella")))
+ro = C._ro_conn()
+try:
+    cur = ro.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cov12 = G.forecast_coverage(cur, None, "2026-11-05", "2026-12-03")
+finally:
+    ro.rollback()
+    ro.close()
+check("current period (P12, partly loaded): unloaded days are not 'no forecast'",
+      cov12 and all(c["days_requested"] == 28 and c["days_not_loaded"] == 28 - c["days_in_scope"]
+                    and c["coverage_status"] != "PARTIAL" for c in cov12)
+      and not [i for i in G.review("| Store | Sales | Forecast | Difference |\n|---|---|---|---|\n"
+                                   "| A | $10.00 | $5.00 | +$5.00 |", cov12) if i.kind == "COVERAGE_UNDISCLOSED"],
+      str({c["store_name"]: (c["coverage_status"], c["forecast_days"], c["days_in_scope"]) for c in cov12}))
 check("P11 coverage: the exact uncovered weeks",
       cov["LCF Airtex"]["days_without_forecast"] == [(date(2026, 10, 29), date(2026, 11, 4))]
       and cov["LCF Ella"]["days_without_forecast"] == [(date(2026, 10, 29), date(2026, 11, 4))]
