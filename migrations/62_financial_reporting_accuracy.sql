@@ -247,4 +247,8 @@ COMMENT ON VIEW v_revel_sales_metrics_daily_llm IS
   'payments_received matches v_payments_daily_v2 (payment date). None of these '
   'is verified against a Revel UI report definition.';
 
+-- Same owner as every other analytics view, whoever applies this file (the
+-- replaced R365 views keep their existing owner automatically).
+ALTER VIEW v_revel_sales_metrics_daily_llm OWNER TO laynes_user;
+
 COMMIT;

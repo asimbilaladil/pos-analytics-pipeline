@@ -505,12 +505,41 @@ finally:
 check("store-restricted credential: guard coverage limited to the allowed store",
       [c["store_name"] for c in scoped] == ["LCF Airtex"], str([c["store_name"] for c in scoped]))
 
+# Rollback script: recreates migration 54's views exactly (checked as TEMP views).
+RB = open("docs/rollback/62_63_financial_reporting_rollback.sql").read()
+check("rollback drops the new view and both R365 views, restores the laynes_ro grants",
+      all(x in RB for x in ("DROP VIEW IF EXISTS v_revel_sales_metrics_daily_llm;",
+                            "DROP VIEW v_r365_store_period_llm;", "DROP VIEW v_r365_store_weekly_llm;",
+                            "GRANT SELECT ON v_r365_store_weekly_llm  TO laynes_ro;",
+                            "GRANT SELECT ON v_r365_store_period_llm  TO laynes_ro;")))
+check("migration 62 pins the new view's owner", "ALTER VIEW v_revel_sales_metrics_daily_llm OWNER TO laynes_user;" in MIG)
+conn = rw_conn()
+try:
+    cur = conn.cursor()
+    rb_names = migration_sandbox.install(cur, RB)
+    same = []
+    for v in rb_names:
+        cur.execute("SELECT pg_get_viewdef(%s::regclass, true), pg_get_viewdef(%s::regclass, true)",
+                    ("pg_temp." + v, "public." + v))
+        a, b = cur.fetchone()
+        cur.execute(f"SELECT count(*) FROM ((SELECT * FROM public.{v} EXCEPT SELECT * FROM pg_temp.{v}) "
+                    f"UNION ALL (SELECT * FROM pg_temp.{v} EXCEPT SELECT * FROM public.{v})) x")
+        # inside this session production's own definition names the shadowed
+        # weekly view as public.<name>; that qualifier is the only allowed diff
+        same.append(a == b.replace("public.v_r365_store_weekly_llm", "v_r365_store_weekly_llm")
+                    and cur.fetchone()[0] == 0)
+    check("rollback recreates the current production R365 views exactly (definition and values)",
+          rb_names == ["v_r365_store_weekly_llm", "v_r365_store_period_llm"] and all(same), str(same))
+finally:
+    conn.rollback()
+    conn.close()
+
 mig63 = open("migrations/63_financial_reporting_grants.sql").read()
 grants63 = [l for l in mig63.splitlines() if l.strip().upper().startswith("GRANT")]
 check("migration 63 grants SELECT on the new view only",
       grants63 == ["GRANT SELECT ON v_revel_sales_metrics_daily_llm TO laynes_ro;"], str(grants63))
 check("migrations 62/63 never grant raw tables or write privileges",
-      not re.search(r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER)\b|ALL PRIVILEGES|GRANT\s+\w+\s+ON\s+"
+      not re.search(r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP)\b|\bALTER\s+(TABLE|ROLE|SCHEMA|DATABASE|DEFAULT)\b|ALL PRIVILEGES|GRANT\s+\w+\s+ON\s+"
                     r"(PAYMENTS_V2|R365_STORE_DAILY|ORDERS_V2)\b",
                     re.sub(r"--[^\n]*", "", (MIG + mig63)).upper().replace("DELETED", "")))
 ro = C._ro_conn()
