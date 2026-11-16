@@ -114,8 +114,11 @@ def build_mcp() -> FastMCP:
 
     @mcp.tool(description=(
         "Revel POS sales and R365 net/gross sales with guest and transaction counts, per "
-        "store, grouped by day or store. Revel and R365 figures are separate sources with "
-        "exact definitions in the result; missing data is null, never zero."))
+        "store, grouped by day or store. Revel pos_sales is the ticket total INCLUDING tax; "
+        "explicit Revel gross before discounts, discounts, comps, net sales excluding tax, "
+        "tax, total including tax and payments received are returned alongside. Revel and "
+        "R365 figures are separate sources with exact definitions in the result; missing "
+        "data is null, never zero."))
     async def get_sales_guest_counts(
             ctx: Context, start_date: IsoDate, end_date: IsoDate,
             group_by: Literal["day", "store"] = "day",
@@ -128,8 +131,9 @@ def build_mcp() -> FastMCP:
 
     @mcp.tool(description=(
         "Labor cost, labor hours and labor % of sales per store. One source per result "
-        "(R365 or Revel timesheet estimate) with the sales denominator named; sources are "
-        "never mixed."))
+        "(R365 or Revel timesheet estimate) with the sales denominator named and marked "
+        "includes_tax; the Revel result also gives labor % of net sales excluding tax. "
+        "Sources are never mixed."))
     async def get_labor_metrics(
             ctx: Context, start_date: IsoDate, end_date: IsoDate,
             source: Annotated[Literal["r365", "revel"] | None, Field(

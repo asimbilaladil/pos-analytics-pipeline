@@ -56,6 +56,8 @@ class FakeDB:
             return [{"establishment_id": i} for i in self.hme_mapped]
         if "FROM v_orders_classified" in sql:
             return pick(self.revel)
+        if "FROM v_payments_daily_v2" in sql:
+            return pick(getattr(self, "payments", []))
         if "FROM v_r365_store_daily_llm" in sql:
             return pick(self.r365)
         if "FROM v_labor_daily_context" in sql:

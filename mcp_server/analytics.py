@@ -20,6 +20,7 @@ import concurrent.futures as cf
 import contextlib
 import time
 from datetime import date, timedelta
+from decimal import Decimal as D
 
 import psycopg2
 import psycopg2.extras
@@ -136,12 +137,54 @@ SELECT establishment_id, business_date,
        count(*) FILTER (WHERE txn_class = 'REAL')            AS real_transactions,
        count(*) FILTER (WHERE txn_class = 'COMP')            AS comp_tickets,
        count(*) FILTER (WHERE txn_class = 'EMPTY')           AS empty_tickets,
-       sum(final_total) FILTER (WHERE txn_class = 'REAL')    AS real_sales
+       sum(final_total) FILTER (WHERE txn_class = 'REAL')    AS real_sales,
+       -- Explicit metrics (definitions_version 2026-11-17); the same formulas
+       -- as v_revel_sales_metrics_daily_llm (migration 62).
+       sum(subtotal) FILTER (WHERE txn_class IN ('REAL', 'COMP')) AS gross_sales_before_discounts,
+       sum(COALESCE(discount_amount, 0)) FILTER (WHERE txn_class = 'REAL') AS discounts,
+       sum(subtotal) FILTER (WHERE txn_class = 'COMP')       AS comps,
+       sum(tax) FILTER (WHERE txn_class = 'REAL')            AS tax
   FROM v_orders_classified
  WHERE establishment_id = ANY(%(ids)s)
    AND business_date >= %(start)s AND business_date < %(end)s
  GROUP BY establishment_id, business_date
 """
+
+# Payments by payment date: the reference side of the Revel reconciliation gate.
+_REVEL_PAYMENTS_SQL = """
+SELECT establishment_id, business_date, payment_amount
+  FROM v_payments_daily_v2
+ WHERE establishment_id = ANY(%(ids)s)
+   AND business_date >= %(start)s AND business_date < %(end)s
+"""
+
+DEFINITIONS_VERSION = "2026-11-17"
+_METRIC_KEYS = ("real_sales", "gross_sales_before_discounts", "discounts", "comps", "tax")
+
+
+def revel_metrics(rv: dict | None, pay: dict | None) -> dict:
+    """Explicit Revel sales metrics for one store-day (or summed rows).
+    net = gross - discounts - comps; total_including_tax = legacy pos_sales."""
+    if rv is None:
+        return {}
+    def z(k):
+        v = rv.get(k)
+        return float(v) if v is not None else 0.0
+    gross, disc, comps = z("gross_sales_before_discounts"), z("discounts"), z("comps")
+    return {
+        "gross_sales_before_discounts": round(gross, 2),
+        "discounts": round(disc, 2),
+        "comps": round(comps, 2),
+        "net_sales_excluding_tax": round(gross - disc - comps, 2),
+        "tax": round(z("tax"), 2),
+        "total_including_tax": round(z("real_sales"), 2),
+        "payments_received": (None if pay is None or pay.get("payment_amount") is None
+                              else round(float(pay["payment_amount"]), 2)),
+    }
+
+
+def _sum_rows(rows_: list[dict], keys) -> dict:
+    return {k: sum((D(str(r[k])) for r in rows_ if r.get(k) is not None), D(0)) for k in keys}
 
 _R365_DAILY_SQL = """
 SELECT establishment_id, business_date, day_status, net_sales, gross_sales,
@@ -153,16 +196,31 @@ SELECT establishment_id, business_date, day_status, net_sales, gross_sales,
 
 SALES_DEFINITIONS = {
     "pos_sales_revel": ("SUM(final_total) over Revel REAL tickets (txn_class='REAL': "
-                        "final_total > 0 with items). Revel POS total; the project's "
-                        "definition of 'sales'. Comped, empty and deleted tickets are "
-                        "excluded from sales and from the real transaction count."),
+                        "final_total > 0 with items). INCLUDES SALES TAX: it is the "
+                        "ticket total, not net sales. Unchanged for backward "
+                        "compatibility and identical to total_including_tax_revel. "
+                        "Comped, empty and deleted tickets are excluded."),
+    "gross_sales_before_discounts_revel": ("SUM(subtotal) over REAL + COMP tickets: item "
+                                           "sales before discounts and comps, excluding tax."),
+    "discounts_revel": "SUM(discount_amount) over REAL tickets.",
+    "comps_revel": "SUM(subtotal) over COMP tickets ($0 tickets with items: fully comped).",
+    "net_sales_excluding_tax_revel": "gross_sales_before_discounts - discounts - comps.",
+    "tax_revel": "SUM(tax) over REAL tickets.",
+    "total_including_tax_revel": ("SUM(final_total) over REAL tickets = net sales excl. tax "
+                                  "+ tax (to the cent on all but a handful of tickets)."),
+    "payments_received_revel": ("Revel payments by PAYMENT date (v_payments_daily_v2): the "
+                                "reconciliation reference. Not a sales figure."),
+    "revel_definitions_note": ("None of the Revel figures is verified against a Revel UI "
+                               "report definition; a Revel screen figure may differ."),
     "real_transactions_revel": ("Count of Revel REAL tickets (a transaction/check as the "
                                 "POS records it). NOT guests: Revel has no verified guest "
                                 "count."),
     "comp_tickets_revel": "$0 tickets that have items (employee meals / de-facto voids).",
     "empty_tickets_revel": "$0 tickets with no items (POS artefacts).",
     "net_sales_r365": "R365 daily-report net sales (R365 is authoritative for net sales).",
-    "gross_sales_r365": "R365 daily-report gross sales.",
+    "gross_sales_r365": ("R365 daily-report gross sales (R365's own figure; equal to R365 "
+                         "net_sales on most loaded days). Not the same as Revel "
+                         "gross_sales_before_discounts."),
     "guest_count_r365": "R365 daily-report guest count (R365's own figure).",
     "check_count_r365": ("R365 daily-report check count. Differs from Revel REAL "
                          "transactions by definition; the two are never merged."),
@@ -181,6 +239,8 @@ def sales_guest_counts(ids: list[int], start: date, end: date, group_by: str) ->
     r365_gates = _gates(ids, start, end_x, ["r365"])
     revel = {(r["establishment_id"], r["business_date"]): r
              for r in _query(_REVEL_SQL, params)}
+    pays = {(r["establishment_id"], r["business_date"]): r
+            for r in _query(_REVEL_PAYMENTS_SQL, params)}
     r365 = {(r["establishment_id"], r["business_date"]): r
             for r in _query(_R365_DAILY_SQL, params)}
 
@@ -225,7 +285,8 @@ def sales_guest_counts(ids: list[int], start: date, end: date, group_by: str) ->
                         "pos_sales": num(rv["real_sales"]),
                         "real_transactions": int(rv["real_transactions"]),
                         "comp_tickets": int(rv["comp_tickets"]),
-                        "empty_tickets": int(rv["empty_tickets"])},
+                        "empty_tickets": int(rv["empty_tickets"]),
+                        **revel_metrics(rv, pays.get((i, d)))},
                     "r365": None if rr is None else {
                         "day_status": rr["day_status"],
                         "net_sales": num(rr["net_sales"]), "gross_sales": num(rr["gross_sales"]),
@@ -247,6 +308,13 @@ def sales_guest_counts(ids: list[int], start: date, end: date, group_by: str) ->
                     "real_transactions": int(sum(r["real_transactions"] for r in rvs)),
                     "comp_tickets": int(sum(r["comp_tickets"] for r in rvs)),
                     "empty_tickets": int(sum(r["empty_tickets"] for r in rvs)),
+                    **revel_metrics(
+                        _sum_rows(rvs, _METRIC_KEYS),
+                        ({"payment_amount": sum((D(str(pays[(i, d)]["payment_amount"]))
+                                                 for d in rev_days if (i, d) in pays
+                                                 and pays[(i, d)]["payment_amount"] is not None),
+                                                D(0))}
+                         if any((i, d) in pays for d in rev_days) else None)),
                     "days_included": len(rvs), "days_requested": len(requested_days)},
                 "r365": None if not rrs else {
                     "net_sales": tot(rrs, "net_sales"), "gross_sales": tot(rrs, "gross_sales"),
@@ -267,6 +335,7 @@ def sales_guest_counts(ids: list[int], start: date, end: date, group_by: str) ->
         "rows": rows,
         "stores": stores,
         "definitions": SALES_DEFINITIONS,
+        "definitions_version": DEFINITIONS_VERSION,
         "notes": ["Revel and R365 figures are separate sources and are never added or "
                   "blended. A null means no verified data, never zero."],
     }
@@ -284,14 +353,24 @@ SELECT establishment_id, business_date, labor_hours, estimated_labor_cost,
 LABOR_DEFINITIONS = {
     "r365": {"labor_cost": "R365 labour cost (R365's own figure; not payroll).",
              "labor_hours": "R365 labour hours.",
-             "sales_denominator": "R365 net sales for the same store-days.",
+             "sales_denominator": ("R365 net sales for the same store-days (R365's own "
+                                   "figure; excludes tax)."),
              "labor_pct": "SUM(labor_cost) / SUM(net_sales) * 100, recomputed from sums."},
     "revel": {"labor_cost": ("ESTIMATED cost = clocked hours x role wage. Not payroll; "
                              "excludes overtime premium, taxes and burden."),
               "labor_hours": ("Elapsed clocked time; breaks are not recorded so it "
                               "includes unpaid break time and overstates paid hours."),
-              "sales_denominator": "Revel REAL-ticket sales (SUM(final_total), txn_class REAL).",
-              "labor_pct": "SUM(estimated_labor_cost) / SUM(REAL sales) * 100."},
+              "sales_denominator": ("Revel REAL-ticket sales (SUM(final_total), txn_class "
+                                    "REAL). INCLUDES SALES TAX; unchanged for backward "
+                                    "compatibility."),
+              "labor_pct": ("SUM(estimated_labor_cost) / SUM(REAL sales incl. tax) * 100. "
+                            "Unchanged for backward compatibility; understates labor % "
+                            "against net sales."),
+              "labor_pct_net_sales_excluding_tax": (
+                  "SUM(estimated_labor_cost) / SUM(net_sales_excluding_tax) * 100, where "
+                  "net = gross before discounts - discounts - comps (no tax)."),
+              "sales_denominator_net_excluding_tax": (
+                  "Revel net sales excluding tax for the same store-days.")},
 }
 
 
@@ -345,7 +424,7 @@ def labor_metrics(ids: list[int], start: date, end: date, source: str | None) ->
                 "labor_cost": round(float(sum(cost)), 2) if cost else None,
                 "labor_hours": round(float(sum(hrs)), 2) if hrs else None,
                 "labor_pct": pct,
-                "sales_denominator": {"basis": "r365_net_sales",
+                "sales_denominator": {"basis": "r365_net_sales", "includes_tax": False,
                                       "amount": round(sum_sales, 2) if sum_sales else None},
                 "days_included": len(days), "days_requested": len(req_days),
                 "status": st})
@@ -372,6 +451,12 @@ def labor_metrics(ids: list[int], start: date, end: date, source: str | None) ->
             sum_sales = float(sum(sl)) if sl else None
             pct = (round(float(sum(cost)) / sum_sales * 100, 2)
                    if same and sum_sales else None)
+            # Additive (definitions_version 2026-11-17): the same ratio against
+            # net sales excluding tax. labor_pct above keeps its meaning.
+            net = revel_metrics(_sum_rows([sales[(i, d)] for d in days], _METRIC_KEYS),
+                                None).get("net_sales_excluding_tax") if days else None
+            pct_net = (round(float(sum(cost)) / net * 100, 2)
+                       if same and net else None)
             open_shifts = sum(int(lab[(i, d)]["open_shift_count"] or 0) for d in days)
             missing_wage = sum(int(lab[(i, d)]["missing_wage_shift_count"] or 0) for d in days)
             st = "ok" if ok and len(days) == len(req_days) and pct is not None else (
@@ -383,8 +468,12 @@ def labor_metrics(ids: list[int], start: date, end: date, source: str | None) ->
                 "labor_cost_basis": "estimated (hours x wage), not payroll",
                 "labor_hours": round(float(sum(hrs)), 2) if hrs else None,
                 "labor_pct": pct,
-                "sales_denominator": {"basis": "revel_real_ticket_sales",
+                "sales_denominator": {"basis": "revel_real_ticket_sales", "includes_tax": True,
                                       "amount": round(sum_sales, 2) if sum_sales else None},
+                "labor_pct_net_sales_excluding_tax": pct_net,
+                "sales_denominator_net_excluding_tax": {
+                    "basis": "revel_net_sales_excluding_tax", "includes_tax": False,
+                    "amount": net if same and net else None},
                 "days_included": len(days), "days_requested": len(req_days),
                 "open_shifts_excluded": open_shifts,
                 "shifts_missing_wage": missing_wage, "status": st})
@@ -400,6 +489,7 @@ def labor_metrics(ids: list[int], start: date, end: date, source: str | None) ->
                    "timezone": TZ},
         "rows": out_rows, "coverage": store_meta,
         "definitions": LABOR_DEFINITIONS[chosen],
+        "definitions_version": DEFINITIONS_VERSION,
         "notes": ["labor_pct is computed only where the labor numerator and the sales "
                   "denominator come from the same source and cover the same days; "
                   "otherwise it is null with status partial/unavailable."],
