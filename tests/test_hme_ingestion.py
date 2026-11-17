@@ -337,7 +337,9 @@ try:
     SAFE_LLM_VIEWS = {"v_hme_store_daily_llm", "v_hme_outliers_daily_llm",
                       "v_hme_goal_history_llm", "v_hme_day_completeness_llm",
                       # migration 61: per-store status only (no figures)
-                      "v_hme_store_status_llm"}
+                      "v_hme_store_status_llm",
+                      # migration 65: per-store-day trust grade (status only)
+                      "v_hme_store_day_trust_llm"}
     cur = conn.cursor()
     # Match HME relations by prefix. A substring match would also catch
     # "establis(hme)nts", which is a Revel table and is legitimately readable.
@@ -347,7 +349,7 @@ try:
                      AND c.relkind IN ('r','v','m')
                      AND has_table_privilege('laynes_ro', c.oid, 'SELECT')""")
     readable = {r[0] for r in cur.fetchall()}
-    check("laynes_ro reads exactly the five safe HME views (raw hme_store_ingest_result stays denied)",
+    check("laynes_ro reads exactly the six safe HME views (raw hme_store_ingest_result stays denied)",
           readable == SAFE_LLM_VIEWS, str(sorted(readable)))
     check("no raw or internal HME relation is readable by laynes_ro",
           not (readable - SAFE_LLM_VIEWS), str(sorted(readable - SAFE_LLM_VIEWS)))
