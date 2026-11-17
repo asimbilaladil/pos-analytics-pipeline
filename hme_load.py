@@ -32,13 +32,44 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ov
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "hme_load/1.5.0"
+LOADER_VERSION = "hme_load/1.6.0"
 RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 FORBIDDEN_KEYS = ("token", "id_token", "ctx_token", "cookie", "password", "authorization")
 
 
 class LoadAborted(Exception):
     pass
+
+
+class StoreNotInExtract(LoadAborted):
+    """Store-scoped load: the scoped store returned no rows for the date.
+    Nothing is written; the date stays failed (retryable)."""
+
+
+def scope_doc(doc, stores):
+    """A copy of an extract keeping ONLY the given HME store numbers' rows.
+    Source totals are recomputed over those rows, so the day-level checks in
+    reconcile() measure exactly what is loaded -- with the same tolerances."""
+    import copy
+    keep = {str(s) for s in stores}
+    d = copy.deepcopy(doc)
+    for k in list(d["facts"]):
+        d["facts"][k] = [r for r in d["facts"][k] if str(r["hme_store_number"]) in keep]
+    tots = d.get("source_totals") or {}
+    sd = d["facts"].get("store_daily") or []
+    if tots.get("store_daily"):
+        for col in ("total_orders", "regular_orders", "disastrous_orders"):
+            if col in tots["store_daily"]:
+                tots["store_daily"][col] = sum(r.get(col) or 0 for r in sd)
+    od = d["facts"].get("outliers_daily") or []
+    if tots.get("outliers_daily") and "car_departures" in tots["outliers_daily"]:
+        tots["outliers_daily"]["car_departures"] = sum(r.get("car_departures") or 0 for r in od)
+    c = dict(d.get("completeness") or {})
+    c["missing_verified_detail"] = [m for m in (c.get("missing_verified_detail") or [])
+                                    if str(m.get("hme_store_number")) in keep]
+    c["store_scope"] = sorted(keep)
+    d["completeness"] = c
+    return d
 
 
 # ── per-store grading (partial-store policy) ────────────────────────────────
@@ -225,7 +256,7 @@ def reconcile(doc):
 
 def record_failed_run(conn, business_date, *, status, reason, attempt=1,
                       started_at=None, tenant_scope_ok=None, freshness=None,
-                      extractor_version=None):
+                      extractor_version=None, store_scope=None):
     """Record an attempt that never reached a successful load.
 
     Committed on its own connection state so a failure is still auditable. Only
@@ -234,20 +265,25 @@ def record_failed_run(conn, business_date, *, status, reason, attempt=1,
     if status not in ("failed", "aborted_tenant_scope", "partial"):
         raise ValueError(f"unexpected failure status {status!r}")
     cur = conn.cursor()
-    cur.execute("""
+    # store_scope is only ever named for a store-scoped run, so the normal
+    # path works on a database with or without migration 64.
+    scope_col, scope_val = ((", store_scope", ",%s") if store_scope else ("", ""))
+    cur.execute(f"""
         INSERT INTO hme_ingest_run (business_date, requested_date, source,
             source_reports, started_at, finished_at, tenant_scope_ok, store_count,
             rows_received, rows_written, reconciliation_ok, status, warnings,
-            attempt, extractor_version, loader_version, freshness_ok, freshness_detail)
+            attempt, extractor_version, loader_version, freshness_ok, freshness_detail
+            {scope_col})
         VALUES (%s,%s,'powerbi_querydata',%s,%s,now(),%s,NULL,NULL,0,NULL,%s,%s,
-                %s,%s,%s,%s,%s)
+                %s,%s,%s,%s,%s{scope_val})
         RETURNING run_id
     """, (business_date, business_date, [],
           started_at or datetime.datetime.now(datetime.timezone.utc),
           tenant_scope_ok, status, [reason[:500]], attempt,
           extractor_version, LOADER_VERSION,
           None if freshness is None else bool(freshness.get("ok")),
-          None if freshness is None else json.dumps(freshness)))
+          None if freshness is None else json.dumps(freshness))
+        + ((sorted(str(x) for x in store_scope),) if store_scope else ()))
     run_id = cur.fetchone()[0]
     conn.commit()
     return run_id
@@ -374,7 +410,16 @@ def apply_goal_observation(cur, obs, obs_date, run_id):
     return _close_and_open(cur, sn, obs_date, vals, run_id)
 
 
-def load(doc, conn, dry_run=False, allow_partial_stores=False):
+def load(doc, conn, dry_run=False, allow_partial_stores=False, only_stores=None):
+    """Load one extracted day.
+
+    only_stores: HME store numbers for a STORE-SCOPED load (migration 64). The
+    full extract still passes every tenant/security check; then only these
+    stores' rows, goals and per-store results are written, the run is recorded
+    with store_scope, and nothing about any other store -- nor the day's
+    network verdict -- is touched. Each scoped store must be an active VERIFIED
+    mapping and must be present in the extract (StoreNotInExtract otherwise).
+    """
     date = doc["business_date"]
     if doc["business_date"] != doc["requested_date"]:
         raise LoadAborted("business_date != requested_date; date provenance broken")
@@ -404,6 +449,24 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
         raise LoadAborted(
             f"{len(unknown)} store(s) not in hme_store_mapping -> {unknown[:10]}; "
             f"tenant scope unproven, refusing to load")
+
+    # --- STORE SCOPE (migration 64): checked on the FULL extract above, then
+    # everything below sees only the scoped stores. -------------------------
+    scope = sorted({str(s) for s in only_stores}) if only_stores else None
+    if scope:
+        bad = [s for s in scope
+               if s not in inv or (inv[s]["mapping_status"] or "").upper() != "VERIFIED"]
+        if bad:
+            raise LoadAborted(f"store scope {bad} is not an active VERIFIED HME mapping; "
+                              f"refusing a store-scoped load")
+        absent = [s for s in scope if s not in payload_stores]
+        if absent:
+            raise StoreNotInExtract(
+                f"scoped store(s) {absent} returned no rows for {date}; nothing written")
+        doc = scope_doc(doc, scope)
+        payload_stores = payload_stores & set(scope)
+        known = set(scope)
+        mapping = [m for m in mapping if m["hme_store_number"] in known]
 
     # --- COMPLETENESS: absence is graded, never silently accepted -----------
     # A missing VERIFIED store means the day cannot represent Laynes coverage
@@ -454,6 +517,8 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
             "missing_verified_detail") or [],
         "empty_rows_dropped": dropped_empty,
     }
+    if scope:
+        completeness["store_scope"] = scope
 
     # The extractor's own freshness verdict is honoured here too: an incomplete
     # day must never be written as if it were final.
@@ -483,14 +548,15 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
             f"VERIFIED/OUT_OF_SCOPE; counted in store_count only")
 
     rows_received = sum(len(v) for v in doc["facts"].values())
-    cur.execute("""
+    scope_col, scope_val = ((", store_scope", ",%s") if scope else ("", ""))
+    cur.execute(f"""
         INSERT INTO hme_ingest_run (business_date, requested_date, source, source_reports,
             query_hash, started_at, finished_at, tenant_scope_ok, tenant_scope_detail,
             store_count, verified_store_count, out_of_scope_store_count,
             rows_received, reconciliation_ok, reconciliation_detail,
             status, warnings, extractor_version, loader_version, attempt,
-            freshness_ok, freshness_detail)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,%s)
+            freshness_ok, freshness_detail{scope_col})
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,%s{scope_val})
         RETURNING run_id
     """, (date, doc["requested_date"], doc["source"], doc["source_reports"],
           doc.get("query_hash"), doc["started_at"], doc["finished_at"],
@@ -500,7 +566,8 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
           doc.get("extractor_version"), LOADER_VERSION, int(doc.get("attempt", 1)),
           doc.get("freshness_ok"),
           json.dumps({"freshness": doc.get("freshness_detail"),
-                      "completeness": completeness})))
+                      "completeness": completeness}))
+        + ((scope,) if scope else ()))
     run_id = cur.fetchone()[0]
 
     trend = {r["hme_store_number"]: r for r in doc["facts"].get("trend_store_daily", [])}
@@ -581,6 +648,11 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
     # let the 2026-09-16 Trend/PA divergence be recorded as a clean success.)
     cur.execute("SELECT id FROM establishments")
     est_ids = [r[0] for r in cur.fetchall()]
+    if scope:
+        # Results only for the scoped stores' establishments: no row is written
+        # for any other store, so their latest per-store status is untouched.
+        est_ids = [m["revel_establishment_id"] for m in mapping
+                   if m["revel_establishment_id"] is not None]
     store_results = grade_stores(doc, mapping, est_ids, recon)
     psycopg2.extras.execute_batch(cur, """
         INSERT INTO hme_store_ingest_result (run_id, business_date, revel_establishment_id,
@@ -625,7 +697,8 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False):
             "goal_rows": goal_written, "goal_stats": goal_stats,
             "reconciliation_ok": recon_ok, "reconciliation": recon,
             "status": final_status, "completeness": completeness,
-            "store_count": len(payload_stores), "store_results": store_results}
+            "store_count": len(payload_stores), "store_results": store_results,
+            "store_scope": scope}
 
 
 def main():
