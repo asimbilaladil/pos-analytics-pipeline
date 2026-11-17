@@ -295,6 +295,77 @@ def test_hme_unreconciled_days_excluded_not_served(db):
     assert s["status"] == "partial"
 
 
+def _unverified(store, d):
+    return {"establishment_id": store, "store_name": "LCF Mission Bend", "business_date": d,
+            "trust_status": "UNVERIFIED", "grade_source": "STORE_RESULT",
+            "store_result_status": "PARTIAL", "store_result_reason": "RECONCILIATION_MISMATCH",
+            "store_check_failed": True, "day_check_failed": False}
+
+
+def test_hme_store_level_unverified_days_excluded_never_ok(db):
+    # Migration 65: the network day reconciled but THIS store's own row did not.
+    ds = days(D0, 3)
+    db.hme_mapped = {25}
+    db.hme = [hme_row(25, d, cars=100, total=100 + 100 * i) for i, d in enumerate(ds)]
+    db.gate_for("hme", 25, gate(False, [
+        "HME store-level reconciliation NOT verified for LCF Mission Bend on 2026-10-23 "
+        "(PARTIAL / RECONCILIATION_MISMATCH: this store's own check failed)"],
+        hme={"unreconciled_days": [], "store_day_trust": {
+            "available": True, "verified_store_days": 2,
+            "unverified_store_days": [_unverified(25, "2026-10-23")]}}))
+    r = a.drive_thru_speed([25], D0, ds[-1], None)
+    s = r["stores"][0]
+    assert r["status"] == "partial" and s["status"] == "partial"
+    assert s["trust_status"] == "VERIFIED_SUBSET"
+    assert s["days_included"] == 2 and s["drive_thru_cars"] == 200
+    assert s["avg_speed_of_service_seconds"] == 200.0            # days 1 and 3 only
+    assert s["days_excluded_unreconciled"] == ["2026-10-23"]
+    assert s["days_excluded_store_unverified"] == [{
+        "date": "2026-10-23", "store_result_status": "PARTIAL",
+        "store_result_reason": "RECONCILIATION_MISMATCH", "grade_source": "STORE_RESULT"}]
+    assert s["coverage"]["store_day_trust"] == {"available": True, "verified_store_days": 2,
+                                                "unverified_store_days": 1}
+
+
+def test_hme_single_unverified_store_day_is_unavailable_with_reason(db):
+    db.hme_mapped = {25, 6}
+    db.hme = [hme_row(25, D0), hme_row(6, D0)]
+    reason = ("HME store-level reconciliation NOT verified for LCF Mission Bend on "
+              "2026-10-22 (PARTIAL / RECONCILIATION_MISMATCH)")
+    db.gate_for("hme", 25, gate(False, [reason], hme={"unreconciled_days": [], "store_day_trust": {
+        "available": True, "verified_store_days": 0,
+        "unverified_store_days": [_unverified(25, "2026-10-22")]}}))
+    r = a.drive_thru_speed([6, 25], D0, D0, None)
+    s25 = next(s for s in r["stores"] if s["store_id"] == 25)
+    s6 = next(s for s in r["stores"] if s["store_id"] == 6)
+    assert r["status"] == "partial"                     # one store's failure is never hidden
+    assert s6["status"] == "ok" and s6["trust_status"] == "VERIFIED"
+    assert s25["status"] == "unavailable" and s25["trust_status"] == "UNAVAILABLE"
+    assert s25["reason"] == reason and s25["drive_thru_cars"] is None
+    assert s25["avg_speed_of_service_seconds"] is None
+
+
+def test_hme_store_trust_unknown_withholds_everything(db):
+    db.hme_mapped = {6}
+    db.hme = [hme_row(6, D0)]
+    db.gate_for("hme", 6, gate(False, [
+        "HME store-level trust could not be determined (v_hme_store_day_trust_llm "
+        "unavailable); HME figures cannot be shown as verified"],
+        hme={"unreconciled_days": [], "store_day_trust": {"available": False}}))
+    s = a.drive_thru_speed([6], D0, D0, None)["stores"][0]
+    assert s["status"] == "unavailable" and s["avg_speed_of_service_seconds"] is None
+    assert s["days_excluded_store_unverified"] == []
+
+
+def test_hme_trust_status_definitions_are_published(db):
+    db.hme_mapped = {6}
+    db.hme = [hme_row(6, D0)]
+    r = a.drive_thru_speed([6], D0, D0, None)
+    assert r["stores"][0]["trust_status"] == "VERIFIED"
+    assert "VERIFIED_SUBSET" in r["definitions"]["trust_status"]
+    assert "days_excluded_store_unverified" in r["definitions"]
+
+
 def test_hme_other_gate_failures_still_withhold_everything(db):
     db.hme_mapped = {6}
     db.hme = [hme_row(6, D0)]

@@ -30,7 +30,8 @@ RAW_HME = ("hme_store_daily", "hme_outliers_daily", "hme_goal_history",
            "v_hme_store_daily_verified", "hme_store_ingest_result")
 # Migration 61: per-store HME status (dates and status codes, no figures).
 # Granted on its own; it is a reference relation, not one of the four fact views.
-STATUS_VIEWS = ("v_hme_store_status_llm",)
+# migration 61 status view; migration 65 per-store-day trust grade (status only)
+STATUS_VIEWS = ("v_hme_store_status_llm", "v_hme_store_day_trust_llm")
 
 results = []
 
@@ -357,7 +358,7 @@ cur.execute("""SELECT table_name, privilege_type
                 WHERE grantee = 'laynes_ro' AND table_name LIKE 'v_hme%%'
                 ORDER BY table_name""")
 grants = cur.fetchall()
-check("migrations 44 + 61 applied: laynes_ro reads exactly the four LLM views + the status view",
+check("migrations 44 + 61 + 65 applied: laynes_ro reads exactly the four LLM views + the two status views",
       sorted(g[0] for g in grants) == sorted(LLM_VIEWS + STATUS_VIEWS), str(grants))
 check("the grant is SELECT only",
       all(g[1] == "SELECT" for g in grants), str(grants))

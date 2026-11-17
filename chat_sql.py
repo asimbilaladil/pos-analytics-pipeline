@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 import anthropic  # noqa: F401  (tests patch chat_sql.anthropic.Anthropic)
 import psycopg2
 import re
+import psycopg2.errors
 import psycopg2.extras
 from pglast import ast, parse_sql
 from pglast.parser import ParseError
@@ -1774,6 +1775,10 @@ v_hme_day_completeness_llm — one row per business_date
     status, source_complete, reconciliation_ok, observed/expected_store_count,
     verified_observed/expected_count, counts_consistent
 
+v_hme_store_day_trust_llm  — establishment_id x business_date (one row per loaded
+    store-day): trust_status (VERIFIED / UNVERIFIED), grade_source,
+    store_result_status, store_result_reason, store_check_failed
+
 v_hme_store_status_llm     — one row per Laynes establishment (no scope needed)
     establishment_id, store_name, hme_mapping_status (VERIFIED / UNMAPPED),
     latest_business_date (latest date with HME data for THIS store),
@@ -1804,6 +1809,13 @@ HME rules — these are not stylistic, they change what is true:
     that matters. When reconciliation_ok = false, surface that warning.
     source_complete and reconciliation_ok are INDEPENDENT: reconciled never
     implies complete.
+  * HME TRUST IS ALSO PER STORE-DAY. A day can reconcile for the network while
+    one store's own checks fail (store_result_status PARTIAL). check_data
+    reports these as "HME store-level reconciliation NOT verified": in a
+    single-store scope that store-day is blocked; in a network scope name each
+    unverified store-day with its reason, exclude it from figures or label it
+    UNVERIFIED, and never call a sum that includes it verified or a network
+    total. Never describe an UNVERIFIED store-day as verified or reconciled.
   * source_complete = false while every store you were asked about is present
     is still usable at store level — but do not call the network source
     complete.
@@ -2061,6 +2073,9 @@ _ALLOWED_RELATIONS = frozenset({
     # Per-store HME status (migration 61): mapping, latest loaded date, latest
     # graded result. Status only -- no figures.
     "v_hme_store_status_llm",
+    # Per-store-day HME trust grade (migration 65): VERIFIED / UNVERIFIED and
+    # the per-store result code of the row actually loaded. Status only.
+    "v_hme_store_day_trust_llm",
     # R365 weekly-report facts (migrations 54/55). VERIFIED-mapping-gated views
     # over tables laynes_ro cannot read: r365_store_daily, r365_store_weekly,
     # r365_store_mapping and r365_ingest_run stay denied, so the R365 store id,
@@ -2748,6 +2763,7 @@ _RELATION_DOMAIN = {
     "v_hme_outliers_daily_llm": DOMAIN_HME,
     "v_hme_goal_history_llm": DOMAIN_HME,
     "v_hme_day_completeness_llm": DOMAIN_HME,
+    "v_hme_store_day_trust_llm": DOMAIN_HME,
     "v_labor_hourly_context": DOMAIN_LABOR,
     "v_labor_daily_context": DOMAIN_LABOR,
     "v_order_identity_context": DOMAIN_IDENTITY,
@@ -2891,6 +2907,60 @@ SELECT (SELECT count(DISTINCT establishment_id) FROM v_hme_store_daily_llm)   AS
          WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
            AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int))     AS stores_in_scope
 """
+
+
+# Per-store-day trust (migration 65). The network day verdict above says
+# whether the DAY reconciled; this says whether THIS STORE's row for the day
+# did. A day can reconcile for the network while one store's own checks fail
+# (Mission Bend 2026-11-03 / 11-06: goal D disagreed with the PA threshold),
+# and such a store-day must never be served as verified.
+_HME_STORE_TRUST_SQL = """
+SELECT count(*)                                          AS store_days,
+       count(*) FILTER (WHERE trust_status = 'VERIFIED') AS verified_store_days,
+       COALESCE(json_agg(json_build_object(
+                   'establishment_id', establishment_id,
+                   'store_name', store_name,
+                   'business_date', business_date,
+                   'trust_status', trust_status,
+                   'grade_source', grade_source,
+                   'store_result_status', store_result_status,
+                   'store_result_reason', store_result_reason,
+                   'store_check_failed', store_check_failed,
+                   'day_check_failed', day_check_failed)
+                 ORDER BY establishment_id, business_date)
+                FILTER (WHERE trust_status <> 'VERIFIED'), '[]'::json)
+                                                         AS unverified
+  FROM v_hme_store_day_trust_llm
+ WHERE business_date >= %(start)s::date AND business_date < %(end)s::date
+   AND (%(est)s::int IS NULL OR establishment_id = %(est)s::int)
+"""
+
+HME_STORE_UNVERIFIED_PREFIX = "HME store-level reconciliation NOT verified"
+HME_STORE_TRUST_UNKNOWN = ("HME store-level trust could not be determined "
+                           "(v_hme_store_day_trust_llm unavailable)")
+
+
+def _hme_store_day_trust(cur, params) -> dict:
+    """Per-store-day grades for the scope. Fails CLOSED: if the view is missing
+    (code deployed before migration 65) or not granted, available=False and the
+    gate refuses -- a store-day is never assumed verified."""
+    cur.execute("SAVEPOINT hme_store_trust")
+    try:
+        cur.execute(_HME_STORE_TRUST_SQL, params)
+        row = dict(cur.fetchone())
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.InsufficientPrivilege):
+        cur.execute("ROLLBACK TO SAVEPOINT hme_store_trust")
+        return {"available": False, "store_days": None, "verified_store_days": None,
+                "unverified_store_days": []}
+    cur.execute("RELEASE SAVEPOINT hme_store_trust")
+    unverified = []
+    for u in row["unverified"] or []:
+        u = dict(u)
+        u["business_date"] = str(u["business_date"])[:10]
+        unverified.append(u)
+    return {"available": True, "store_days": row["store_days"],
+            "verified_store_days": row["verified_store_days"],
+            "unverified_store_days": unverified}
 
 
 # ── HME ingestion schedule (mirrors the systemd units) ──────────────────────
@@ -3082,6 +3152,7 @@ def _hme_block(cur, establishment_id, period_start, period_end):
             r["business_date"].isoformat())
 
     latest = scope["latest_business_date"]
+    store_trust = _hme_store_day_trust(cur, params)
 
     per_day = [{
         "business_date": d["business_date"].isoformat(),
@@ -3144,6 +3215,11 @@ def _hme_block(cur, establishment_id, period_start, period_end):
         "missing_verified_stores": missing_verified,
         "unavailable_stores_in_scope": unavailable_stores,
         "store_status": store_status,
+        # Per-store-day trust (migration 65): every loaded store-day whose OWN
+        # ingestion grade is not SUCCESS. Independent of, and on top of, the
+        # network day verdict in per_day / unreconciled_days.
+        "store_day_trust": store_trust,
+        "scope_establishment_id": establishment_id,
         "metric_availability": {
             "store_daily": True,
             "outliers": True,
@@ -4637,7 +4713,21 @@ def blocked_domain_context(meta: dict, question_domains) -> dict:
             "incomplete_days": h.get("incomplete_days"),
             "unreconciled_days": h.get("unreconciled_days"),
             "missing_verified_stores": h.get("missing_verified_stores"),
+            "unverified_store_days": ((h.get("store_day_trust") or {})
+                                      .get("unverified_store_days")),
+            "store_level_only": bool(hme_failed) and all(
+                r.startswith(HME_STORE_UNVERIFIED_PREFIX)
+                for r in out["blocking_reasons"] if "HME" in r),
         }
+        if out["hme"]["store_level_only"]:
+            out["hme"]["store_level_note"] = (
+                "HME is blocked ONLY because this store's own rows for the named "
+                "dates did not verify. Say exactly which dates and why; HME for "
+                "other dates, and for other stores, is not affected by this check.")
+            out["instruction"] += (" Exception for HME: this failure is specific "
+                                   "to the store-days in hme.unverified_store_days "
+                                   "-- do not tell the user HME is unusable in "
+                                   "general.")
     if DOMAIN_R365 in doms:
         r = meta.get("r365") or {}
         r365_failed = any(_is_r365_ops_reason(x) for x in out["blocking_reasons"])
@@ -4843,6 +4933,65 @@ def hme_unavailable_reason(hme: dict, period_start: str, period_end: str) -> str
     return reason
 
 
+def _hme_store_day_phrase(store: str, items: list) -> str:
+    """'LCF Mission Bend on 2026-11-03, 2026-11-06 (PARTIAL / RECONCILIATION_MISMATCH:
+    this store's own check failed)' -- one store, its dates and their reasons."""
+    by_reason: dict = {}
+    for u in items:
+        if u.get("store_result_status"):
+            why = f"{u['store_result_status']} / {u.get('store_result_reason')}"
+            if u.get("store_check_failed"):
+                why += ": this store's own check failed"
+            elif u.get("day_check_failed"):
+                why += ": a day-level check failed"
+        else:
+            why = ("no per-store result; its network run did not reconcile"
+                   if u.get("grade_source") == "NETWORK_RUN" else "no ingestion run on record")
+        by_reason.setdefault(why, []).append(u["business_date"])
+    parts = [f"{', '.join(ds)} ({why})" for why, ds in by_reason.items()]
+    return f"{store} on " + "; ".join(parts)
+
+
+def _hme_store_trust_gate(hme: dict, unreconciled) -> tuple[list, list]:
+    """Per-store-day trust (migration 65), applied ON TOP of the network gate.
+
+    Mirrors the existing per-store rule for missing rows:
+      * single-store scope: an unverified store-day is a FAIL for that scope;
+      * network scope: each unverified store-day is named with its reason and
+        must be excluded from (or labelled unverified in) any figure -- a sum
+        that includes it is never a verified total. It does not block the
+        stores whose rows verified.
+    Store-days on a date that already failed NETWORK reconciliation are covered
+    by that FAIL and are not repeated. A block without the key (older callers)
+    is left to the network gate; a block whose trust lookup failed refuses.
+    """
+    trust = hme.get("store_day_trust")
+    if trust is None:
+        return [], []
+    if not trust.get("available"):
+        return [HME_STORE_TRUST_UNKNOWN + "; HME figures cannot be shown as verified"], []
+    skip = set(unreconciled or [])
+    items = [u for u in trust.get("unverified_store_days") or []
+             if u.get("business_date") not in skip]
+    if not items:
+        return [], []
+    by_store: dict = {}
+    for u in items:
+        by_store.setdefault(u.get("store_name") or f"store {u.get('establishment_id')}",
+                            []).append(u)
+    phrase = "; ".join(_hme_store_day_phrase(n, xs) for n, xs in by_store.items())
+    if hme.get("scope_establishment_id") is not None:
+        return [HME_STORE_UNVERIFIED_PREFIX + " for " + phrase
+                + ". Those store-days are UNVERIFIED and must not be presented as "
+                  "verified. Name these dates and their reason; other dates for this "
+                  "store and other stores are not affected by this check"], []
+    return [], [HME_STORE_UNVERIFIED_PREFIX + " for " + phrase
+                + ". Exclude those store-days from every figure, or label them "
+                  "UNVERIFIED -- name each one with its reason, and never call a sum "
+                  "that includes them a verified or network total. The other "
+                  "stores' rows for those dates verified and remain usable"]
+
+
 def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list]:
     """HME's own trust gate. Returns (fails, warns).
 
@@ -4886,6 +5035,9 @@ def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list
         fails.append("HME cross-source reconciliation failed on "
                      + ", ".join(unreconciled)
                      + "; drive-thru figures for those dates are not reconciled")
+    sf, sw = _hme_store_trust_gate(hme, unreconciled)
+    fails += sf
+    warns += sw
     # Absent OUT_OF_SCOPE stores are a known, accepted condition: the mapped
     # stores are still complete, so this warns rather than blocks.
     incomplete = hme.get("incomplete_days") or []
