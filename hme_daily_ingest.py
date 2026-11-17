@@ -224,7 +224,7 @@ def classify_store_results(res, log=None):
 
 
 def ingest_date(target, *, env, fh, max_attempts=MAX_ATTEMPTS, dry_run=False,
-                backoff=None):
+                backoff=None, only_stores=None):
     """Extract -> load ONE business date. Caller holds the lock.
 
     Returns (exit_code, load_result_or_None, reason). Retries only a failed
@@ -233,6 +233,7 @@ def ingest_date(target, *, env, fh, max_attempts=MAX_ATTEMPTS, dry_run=False,
     burn three attempts and 37 minutes.
     """
     backoff = BACKOFF_SECONDS if backoff is None else backoff
+    scope_kw = {"only_stores": list(only_stores)} if only_stores else {}
     started = datetime.datetime.now(datetime.timezone.utc)
     last_reason = "no attempt ran"
     for attempt in range(1, max(1, max_attempts) + 1):
@@ -260,20 +261,26 @@ def ingest_date(target, *, env, fh, max_attempts=MAX_ATTEMPTS, dry_run=False,
 
         conn = hme_load.connect()
         try:
+            # The scope is passed ONLY for a store-scoped run, so the normal
+            # path calls the loader exactly as before migration 64.
             res = hme_load.load(doc, conn, dry_run=dry_run,
-                                allow_partial_stores=PARTIAL_STORES)
+                                allow_partial_stores=PARTIAL_STORES, **scope_kw)
         except hme_load.LoadAborted as e:
             conn.rollback()
             last_reason = f"load aborted: {e}"
             log(f"attempt {attempt}: {last_reason}", fh)
-            status = ("aborted_tenant_scope"
-                      if "tenant" in str(e).lower() or "store" in str(e).lower()
-                      else "partial")
+            if isinstance(e, hme_load.StoreNotInExtract):
+                status = "failed"           # missing source data, not a scope breach
+            else:
+                status = ("aborted_tenant_scope"
+                          if "tenant" in str(e).lower() or "store" in str(e).lower()
+                          else "partial")
             rid = hme_load.record_failed_run(
                 conn, target, status=status, reason=str(e), attempt=attempt,
                 started_at=started, tenant_scope_ok=doc.get("tenant_scope_ok"),
                 freshness=doc.get("freshness_detail"),
-                extractor_version=doc.get("extractor_version"))
+                extractor_version=doc.get("extractor_version"),
+                **({"store_scope": only_stores} if only_stores else {}))
             log(f"recorded failed run_id={rid} status={status}", fh)
             conn.close()
             return EXIT_HARD_FAILURE, None, last_reason   # never retry a safety abort
@@ -319,7 +326,8 @@ def ingest_date(target, *, env, fh, max_attempts=MAX_ATTEMPTS, dry_run=False,
         try:
             rid = hme_load.record_failed_run(
                 conn, target, status="failed", reason=last_reason,
-                attempt=max_attempts, started_at=started)
+                attempt=max_attempts, started_at=started,
+                **({"store_scope": only_stores} if only_stores else {}))
             log(f"recorded failed run_id={rid} status=failed", fh)
         finally:
             conn.close()

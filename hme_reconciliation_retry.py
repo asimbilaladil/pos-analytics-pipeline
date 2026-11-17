@@ -66,11 +66,15 @@ def latest_run(conn, business_date):
     and the views use, rather than parsing a warnings string.
     """
     cur = conn.cursor()
+    # Network-wide runs only: a store-scoped backfill run (migration 64) never
+    # decides whether the DAY is reconciled. to_jsonb(r) reads store_scope
+    # without naming the column, so this also runs before migration 64.
     cur.execute("""
         SELECT run_id, status, reconciliation_ok, tenant_scope_ok,
                store_count, verified_store_count, out_of_scope_store_count
-          FROM hme_ingest_run
+          FROM hme_ingest_run r
          WHERE business_date = %s
+           AND (to_jsonb(r) ->> 'store_scope') IS NULL
          ORDER BY run_id DESC
          LIMIT 1""", (business_date,))
     row = cur.fetchone()
