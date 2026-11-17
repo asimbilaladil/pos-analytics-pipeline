@@ -32,7 +32,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ov
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "hme_load/1.6.0"
+LOADER_VERSION = "hme_load/1.7.0"
 RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 FORBIDDEN_KEYS = ("token", "id_token", "ctx_token", "cookie", "password", "authorization")
 
@@ -327,6 +327,44 @@ def _close_and_open(cur, sn, obs_date, vals, run_id):
         "ON CONFLICT (hme_store_number, effective_from_date) DO NOTHING",
         (sn, obs_date, *vals, run_id))
     return "opened"
+
+
+GOAL_FAILED_CHECK_REASON = "observation_fails_pa_goal_d_check"
+
+
+def goal_d_failed_stores(recon) -> set:
+    """HME store numbers whose goal observation for the day disagreed with the
+    store's own Performance Analysis threshold (goal_d_matches_pa_threshold)."""
+    out = set()
+    for c in (recon or {}).get("checks", []):
+        if c.get("check") == "goal_d_matches_pa_threshold" and not c.get("ok"):
+            out |= {str(x) for x in c.get("stores") or []}
+    return out
+
+
+def reject_goal_observation(cur, obs, obs_date, run_id):
+    """A goal observation that FAILED its own reconciliation check is evidence,
+    not history: it is parked in hme_goal_conflict for audit (with the period
+    history currently records for that date, if any) and hme_goal_history is
+    left exactly as it was -- no period is closed, opened or extended.
+
+    Before 1.7.0 such an observation went through apply_goal_observation like
+    any other, so Mission Bend's 2026-11-03 and 2026-11-06 Multi-report goals
+    (D=289, while the same day's Performance Analysis threshold was 285) closed
+    the 285 period and opened one-day 289 periods.
+    """
+    sn = obs["hme_store_number"]
+    cur.execute("""SELECT effective_from_date, effective_to_date,
+                          goal_a_seconds, goal_b_seconds, goal_c_seconds, goal_d_seconds
+                   FROM hme_goal_history
+                   WHERE hme_store_number = %s
+                     AND effective_from_date <= %s
+                     AND (effective_to_date IS NULL OR effective_to_date >= %s)
+                   ORDER BY effective_from_date DESC LIMIT 1""", (sn, obs_date, obs_date))
+    covering = cur.fetchone()
+    _record_goal_conflict(cur, sn, obs_date, _goal_vals(obs), covering,
+                          GOAL_FAILED_CHECK_REASON, run_id)
+    return "conflicts"
 
 
 def apply_goal_observation(cur, obs, obs_date, run_id):
@@ -625,11 +663,19 @@ def load(doc, conn, dry_run=False, allow_partial_stores=False, only_stores=None)
     written += len(od_rows)
 
     # Goal history, four explicit cases (see apply_goal_observation).
+    # An observation whose store failed goal_d_matches_pa_threshold is never
+    # folded into history (see reject_goal_observation); it is recorded as a
+    # conflict for audit instead.
     goal_stats = {"extended": 0, "opened": 0, "closed": 0,
-                  "unchanged": 0, "conflicts": 0}
+                  "unchanged": 0, "conflicts": 0, "rejected_failed_check": 0}
     obs_date = datetime.date.fromisoformat(date)
+    goal_failed = goal_d_failed_stores(recon)
     for r in doc["facts"].get("goal_observations", []):
-        outcome = apply_goal_observation(cur, r, obs_date, run_id)
+        if str(r["hme_store_number"]) in goal_failed:
+            outcome = reject_goal_observation(cur, r, obs_date, run_id)
+            goal_stats["rejected_failed_check"] += 1
+        else:
+            outcome = apply_goal_observation(cur, r, obs_date, run_id)
         goal_stats[outcome] = goal_stats.get(outcome, 0) + 1
     goal_written = goal_stats["extended"] + goal_stats["opened"]
     written += goal_written
