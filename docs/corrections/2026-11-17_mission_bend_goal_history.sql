@@ -26,6 +26,23 @@
 -- any surprise aborts the whole transaction before anything is changed.
 
 \set ON_ERROR_STOP 1
+-- ── commit gate ─────────────────────────────────────────────────────────────
+-- Only the exact value apply=1 commits. Unset or apply=0 is a dry run (rolled
+-- back). ANY other value (true, yes, on, 01, ' 1', ...) aborts here, before a
+-- transaction or lock is taken. Do not replace this with \if :{?apply}: that
+-- tests whether the variable is DEFINED, so -v apply=0 would commit.
+\if :{?apply}
+\else
+  \set apply 0
+\endif
+\unset do_commit
+SELECT CASE :'apply' WHEN '1' THEN 'true' WHEN '0' THEN 'false' END AS do_commit \gset
+\if :{?do_commit}
+\else
+  \echo 'invalid -v apply value: use apply=1 to commit, or omit it / apply=0 for a dry run'
+  DO $$ BEGIN RAISE EXCEPTION 'invalid -v apply value; nothing was changed'; END $$;
+  \quit
+\endif
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 LOCK TABLE hme_goal_history IN SHARE ROW EXCLUSIVE MODE;   -- no concurrent loader write
@@ -150,7 +167,7 @@ SELECT effective_from_date, effective_to_date, goal_a_seconds, goal_b_seconds,
 SELECT observed_date, observed_goal_d, existing_from, existing_goal_d, reason, run_id
   FROM hme_goal_conflict WHERE hme_store_number = '1158614' ORDER BY observed_date;
 
-\if :{?apply}
+\if :do_commit
   \echo '== APPLY: committing'
   COMMIT;
 \else

@@ -319,10 +319,13 @@ def test_hme_store_level_unverified_days_excluded_never_ok(db):
     assert s["trust_status"] == "VERIFIED_SUBSET"
     assert s["days_included"] == 2 and s["drive_thru_cars"] == 200
     assert s["avg_speed_of_service_seconds"] == 200.0            # days 1 and 3 only
-    assert s["days_excluded_unreconciled"] == ["2026-10-23"]
+    # days_excluded_unreconciled keeps its 73ef62a meaning: NETWORK days only.
+    assert s["days_excluded_unreconciled"] == []
     assert s["days_excluded_store_unverified"] == [{
         "date": "2026-10-23", "store_result_status": "PARTIAL",
-        "store_result_reason": "RECONCILIATION_MISMATCH", "grade_source": "STORE_RESULT"}]
+        "store_result_reason": "RECONCILIATION_MISMATCH", "grade_source": "STORE_RESULT",
+        "also_network_unreconciled": False}]
+    assert s["coverage"]["figures_limited_to_reconciled_days"] is True
     assert s["coverage"]["store_day_trust"] == {"available": True, "verified_store_days": 2,
                                                 "unverified_store_days": 1}
 
@@ -354,7 +357,45 @@ def test_hme_store_trust_unknown_withholds_everything(db):
         hme={"unreconciled_days": [], "store_day_trust": {"available": False}}))
     s = a.drive_thru_speed([6], D0, D0, None)["stores"][0]
     assert s["status"] == "unavailable" and s["avg_speed_of_service_seconds"] is None
-    assert s["days_excluded_store_unverified"] == []
+    assert s["days_excluded_store_unverified"] == [] and s["days_excluded_unreconciled"] == []
+    assert s["trust_status"] == "UNAVAILABLE"
+
+
+def test_hme_network_and_store_exclusions_reported_separately(db):
+    # Day 1: network-unreconciled only. Day 2: both (overlap). Day 3: store-only.
+    # Day 4: verified. Each list keeps its own meaning; all three days are excluded.
+    ds = days(D0, 4)
+    db.hme_mapped = {25}
+    db.hme = [hme_row(25, d, cars=100, total=100 + 100 * i) for i, d in enumerate(ds)]
+    net, both, store_only, ok_day = (str(d) for d in ds)
+    db.gate_for("hme", 25, gate(False, [
+        f"HME cross-source reconciliation failed on {net}, {both}; drive-thru figures "
+        "for those dates are not reconciled",
+        f"HME store-level reconciliation NOT verified for LCF Mission Bend on {store_only} "
+        "(PARTIAL / RECONCILIATION_MISMATCH)"],
+        hme={"unreconciled_days": [net, both], "store_day_trust": {
+            "available": True, "verified_store_days": 2,
+            "unverified_store_days": [_unverified(25, both), _unverified(25, store_only)]}}))
+    s = a.drive_thru_speed([25], D0, ds[-1], None)["stores"][0]
+    assert s["days_excluded_unreconciled"] == [net, both]
+    assert [(u["date"], u["also_network_unreconciled"])
+            for u in s["days_excluded_store_unverified"]] == [(both, True), (store_only, False)]
+    assert s["days_included"] == 1 and s["drive_thru_cars"] == 100
+    assert s["avg_speed_of_service_seconds"] == 400.0            # day 4 only
+    assert s["status"] == "partial" and s["trust_status"] == "VERIFIED_SUBSET"
+    assert s["coverage"]["figures_limited_to_reconciled_days"] is True
+
+
+def test_hme_fully_verified_lists_empty(db):
+    ds = days(D0, 2)
+    db.hme_mapped = {6}
+    db.hme = [hme_row(6, d) for d in ds]
+    db.gate_for("hme", 6, gate(True, [], hme={"unreconciled_days": [], "store_day_trust": {
+        "available": True, "verified_store_days": 2, "unverified_store_days": []}}))
+    s = a.drive_thru_speed([6], D0, ds[-1], None)["stores"][0]
+    assert s["status"] == "ok" and s["trust_status"] == "VERIFIED" and s["days_included"] == 2
+    assert s["days_excluded_unreconciled"] == [] and s["days_excluded_store_unverified"] == []
+    assert s["coverage"]["figures_limited_to_reconciled_days"] is False
 
 
 def test_hme_trust_status_definitions_are_published(db):

@@ -11,7 +11,8 @@
 -- to the existing hme_goal_conflict table. Rolling the code back restores the
 -- 1.6.0 behaviour; conflict rows already written stay as audit records.
 
+-- DROP VIEW removes its grants too, so no separate REVOKE (which would fail
+-- if the view were already gone). Safe to re-run.
 BEGIN;
-REVOKE SELECT ON v_hme_store_day_trust_llm FROM laynes_ro;
 DROP VIEW IF EXISTS v_hme_store_day_trust_llm;
 COMMIT;

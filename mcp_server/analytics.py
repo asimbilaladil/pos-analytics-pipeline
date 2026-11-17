@@ -734,12 +734,18 @@ HME_DEFINITIONS = {
         "store-day passed both the network-day and this store's own reconciliation. "
         "VERIFIED_SUBSET: the figures cover ONLY verified store-days; some requested "
         "days are excluded (see days_excluded_unreconciled / "
-        "days_excluded_store_unverified) or have no data (days_without_data). "
+        "days_excluded_store_unverified -- both are excluded from every figure) or "
+        "have no data (days_without_data). "
         "UNAVAILABLE: no verified store-day in the period. Unverified store-days are "
         "never included in any figure."),
+    "days_excluded_unreconciled": (
+        "Days excluded because the NETWORK day did not pass cross-source "
+        "reconciliation."),
     "days_excluded_store_unverified": (
         "Days excluded because THIS store's own HME row did not verify (e.g. "
-        "PARTIAL / RECONCILIATION_MISMATCH) although the network day may have."),
+        "PARTIAL / RECONCILIATION_MISMATCH), with its grade. "
+        "also_network_unreconciled=true means the day is in "
+        "days_excluded_unreconciled as well."),
 }
 
 
@@ -831,17 +837,24 @@ def drive_thru_speed(ids: list[int], start: date, end: date, daypart) -> dict:
                                 if rs else None),
             "days_included": len(days), "days_requested": len(req_days),
             "days_without_data": ranges_of([d for d in req_days if (i, d) not in rows]),
-            "days_excluded_unreconciled": sorted(excluded),
-            # Additive (migration 65): which of those were excluded because THIS
-            # store's own row did not verify, with the per-store grade.
+            # Unchanged contract (as at 73ef62a): NETWORK-unreconciled days only.
+            "days_excluded_unreconciled": sorted(net_excluded),
+            # Additive (migration 65): days excluded because THIS store's own row
+            # did not verify, with its grade. A day can be in both lists
+            # (also_network_unreconciled); every day in either list is excluded
+            # from the figures.
             "days_excluded_store_unverified": [
                 {"date": u["business_date"],
                  "store_result_status": u.get("store_result_status"),
                  "store_result_reason": u.get("store_result_reason"),
-                 "grade_source": u.get("grade_source")}
-                for u in unverified if u["business_date"] in store_excluded],
+                 "grade_source": u.get("grade_source"),
+                 "also_network_unreconciled": u["business_date"] in net_excluded}
+                for u in sorted(unverified, key=lambda u: u["business_date"])
+                if u["business_date"] in store_excluded],
             "trust_status": ("VERIFIED" if st == "ok" else
                              "VERIFIED_SUBSET" if rs else "UNAVAILABLE"),
+            # True when ANY day was excluded for reconciliation, network or this
+            # store's own (a store-level failure is a reconciliation failure).
             "coverage": {**_gate_summary(g, "hme"),
                          "figures_limited_to_reconciled_days": bool(excluded)},
         })
