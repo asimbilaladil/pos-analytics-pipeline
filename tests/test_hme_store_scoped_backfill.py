@@ -350,7 +350,7 @@ try:
           acts["2026-10-14"].startswith("skip: store already") and acts["2026-10-16"].startswith("skip: store already"))
     check("F missing dates are planned (10-15, 10-17); today is never planned",
           todo == [datetime.date(2026, 10, 15), datetime.date(2026, 10, 17)]
-          and acts["2026-10-18"] == "skip: day not complete", str(todo))
+          and acts["2026-10-18"].startswith("skip: belongs to the daily/retry cycle"), str(todo))
     _, todo_inc = B.store_plan(real, MB, datetime.date(2026, 10, 13), datetime.date(2026, 10, 14), ck,
                                today=datetime.date(2026, 10, 18), include_loaded=True)
     check("F --include-loaded is the only way to reload a date the store has",
@@ -494,6 +494,202 @@ with tempfile.TemporaryDirectory() as td:
               str(calls))
     finally:
         L.load, L.record_failed_run, I.run_extractor, L.connect = _load, _rfr, _ext, L_connect
+
+# ═══ V. pre-PR verification (review points 1-5) ═════════════════════════════
+print("V. pre-PR verification")
+import re  # noqa: E402
+import subprocess  # noqa: E402
+import importlib.util  # noqa: E402
+
+
+def git_show(ref_path):
+    r = subprocess.run(["git", "show", ref_path], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def view_stmts(sql_text):
+    body = re.sub(r"--[^\n]*", "", sql_text)
+    return [f"CREATE OR REPLACE TEMP VIEW {n} AS{sel}" for n, sel in re.findall(
+        r"CREATE OR REPLACE VIEW\s+(\w+)\s+AS(.*?);\s*(?=\n(?:COMMENT|CREATE|COMMIT|GRANT|BEGIN|ALTER|$))",
+        body + "\n", re.S | re.I)]
+
+
+# V1: independent of PR #34 (migrations 62/63), in either order
+m62 = git_show("origin/fix/financial-reporting-accuracy:migrations/62_financial_reporting_accuracy.sql")
+m63 = git_show("origin/fix/financial-reporting-accuracy:migrations/63_financial_reporting_grants.sql")
+check("V1 PR #34 migrations readable from its pushed branch (worktree untouched)", bool(m62 and m63))
+objs64 = set(re.findall(r"\b(hme_\w+|v_hme_\w+|r365_\w+|v_r365_\w+|v_revel_\w+|v_orders\w*)\b", sql_body(MIG)))
+objs62 = set(re.findall(r"\b(hme_\w+|v_hme_\w+|r365_\w+|v_r365_\w+|v_revel_\w+|v_orders\w*|payments_v2)\b",
+                        sql_body(m62 or "") + sql_body(m63 or "")))
+check("V1 migration 64 and migrations 62/63 touch disjoint objects",
+      objs64 and objs62 and not (objs64 & objs62)
+      and all(o.startswith(("hme_", "v_hme_")) for o in objs64), str(sorted(objs64 & objs62)))
+for order in ("64 then 62", "62 then 64"):
+    real = L.connect()
+    real.autocommit = False
+    try:
+        cur = real.cursor()
+        make_sandbox(real, apply_migration=False)
+        steps = ([sql_body(MIG).replace("CREATE OR REPLACE VIEW", "CREATE OR REPLACE TEMP VIEW")]
+                 + view_stmts(m62 or ""))
+        if order == "62 then 64":
+            steps = steps[1:] + steps[:1]
+        for st in steps:
+            cur.execute(st)
+        cur.execute("SELECT count(*) FROM v_hme_day_completeness_llm")
+        a = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM v_r365_store_period_llm WHERE forecast_days IS NOT NULL")
+        b = cur.fetchone()[0]
+        check(f"V1 both migrations apply cleanly together ({order})", a > 0 and b > 0)
+    finally:
+        real.rollback()
+        real.close()
+check("V1 migration 64 alone was applied to today's schema (62/63 NOT applied) in A-G above",
+      all(ok for n, ok, _ in results if n.startswith("A ")))
+
+real = L.connect()
+real.autocommit = False
+conn = NoCommit(real)
+try:
+    cur = real.cursor()
+    dcur = real.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    make_sandbox(real, apply_migration=True)
+    view_all = lambda: (cur.execute("SELECT * FROM v_hme_day_completeness_llm ORDER BY business_date")
+                        or cur.fetchall())
+    day = lambda d: (cur.execute("SELECT status, reconciliation_ok, observed_store_count FROM "
+                                 "v_hme_day_completeness_llm WHERE business_date = %s", (d,)) or cur.fetchone())
+    elig = lambda d: R.assess_retry_eligibility(R.latest_run(conn, datetime.date.fromisoformat(d)))
+
+    # V3: a Mission-Bend-only run cannot upgrade a network verdict -- even if
+    # it is forced to look perfect.
+    v_before = view_all()
+    e14, e15 = elig("2026-10-14"), elig("2026-10-15")
+    r14 = L.load(doc_for("2026-10-14"), conn, only_stores=[MB])
+    r15 = L.load(doc_for("2026-10-15"), conn, only_stores=[MB])
+    cur.execute("UPDATE hme_ingest_run SET status = 'succeeded', reconciliation_ok = true, "
+                "store_count = 11, verified_store_count = 11 WHERE run_id IN (%s, %s)",
+                (r14["run_id"], r15["run_id"]))
+    check("V3 even 'perfect' scoped runs on 10-14/10-15 leave every day verdict unchanged",
+          view_all() == v_before)
+    check("V3 2026-10-14 and 2026-10-15 remain NOT reconciled at network level",
+          day("2026-10-14")[1] is False and day("2026-10-15")[1] is False)
+    hb = C._hme_block(dcur, EST, "2026-10-14", "2026-10-16")
+    check("V3 the chat HME gate still reports 10-14 and 10-15 as unreconciled for Mission Bend",
+          {"2026-10-14", "2026-10-15"} <= {str(x) for x in (hb.get("unreconciled_days") or [])},
+          str(hb.get("unreconciled_days")))
+    hbn = C._hme_block(dcur, None, "2026-10-14", "2026-10-16")
+    check("V3 ... and for the network", {"2026-10-14", "2026-10-15"}
+          <= {str(x) for x in (hbn.get("unreconciled_days") or [])})
+
+    # V2: scheduled jobs keep working with scoped runs present
+    # The retry derives coverage from loaded rows, so after a backfill Mission
+    # Bend counts as observed (10/11 + 1 NO_ACCESS -> 11/11). The DECISION is
+    # unchanged either way; a scoped run can only add rows, so it can never
+    # make an eligible day ineligible or the reverse.
+    check("V2 retry eligibility DECISION for 10-14/10-15 is unchanged with scoped runs present",
+          elig("2026-10-14")[0] == e14[0] and elig("2026-10-15")[0] == e15[0],
+          str((e14, elig("2026-10-14"))))
+    check("V2 ... only its coverage count now includes Mission Bend's loaded rows (10/11 -> 11/11)",
+          "10/11" in e14[1] and "11/11" in elig("2026-10-14")[1])
+    rn = L.load(doc_for("2026-10-14"), conn, allow_partial_stores=True)         # a later NETWORK run
+    cur.execute("SELECT store_scope FROM hme_ingest_run WHERE run_id = %s", (rn["run_id"],))
+    check("V2 a daily/retry-style network run after scoped runs is recorded network-wide",
+          cur.fetchone()[0] is None)
+    n_doc = len({str(r["hme_store_number"]) for rows in doc_for("2026-10-14")["facts"].values() for r in rows})
+    check("V2 ... and becomes the day's verdict (not the scoped runs)", day("2026-10-14")[2] == n_doc)
+    check("V2 the retry sees that network run as the latest", R.latest_run(conn, datetime.date(2026, 10, 14))["run_id"] == rn["run_id"])
+    r14b = L.load(doc_for("2026-10-14"), conn, only_stores=[MB])
+    check("V2 a scoped run AFTER the network run still does not replace it",
+          R.latest_run(conn, datetime.date(2026, 10, 14))["run_id"] == rn["run_id"] and day("2026-10-14")[2] == n_doc)
+    check("V2 the daily ingest never reads hme_ingest_run (only the mapping)",
+          "FROM hme_ingest_run" not in open("hme_daily_ingest.py").read())
+
+    # V4: rollback can never reinterpret scoped runs as network runs
+    old_src = git_show("a86366d:hme_reconciliation_retry.py")
+    with tempfile.TemporaryDirectory() as td:
+        fp = os.path.join(td, "old_retry.py")
+        open(fp, "w").write(old_src)
+        spec = importlib.util.spec_from_file_location("old_retry", fp)
+        old_R = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(old_R)
+    check("V4 (risk being guarded) the OLD retry would take a newer scoped run as the latest",
+          old_R.latest_run(conn, datetime.date(2026, 10, 14))["run_id"] == r14b["run_id"])
+    check("V4 ... but the OLD retry only ever examines Chicago yesterday",
+          "target = args.date or ingest.chicago_target_date().isoformat()" in old_src)
+    ck = {"version": B.BACKFILL_VERSION, "dates": {}}
+    yday = I.chicago_target_date()
+    rows, todo = B.store_plan(real, MB, yday - datetime.timedelta(days=3), yday, ck)
+    acts = {r["date"]: r["action"] for r in rows}
+    check("V4 the planner never schedules Chicago yesterday (the retry's date)",
+          yday not in todo and acts[yday.isoformat()].startswith("skip: belongs to the daily/retry cycle"),
+          str(acts))
+    cur.execute("SELECT max(business_date) FROM hme_ingest_run WHERE store_scope IS NULL")
+    last_net = cur.fetchone()[0]
+    _, todo_future = B.store_plan(real, MB, last_net + datetime.timedelta(days=1),
+                                  last_net + datetime.timedelta(days=3), ck,
+                                  today=last_net + datetime.timedelta(days=10))
+    check("V4 the planner never schedules a day with no network-wide run yet", todo_future == [])
+    rb = sql_body(RB).replace("CREATE OR REPLACE VIEW", "CREATE OR REPLACE TEMP VIEW")
+    try:
+        cur.execute("SAVEPOINT v4")
+        cur.execute(rb)
+        check("V4 schema rollback refuses while scoped runs exist", False)
+    except psycopg2.errors.RaiseException:
+        cur.execute("ROLLBACK TO SAVEPOINT v4")
+        check("V4 schema rollback refuses while scoped runs exist", True)
+    cur.execute("SELECT count(*) FROM hme_ingest_run WHERE store_scope IS NOT NULL")
+    check("V4 ... and the scoped runs keep their scope", cur.fetchone()[0] >= 3)
+finally:
+    real.rollback()
+    real.close()
+
+# V5: the 33-day backfill is checkpointed and resumes safely after interruption
+D33 = [datetime.date(2026, 10, 14) + datetime.timedelta(days=i) for i in range(33)]
+check("V5 the plan range is exactly 33 days (2026-10-14..11-15)",
+      D33[0] == datetime.date(2026, 10, 14) and D33[-1] == datetime.date(2026, 11, 15))
+with tempfile.TemporaryDirectory() as td:
+    ckp = os.path.join(td, "backfill-store-1158614-2026-10-14-2026-11-15.json")
+    ck = B.load_checkpoint(ckp)
+    done = []
+
+    def interrupt_at(n):
+        def fn(d):
+            if len(done) == n:
+                raise KeyboardInterrupt          # operator Ctrl-C / SIGINT
+            done.append(d)
+            return (I.EXIT_OK, {"run_id": len(done), "status": "succeeded", "reconciliation_ok": True,
+                                "rows_written": 4, "store_results": [{"revel_establishment_id": EST,
+                                                                      "status": "SUCCESS"}]}, "succeeded")
+        return fn
+    try:
+        B.run(D33, ingest_fn=interrupt_at(10), ck=ck, ck_path=ckp, pause=0, fh=None)
+        check("V5 an interrupt stops the run", False)
+    except KeyboardInterrupt:
+        check("V5 an interrupt stops the run", True)
+    ck2 = B.load_checkpoint(ckp)
+    loaded = [d for d in D33 if (ck2["dates"].get(d.isoformat()) or {}).get("state") == "loaded"]
+    check("V5 the 10 dates completed before the interrupt are checkpointed as loaded",
+          loaded == D33[:10] and D33[10].isoformat() not in ck2["dates"])
+    check("V5 the checkpoint is written atomically (no temp file left behind)",
+          not os.path.exists(ckp + ".tmp") and oct(os.stat(ckp).st_mode & 0o777) == "0o600")
+    todo = [d for d in D33 if (ck2["dates"].get(d.isoformat()) or {}).get("state") != "loaded"]
+    done.clear()
+    B.run(todo, ingest_fn=interrupt_at(10 ** 6), ck=ck2, ck_path=ckp, pause=0, fh=None)
+    check("V5 resume processes exactly the 23 remaining dates, the interrupted one first",
+          done == [d.isoformat() for d in D33[10:]])
+    check("V5 after resume all 33 dates are loaded and exit is 0",
+          B.overall_exit(B.load_checkpoint(ckp), D33) == I.EXIT_OK)
+    bad = os.path.join(td, "other.json")
+    json.dump({"version": B.BACKFILL_VERSION, "store_scope": ["115"], "dates": {}}, open(bad, "w"))
+    check("V5 a checkpoint belonging to another store scope is refused",
+          B.main(["--only-store", MB, "--expect-establishment", "25", "--start", "2026-10-14",
+                  "--end", "2026-11-15", "--checkpoint", bad, "--plan"]) == I.EXIT_HARD_FAILURE)
+    check("V5 the store-scoped checkpoint name cannot collide with the network backfill's",
+          "backfill-store-" in open("hme_backfill.py").read())
+check("V5 every date is loaded under the shared ingest lock (acquire_lock) and the mapping is "
+      "re-verified under it", "lock = ingest.acquire_lock(fh)" in open("hme_backfill.py").read()
+      and "verify_store_scope(conn, store, a.expect_establishment)   # again, under the lock"
+      in open("hme_backfill.py").read())
 
 passed = sum(ok for _, ok, _ in results)
 print(f"\nHME store-scoped backfill: {passed} passed, {len(results) - passed} failed, {len(results)} total")

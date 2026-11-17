@@ -131,11 +131,18 @@ def verify_store_scope(conn, store, establishment):
 def store_plan(conn, store, start, end, ck, today=None, include_loaded=False):
     """Read-only per-date plan for a store-scoped backfill.
 
-    Returns (rows, todo). A date is to do when it is a completed Chicago day,
-    not already 'loaded' in this store's checkpoint, and -- unless
-    include_loaded -- the store has no canonical row for it yet.
+    Returns (rows, todo). A date is to do only when ALL hold:
+      * it is older than the daily/retry cycle's date (Chicago yesterday):
+        yesterday belongs to hme-daily-ingest and hme-reconciliation-retry,
+        which load every store anyway -- a scoped run never lands on the one
+        date the retry examines, even if the code is later rolled back;
+      * the day already has a network-wide run: a store is only ever filled
+        INTO a day the network ingestion has judged, never ahead of it;
+      * it is not 'loaded' in this store's checkpoint;
+      * the store has no canonical row for it (unless include_loaded).
+    `today` = first excluded date (default: Chicago yesterday).
     """
-    today = today or ingest.chicago_target_date() + datetime.timedelta(days=1)
+    today = today or ingest.chicago_target_date()
     cur = conn.cursor()
     cur.execute("""SELECT business_date FROM hme_store_daily
                     WHERE hme_store_number = %s AND business_date BETWEEN %s AND %s""",
@@ -154,7 +161,9 @@ def store_plan(conn, store, start, end, ck, today=None, include_loaded=False):
     for d in date_range(start, end):
         e = ck["dates"].get(d.isoformat()) or {}
         if d >= today:
-            action = "skip: day not complete"
+            action = "skip: belongs to the daily/retry cycle (or not complete)"
+        elif d not in net:
+            action = "skip: no network-wide run for this date yet"
         elif e.get("state") == "loaded":
             action = "skip: loaded (checkpoint)"
         elif d in have and not include_loaded:

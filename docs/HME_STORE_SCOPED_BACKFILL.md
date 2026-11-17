@@ -17,6 +17,33 @@ The store was invisible to the integration account until 2026-11-16.
 
 Unchanged: the ingest lock, timers and schedules, the mapping table, the reconciliation checks and tolerances, the daily and retry behaviour, and the chat/MCP code.
 
+## Planner rules (`--plan` and every backfill)
+
+A date is backfilled only when all of these hold:
+1. It is **older than Chicago yesterday.** Yesterday belongs to `hme-daily-ingest` and `hme-reconciliation-retry`, which load every store, so a scoped run never lands on the one date the retry examines.
+2. The day **already has a network-wide run.** A store is filled into days the network has judged, never ahead of them.
+3. It is **not `loaded`** in this store's checkpoint.
+4. The store has **no canonical row** for it (unless `--include-loaded`).
+
+The current plan is in `docs/HME_MISSION_BEND_BACKFILL_PLAN.md`: 33 dates, all to backfill.
+
+## Verified before review (tests/test_hme_store_scoped_backfill.py, section V)
+
+1. **Independent of PR #34 (migrations 62/63).**
+   - The two touch disjoint objects.
+   - 64 was applied to today's schema, without 62/63.
+   - Both migrations apply cleanly together in either order.
+2. **Scheduled jobs keep working with scoped runs present.**
+   - A later network run (as written by the daily ingest or the retry) is recorded network-wide and becomes the day's verdict.
+   - The retry sees it as the latest, and a scoped run after it does not displace it.
+   - The retry's eligibility decision is unchanged. Its coverage count now includes Mission Bend's loaded rows (10/11 → 11/11), which can only add rows, never flip the decision.
+   - The daily ingest never reads `hme_ingest_run`.
+3. **No upgrade of network trust.** Scoped runs on 10-14/10-15, even forced to `succeeded` / `reconciliation_ok = true` / 11 stores, leave every day verdict byte-identical. The chat HME gate still reports 10-14 and 10-15 as unreconciled, for Mission Bend and for the network.
+4. **Rollback cannot reinterpret scoped runs.**
+   - The schema rollback refuses while any scoped run exists, and the scoped runs keep their scope.
+   - Code-only rollback is safe: the old retry would take a newer scoped run as the latest for a date, but it only ever examines Chicago yesterday, which the planner never schedules. Old code never writes `store_scope`, and the migration-64 view keeps ignoring scoped runs.
+5. **Checkpointed and resumable.** An interrupt (SIGINT) after 10 of 33 dates leaves exactly those 10 `loaded`. The checkpoint is written atomically (0600, no temp file). Resume processes exactly the 23 remaining dates, then exit 0. A checkpoint belonging to another store scope is refused. Every date runs under the shared ingest lock, with the mapping re-verified under it.
+
 ## Deployment sequence (each step needs approval)
 
 1. **Back up** `hme_ingest_run` and the view definition: `pg_dump -t hme_ingest_run` plus `pg_get_viewdef('v_hme_day_completeness_llm')`.
@@ -27,7 +54,7 @@ Unchanged: the ingest lock, timers and schedules, the mapping table, the reconci
 4. **Merge the PR, then move the release checkout** (`/root/pos-analytics-pipeline-release`) to the merge commit.
    - The HME timers run from it, and its HME code is safe with or without migration 64.
    - laynes-api and laynes-mcp don't import these modules, so no restart is needed.
-5. **Plan (read-only):** `hme_backfill.py --only-store 1158614 --expect-establishment 25 --start 2026-10-14 --end 2026-11-15 --plan`.
+5. **Plan (read-only):** `hme_backfill.py --only-store 1158614 --expect-establishment 25 --start 2026-10-14 --end 2026-11-15 --plan`. Expect the 33 dates in `docs/HME_MISSION_BEND_BACKFILL_PLAN.md`.
 6. **Optional dry run of one date** (rolled back): add `--dry-run --start 2026-10-20 --end 2026-10-20`.
 7. **Backfill**, with no other HME job running (the lock enforces this). It takes about 5–6 minutes per date, so about 3 hours for 33 dates, and is restartable at any point.
 8. **Verify:**
