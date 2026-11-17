@@ -34,6 +34,7 @@ from pglast import ast, parse_sql
 from pglast.parser import ParseError
 
 import chat_providers
+import financial_guard
 import store_scope
 
 MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5")
@@ -304,6 +305,10 @@ GLOSSARY = """\
 METRIC DEFINITIONS — use these exact sources:
   "sales" / "revenue" / "net sales"  -> features_daily_summary_v2.total_revenue
         (raw equivalent: SUM(orders_v2.final_total) WHERE deleted IS NOT TRUE)
+        THIS FIGURE INCLUDES SALES TAX and counts CLOSED tickets only. Label it
+        "sales (incl. tax)" every time. If the user asks for net, pre-tax,
+        excluding-tax or gross sales, use v_revel_sales_metrics_daily_llm and
+        name the definition; it differs from total_revenue by design.
   "orders" / "transactions" / "tickets" -> total_orders
   "items sold" / "units"              -> total_items  (raw: SUM(order_items_v2.quantity))
   "AOV" / "average order value" / "average check" -> avg_order_value
@@ -617,6 +622,9 @@ orders; relate it only by establishment_id + business_date (+ local_hour).
   * SALES VS LABOUR (timesheet estimate) uses REAL orders and REAL sales only:
         labour % of sales   = estimated_labor_cost / REAL final_total x 100
         sales per labour hr = REAL final_total / labor_hours
+      REAL final_total INCLUDES sales tax: say "sales incl. tax" when naming
+      this denominator. If the user asks for labour % of net sales / excluding
+      tax, use net_sales_excluding_tax from v_revel_sales_metrics_daily_llm.
         orders per labour hr= REAL order count  / labor_hours
     Name the denominator every time, and label the cost as estimated.
   * NEVER DECLARE OVER- OR UNDERSTAFFING. No staffing target or labour standard
@@ -1020,11 +1028,15 @@ v_r365_store_daily_llm    — establishment_id x business_date
     sales_vs_forecast_pct
 v_r365_store_weekly_llm   — establishment_id x week_start (OFFICIAL weekly row)
     store_name, week_start, week_end, fiscal_year, period_number, period_label,
-    week_status, days_with_data, and the same metrics (no expected_cash)
+    week_status, days_with_data, and the same metrics (no expected_cash),
+    plus forecast_days, days_in_week, forecast_coverage_status,
+    sales_on_forecast_days, sales_on_days_without_forecast (see FORECAST)
 v_r365_store_period_llm   — establishment_id x AYG fiscal period, rolled up from
     the official weekly rows: start_date, end_date, period_status,
     weeks_in_period, weeks_loaded, weeks_complete, period_fully_covered,
-    the additive totals, and ratios recomputed from those totals
+    the additive totals, and ratios recomputed from those totals, plus
+    forecast_days, days_in_period, forecast_coverage_status,
+    sales_on_forecast_days, sales_on_days_without_forecast (see FORECAST)
 v_r365_completeness_llm   — one row per loaded week: week_start, week_end,
     period_label, week_status (COMPLETE / PARTIAL), source_complete,
     reconciliation_ok, expected/observed_store_count, stores_with_full_week,
@@ -1124,13 +1136,32 @@ estimate) to them -- those describe the v_labor_* views, not R365.
 FORECAST — forecasted_sales is NULL where no forecast was entered (R365 sends 0
 as a placeholder; the views convert it). A NULL-forecast store/day is NOT a 0
 forecast and neither met nor missed forecast: list it as "no forecast". The
-variance compares ONLY forecast-covered sales:
+variance compares ONLY forecast-covered sales (R365's own calculation):
     sales_vs_forecast_amount = SUM(forecast_sales_base) - SUM(forecasted_sales)
     sales_vs_forecast_pct    = (SUM(forecast_sales_base) - SUM(forecasted_sales))
                                / NULLIF(SUM(forecasted_sales), 0) * 100
 Never use SUM(net_sales) - SUM(forecasted_sales): stores or days without a
 forecast would count as a huge beat. "Missed forecast" = sales_vs_forecast_amount
 < 0. Always say which stores had no forecast.
+FORECAST COVERAGE — a store can have a forecast for only SOME days of a week or
+period (P11 FY2026: Airtex and Ella none for 2026-10-29..11-04, Beaumont none
+for 2026-10-15..10-21 -- 21 of 28 days). forecast_days / days_in_week /
+days_in_period / forecast_coverage_status (FULL / PARTIAL / NONE) say so, and
+check_data's r365.forecast_coverage lists every store that is not FULL.
+  * Beside forecast and variance, the sales figure MUST be sales_on_forecast_days
+    (= forecast_sales_base). NEVER put net_sales in the same row as
+    forecasted_sales / sales_vs_forecast_*: for a PARTIAL store the row would
+    not add up (sales - forecast != difference).
+  * Report full-period sales separately, in its own clearly labelled column
+    ("full-period sales, not comparable with forecast").
+  * For every PARTIAL store state the coverage as "N of M days" and which dates
+    had no forecast, and call the result "met / missed forecast on forecast
+    days". period_fully_covered = true means the WEEKS are loaded; it says
+    nothing about forecast coverage -- never call a PARTIAL comparison a
+    full-period one.
+  * Every row you print must satisfy sales - forecast = difference. A
+    server-side check verifies this and the coverage statement before the
+    answer is sent.
 
 DAY STATUS — day_status NORMAL / CLOSED / PRE_OPENING. CLOSED and PRE_OPENING
 are genuine zero-trading rows (e.g. LCF Beaumont 2026-09-03 CLOSED). Mention
@@ -1148,8 +1179,10 @@ FISCAL PERIODS — each AYG period is four R365 weeks. For a period query, filte
 v_r365_store_period_llm by fiscal_year and period_number AND the literal
 start_date (the scope gate needs a date literal), declaring
 period_start = start_date and period_end_exclusive = end_date + 1:
-    SELECT store_name, net_sales, labor_pct, sales_vs_forecast_pct,
-           weeks_loaded, period_fully_covered
+    SELECT store_name, net_sales, labor_pct, weeks_loaded, period_fully_covered,
+           sales_on_forecast_days, forecasted_sales, sales_vs_forecast_amount,
+           sales_vs_forecast_pct, forecast_days, days_in_period,
+           forecast_coverage_status
     FROM v_r365_store_period_llm
     WHERE fiscal_year = 2026 AND period_number = 10 AND start_date = '2026-09-10'
 For a network total, SUM the additive columns of the period view and recompute
@@ -1694,6 +1727,29 @@ v_labor_daily_context    — establishment_id x business_date
     No employee_id anywhere. Join labour to sales by establishment_id +
     business_date (+ local_hour) — never to an individual order.
 
+v_revel_sales_metrics_daily_llm — establishment_id x business_date (Chicago day).
+    EXPLICIT Revel sales metrics (migration 62), one definition each:
+      gross_sales_before_discounts  SUM(subtotal), REAL + COMP tickets, excl. tax
+      discounts                     SUM(discount_amount), REAL tickets
+      comps                         SUM(subtotal), COMP tickets (fully comped)
+      net_sales_excluding_tax       gross - discounts - comps
+      tax                           SUM(tax), REAL tickets
+      total_including_tax           SUM(final_total), REAL tickets
+                                    (= the default "sales" figure; INCLUDES tax)
+      payments_received             payments by payment date (reconciliation side)
+      identity_residual             total - (net + tax); ~0, shown, never hidden
+      real_transactions, comp_tickets, open_real_tickets, open_real_ticket_total
+    Use it whenever the user names gross, net, pre-tax, excluding/including tax,
+    tax, discounts, comps or payments, and quote the column name's meaning.
+    COST: it aggregates order rows, like v_orders_classified. A network-wide
+    query over more than about two months can exceed the 15 s statement
+    timeout: query one month or one store at a time. A timeout means the query
+    was too big -- it is NEVER evidence that data is missing or unavailable.
+    None of these is verified against a Revel UI report: if the user quotes a
+    Revel screen figure that differs, say which definition you used and that the
+    Revel report's definition is not verified here -- never pick whichever
+    figure is closest and never adopt it as a new standard.
+
 HME DRIVE-THRU (migrations 43/44). Four views, VERIFIED HME->Revel stores only
 (11 of 12 establishments; LCF Downtown Houston is NOT mapped to HME).
 
@@ -2026,6 +2082,12 @@ _ALLOWED_RELATIONS = frozenset({
     # transaction, location or account ids cross this boundary.
     "v_r365_financial_transaction_llm",
     "v_r365_financial_unapproved_transaction_llm",
+    # Explicit Revel sales metrics (migrations 62/63): per store x Chicago day
+    # SUMS only -- gross before discounts, discounts, comps, net excl. tax, tax,
+    # total incl. tax, payments received. Built over v_orders_classified and
+    # payments_v2 with the owner's rights; payments_v2 itself stays unreadable.
+    # Unknown to _RELATION_DOMAIN on purpose: it falls under the Revel gate.
+    "v_revel_sales_metrics_daily_llm",
 })
 
 # ── SQL validation ─────────────────────────────────────────────────────────
@@ -3123,6 +3185,12 @@ R365_SEMANTICS = [
     "trading; exclude them from 'normal operating day' comparisons or say so.",
     "Forecast variance uses forecast-covered sales: SUM(forecast_sales_base) - "
     "SUM(forecasted_sales), never total net sales minus forecast.",
+    "forecast_coverage lists every store whose forecast does NOT cover every day "
+    "in scope: beside forecast and variance show sales_on_forecast_days, give "
+    "full-period net_sales separately, and state the coverage as 'N of M days'.",
+    "forecast_coverage_check UNAVAILABLE means coverage could NOT be checked: say so, "
+    "and never call a forecast comparison full-period. An empty forecast_coverage "
+    "list means every store is FULL only when forecast_coverage_check is VERIFIED.",
     "Roll ratios up from summed numerators/denominators; never average store "
     "percentages.",
 ]
@@ -3307,7 +3375,27 @@ def _r365_block(cur, establishment_id, period_start, period_end):
         "special_status_days_in_scope": special,
         "metric_availability": dict(R365_METRIC_AVAILABILITY),
         "semantics": list(R365_SEMANTICS),
+        **(_r365_forecast_coverage(cur, establishment_id, period_start, period_end)
+           if per_date else {"forecast_coverage": [], "forecast_coverage_check": "NO_DATA"}),
     }
+
+
+def _r365_forecast_coverage(cur, establishment_id, period_start, period_end):
+    """Stores in scope whose R365 forecast does not cover every day. Isolated
+    in a savepoint: coverage is advisory context and must never abort the
+    profile transaction."""
+    cur.execute("SAVEPOINT r365_fc")
+    try:
+        cov = financial_guard.forecast_coverage(cur, establishment_id,
+                                                period_start, period_end)
+        cur.execute("RELEASE SAVEPOINT r365_fc")
+        return {"forecast_coverage": forecast_coverage_payload(cov),
+                "forecast_coverage_check": "VERIFIED"}
+    except psycopg2.Error as e:
+        cur.execute("ROLLBACK TO SAVEPOINT r365_fc")
+        # An empty list would read as "every store FULL": say UNAVAILABLE.
+        return {"forecast_coverage": [], "forecast_coverage_check": "UNAVAILABLE",
+                "forecast_coverage_error": type(e).__name__}
 
 
 _R365_FIGURES_METRICS = """
@@ -3323,6 +3411,7 @@ _R365_FIGURES_METRICS = """
        sum(total_discounts) / NULLIF(sum(net_sales), 0) * 100 AS discount_pct,
        sum(over_short)       AS over_short,
        sum(forecasted_sales) AS forecasted_sales,
+       sum(forecast_sales_base) AS sales_on_forecast_days,
        sum(forecast_sales_base) - sum(forecasted_sales)     AS sales_vs_forecast_amount,
        (sum(forecast_sales_base) - sum(forecasted_sales))
            / NULLIF(sum(forecasted_sales), 0) * 100         AS sales_vs_forecast_pct
@@ -3370,6 +3459,14 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
                               "end": period_end})
             rows = [{k: (round(float(v), 2) if isinstance(v, decimal.Decimal) else v)
                      for k, v in r.items()} for r in cur.fetchall()]
+            cur.execute("SAVEPOINT r365_fc")
+            try:
+                coverage = financial_guard.forecast_coverage(
+                    cur, establishment_id, period_start, period_end)
+                cur.execute("RELEASE SAVEPOINT r365_fc")
+            except psycopg2.Error:
+                cur.execute("ROLLBACK TO SAVEPOINT r365_fc")
+                coverage = None
     finally:
         conn.rollback()
         conn.close()
@@ -3380,7 +3477,32 @@ def r365_trusted_figures(establishment_id, period_start, period_end) -> dict:
         "basis": basis + "; ratios recomputed from summed parts; percentages are points",
         "by_store": [r for r in rows if r["store_name"] is not None],
         "network_total": network[0] if network and establishment_id is None else None,
+        # sales_vs_forecast_amount compares sales_on_forecast_days, NOT net_sales.
+        "forecast_coverage": forecast_coverage_payload(coverage or []),
+        "forecast_coverage_check": "VERIFIED" if coverage is not None else "UNAVAILABLE",
     }
+
+
+def forecast_coverage_payload(coverage: list[dict]) -> list[dict]:
+    """JSON-safe forecast coverage for the stores whose forecast does NOT cover
+    every day in scope (FULL stores are omitted: nothing to disclose)."""
+    def money(v):
+        return None if v is None else round(float(v), 2)
+    return [{
+        "store_name": c["store_name"],
+        "establishment_id": c["establishment_id"],
+        "coverage_status": c["coverage_status"],
+        "forecast_days": c["forecast_days"],
+        "days_in_scope": c["days_in_scope"],
+        "days_not_loaded": c.get("days_not_loaded", 0),
+        "coverage_basis": "loaded R365 days; days not loaded yet are unknown, not 'no forecast'",
+        "days_without_forecast": [[a.isoformat(), b.isoformat()]
+                                  for a, b in c["days_without_forecast"]],
+        "sales_on_forecast_days": money(c["sales_on_forecast_days"]),
+        "forecasted_sales": money(c["forecasted_sales"]),
+        "sales_vs_forecast_amount": money(c["sales_vs_forecast_amount"]),
+        "net_sales_full_scope": money(c["net_sales"]),
+    } for c in coverage if c["coverage_status"] != "FULL"]
 
 
 def _is_r365_ops_reason(reason: str) -> bool:
@@ -5983,6 +6105,70 @@ def _timing(timings: list, label: str, seconds: float) -> None:
     timings.append((label, round(seconds, 3)))
 
 
+def _guard_coverage(scopes: list, cache: dict) -> tuple[list[dict], bool]:
+    """Forecast coverage for the declared scopes of this turn's R365 forecast
+    queries, read as laynes_ro from the allowlisted daily view. Cached per
+    request. A store-restricted credential only ever sees its own stores.
+
+    Returns (coverage, unavailable). A failed read is cached as None and
+    reported as unavailable -- never as an empty list, which would read as
+    "every store fully covered"."""
+    out: list[dict] = []
+    unavailable = False
+    pol = store_scope.current()
+    for sc in scopes:
+        if sc not in cache:
+            est, start, end = sc
+            try:
+                conn = _ro_conn()
+                try:
+                    conn.set_session(readonly=True, autocommit=False)
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+                        cache[sc] = financial_guard.forecast_coverage(cur, est, start, end)
+                finally:
+                    conn.rollback()
+                    conn.close()
+            except (psycopg2.Error, ValueError) as e:
+                log.warning("financial_guard coverage unavailable: %s", type(e).__name__)
+                cache[sc] = None
+        if cache[sc] is None:
+            unavailable = True
+            continue
+        for c in cache[sc]:
+            if pol is not None and int(c["establishment_id"]) not in pol.allowed:
+                continue
+            out.append(c)
+    return out, unavailable
+
+
+def _financial_guard_final(text: str, scopes: list, cache: dict, steps: list) -> str:
+    """Last, deterministic pass on every answer path: if a financial table
+    still does not add up, or partial forecast coverage is still unstated,
+    append the server-computed facts instead of sending the report as is."""
+    if not text or not text.strip():
+        return text
+    coverage, unavailable = _guard_coverage(scopes, cache) if scopes else ([], False)
+    issues = financial_guard.review(text, coverage, unavailable)
+    timed_out = sum(1 for s in steps if s.get("timeout"))
+    tnote = financial_guard.timeout_note(text, timed_out)
+    if tnote:
+        steps.append({"sql": None, "row_count": None, "error": None,
+                      "timeout_note": True, "timed_out_queries": timed_out})
+    if not issues:
+        if scopes:
+            steps.append({"sql": None, "row_count": None, "error": None,
+                          "financial_guard": {"action": "passed"}})
+        return text + ("\n\n" + tnote if tnote else "")
+    note = financial_guard.final_note(issues, coverage, text)
+    steps.append({"sql": None, "row_count": None, "error": None,
+                  "financial_guard": {"action": "note_appended" if note else "flagged",
+                                      "coverage_unavailable": unavailable,
+                                      "issues": [f"{i.kind}: {i.row}" for i in issues]}})
+    extra = [x for x in (note, tnote) if x]
+    return text + ("\n\n" + "\n\n".join(extra) if extra else "")
+
+
 def answer_question(history: list[dict], question: str, model: str | None = None,
                     attachments: list[dict] | None = None) -> ChatResult:
     """
@@ -6027,6 +6213,11 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     partial_untrusted: set = set()
     partial_events = 0
     last_meta: list[dict] = []              # first gated scope, for the answer
+    # Financial report guard: the declared scopes of successful R365 forecast
+    # queries, their coverage (computed once), and ONE corrective rewrite.
+    forecast_scopes: list = []
+    guard_cov: dict = {}
+    guard_retry_used = False
 
     system = [
         {"type": "text", "text": _system_static(),
@@ -6087,6 +6278,23 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                     turn.stop) or final_text
                 steps.append({"sql": None, "row_count": None, "error": None,
                               "forced_synthesis": turn.stop})
+            elif not guard_retry_used and _loop < MAX_LOOPS - 1:
+                # Deterministic financial-report check: a table whose sales,
+                # forecast and difference do not add up, or partial forecast
+                # coverage left unstated, goes back ONCE with the facts.
+                coverage, cov_unavailable = _guard_coverage(forecast_scopes, guard_cov)
+                issues = [i for i in financial_guard.review(final_text, coverage, cov_unavailable)
+                          if i.kind in financial_guard.REWRITABLE]
+                if issues:
+                    guard_retry_used = True
+                    provider.add_assistant(messages, turn)
+                    messages.append({"role": "user", "content":
+                                     financial_guard.correction_prompt(issues, coverage)})
+                    steps.append({"sql": None, "row_count": None, "error": None,
+                                  "financial_guard": {
+                                      "action": "rewrite_requested",
+                                      "issues": [f"{i.kind}: {i.row}" for i in issues]}})
+                    continue
             break
 
         provider.add_assistant(messages, turn)
@@ -6193,6 +6401,12 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 step["sql_seconds"] = round(time.perf_counter() - _t_exec, 3)
                 _timing(timings, "run_sql", time.perf_counter() - _t_exec)
                 step["row_count"] = out["row_count"]
+                if financial_guard.needs_forecast_check(sql):
+                    _sc = (block.input.get("establishment_id"),
+                           block.input.get("period_start"),
+                           block.input.get("period_end_exclusive"))
+                    if _sc[1] and _sc[2] and _sc not in forecast_scopes:
+                        forecast_scopes.append(_sc)
                 if review is not None and out["rows"]:
                     _r0 = out["rows"][0]
                     if "three_margin_points" in _r0:
@@ -6271,7 +6485,14 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 continue
             except (SqlError, psycopg2.Error) as e:
                 step["error"] = str(e).strip()
-                tool_results.append((block.id, f"ERROR: {step['error']}", True))
+                if financial_guard.is_timeout_error(e):
+                    # A timeout is a query-size problem, never evidence that
+                    # data is missing: say so to the model explicitly.
+                    step["timeout"] = True
+                    tool_results.append((block.id, financial_guard.TIMEOUT_TOOL_MESSAGE.format(
+                        seconds=STATEMENT_TIMEOUT_MS / 1000), True))
+                else:
+                    tool_results.append((block.id, f"ERROR: {step['error']}", True))
             steps.append(step)
         provider.add_tool_results(messages, tool_results)
 
@@ -6344,6 +6565,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     _log_timings(timings, model, provider=provider.name, usage=provider.usage)
     if review is not None:
         final_text = fin_review_guarantee(final_text, review_ev)
+    final_text = _financial_guard_final(final_text, forecast_scopes, guard_cov, steps)
     result = ChatResult(final_text.strip() or EMPTY_ANSWER_FALLBACK, steps)
     result.timings = timings
     result.provider = provider.name
