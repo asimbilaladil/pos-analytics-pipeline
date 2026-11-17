@@ -36,6 +36,7 @@ from pglast.parser import ParseError
 
 import chat_providers
 import financial_guard
+import hme_trust_sql
 import store_scope
 
 MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5")
@@ -1812,10 +1813,11 @@ HME rules — these are not stylistic, they change what is true:
   * HME TRUST IS ALSO PER STORE-DAY. A day can reconcile for the network while
     one store's own checks fail (store_result_status PARTIAL). check_data
     reports these as "HME store-level reconciliation NOT verified": in a
-    single-store scope that store-day is blocked; in a network scope name each
-    unverified store-day with its reason, exclude it from figures or label it
-    UNVERIFIED, and never call a sum that includes it verified or a network
-    total. Never describe an UNVERIFIED store-day as verified or reconciled.
+    single-store scope that store-day is blocked; in a network scope the
+    server removes it from every v_hme_store_daily_llm / v_hme_outliers_daily_llm
+    result, so name each excluded store-day with its reason and call any total
+    over those dates a verified subset, never a complete or network total.
+    Never describe an UNVERIFIED store-day as verified or reconciled.
   * source_complete = false while every store you were asked about is present
     is still usable at store level — but do not call the network source
     complete.
@@ -2346,6 +2348,15 @@ def _ro_conn():
 def run_sql(sql: str) -> dict:
     """Execute a validated read-only query. Returns {columns, rows, row_count}."""
     safe = _validate(sql)
+    # HME store-day trust (migration 65), deterministic: every read of an HME
+    # store-day fact view is confined, in the data layer, to store-days graded
+    # VERIFIED. An unverified store-day can therefore never contribute to a
+    # figure, whatever the declared scope or the SQL the model wrote. Fails
+    # closed (no trust row -> excluded; view missing -> the statement errors).
+    try:
+        safe = hme_trust_sql.confine_to_verified(safe)
+    except hme_trust_sql.HmeTrustSqlError as exc:
+        raise SqlError(str(exc)) from exc
     # MCP credentials restricted to some stores: confine every relation the
     # statement reads to those stores, in the data layer. No-op for everyone
     # else (store_scope.current() is None outside an MCP request).
@@ -4986,10 +4997,72 @@ def _hme_store_trust_gate(hme: dict, unreconciled) -> tuple[list, list]:
                   "verified. Name these dates and their reason; other dates for this "
                   "store and other stores are not affected by this check"], []
     return [], [HME_STORE_UNVERIFIED_PREFIX + " for " + phrase
-                + ". Exclude those store-days from every figure, or label them "
-                  "UNVERIFIED -- name each one with its reason, and never call a sum "
-                  "that includes them a verified or network total. The other "
-                  "stores' rows for those dates verified and remain usable"]
+                + ". The server removes those store-days from every HME query "
+                  "result, so any HME total over those dates is a VERIFIED SUBSET, "
+                  "never a complete or network total -- name each excluded "
+                  "store-day with its reason. The other stores' rows for those "
+                  "dates verified and remain usable"]
+
+
+HME_SERVER_EXCLUSION_PREFIX = "Data note (server-enforced): HME drive-thru figures"
+
+
+def hme_server_exclusions(gate_meta, sql: str) -> list:
+    """Unverified HME store-days that run_sql's trust rewrite removed from this
+    statement's scope: every unverified store-day in the declared scope that is
+    not already on a network-unreconciled date (those dates fail the gate, so
+    such a statement never runs). Empty when the statement reads no HME fact
+    view."""
+    if not gate_meta:
+        return []
+    try:
+        if not hme_trust_sql.reads_fact_view(sql):
+            return []
+    except Exception:  # unparseable SQL never reached the database
+        return []
+    h = gate_meta.get("hme") or {}
+    skip = set(h.get("unreconciled_days") or [])
+    return [{k: u.get(k) for k in ("establishment_id", "store_name", "business_date",
+                                    "store_result_status", "store_result_reason",
+                                    "grade_source", "store_check_failed",
+                                    "day_check_failed")}
+            for u in ((h.get("store_day_trust") or {}).get("unverified_store_days") or [])
+            if u.get("business_date") not in skip]
+
+
+def _hme_exclusion_phrase(items: list) -> str:
+    by_store: dict = {}
+    seen = set()
+    for u in sorted(items, key=lambda x: (str(x.get("store_name")), x["business_date"])):
+        key = (u.get("establishment_id"), u["business_date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        by_store.setdefault(u.get("store_name") or f"store {u.get('establishment_id')}",
+                            []).append(u)
+    return "; ".join(_hme_store_day_phrase(n, xs) for n, xs in by_store.items())
+
+
+def hme_exclusion_note(items: list) -> str:
+    return (HME_SERVER_EXCLUSION_PREFIX + " exclude store-days whose own "
+            "reconciliation is not verified: " + _hme_exclusion_phrase(items)
+            + ". Any HME total that covers those dates is a VERIFIED SUBSET of "
+              "stores, not a complete network total.")
+
+
+def _hme_trust_guard_final(text: str, steps: list) -> str:
+    """Last, deterministic pass: if any executed statement had unverified HME
+    store-days removed by the server, the answer always says so, whatever the
+    model wrote."""
+    items = [u for st in steps for u in (st.get("hme_store_days_excluded") or [])]
+    if not items or not text or not text.strip():
+        return text
+    steps.append({"sql": None, "row_count": None, "error": None,
+                  "hme_trust_guard": {"action": "note_appended",
+                                      "store_days": sorted({(u.get("establishment_id"),
+                                                             u["business_date"])
+                                                            for u in items})}})
+    return text + "\n\n" + hme_exclusion_note(items)
 
 
 def _hme_gate(hme: dict, period_start: str, period_end: str) -> tuple[list, list]:
@@ -6568,12 +6641,23 @@ def answer_question(history: list[dict], question: str, model: str | None = None
                 _fin_note = r365_fin_result_note(gate_meta, sql)
                 if _fin_note:
                     out["r365_financial_note"] = _fin_note
+                _hme_ex = hme_server_exclusions(gate_meta, sql)
+                if _hme_ex:
+                    # run_sql already removed these rows; tell the model, and
+                    # record them so the final answer discloses them regardless.
+                    step["hme_store_days_excluded"] = _hme_ex
+                    out["hme_trust_note"] = (
+                        hme_exclusion_note(_hme_ex) + " These rows were removed by "
+                        "the server before the query ran; do not present any HME "
+                        "total from these results as complete or as a network total.")
                 payload = json.dumps(out, separators=(",", ":"))
                 # keep tool payload bounded
                 if len(payload) > 60000:
                     payload = json.dumps(
                         {"columns": out["columns"], "rows": out["rows"][:200],
-                         "row_count": out["row_count"], "note": "truncated to 200 rows"},
+                         "row_count": out["row_count"], "note": "truncated to 200 rows",
+                         **({"hme_trust_note": out["hme_trust_note"]}
+                            if "hme_trust_note" in out else {})},
                         separators=(",", ":"),
                     )
                 tool_results.append((block.id, payload, False))
@@ -6718,6 +6802,7 @@ def answer_question(history: list[dict], question: str, model: str | None = None
     if review is not None:
         final_text = fin_review_guarantee(final_text, review_ev)
     final_text = _financial_guard_final(final_text, forecast_scopes, guard_cov, steps)
+    final_text = _hme_trust_guard_final(final_text, steps)
     result = ChatResult(final_text.strip() or EMPTY_ANSWER_FALLBACK, steps)
     result.timings = timings
     result.provider = provider.name

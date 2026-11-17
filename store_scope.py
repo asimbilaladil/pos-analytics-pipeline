@@ -56,6 +56,9 @@ _STORE_COLUMN = {
     "v_hme_goal_history_llm": "establishment_id",
     "v_hme_outliers_daily_llm": "establishment_id",
     "v_hme_store_daily_llm": "establishment_id",
+    # Read by chat_sql.run_sql's HME trust rewrite (hme_trust_sql), and readable
+    # directly: per-store-day grades, status only.
+    "v_hme_store_day_trust_llm": "establishment_id",
     "v_labor_daily_context": "establishment_id",
     "v_labor_hourly_context": "establishment_id",
     "v_order_channel_context": "establishment_id",

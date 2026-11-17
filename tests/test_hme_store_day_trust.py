@@ -162,7 +162,7 @@ m = prof(None, "2026-11-03", "2026-11-04")
 sw = [w for w in m["warnings"] if w.startswith(C.HME_STORE_UNVERIFIED_PREFIX)]
 check("network 11-03: verified stores not blocked; Mission Bend named in a mandatory warning",
       m["analysis_permitted"] and len(sw) == 1 and "LCF Mission Bend" in sw[0]
-      and "never call a sum" in sw[0], str(m["warnings"]))
+      and "VERIFIED SUBSET" in sw[0] and "server removes" in sw[0], str(m["warnings"]))
 check("network 11-03: the per-store list is structural, not only text",
       [(u["establishment_id"], u["business_date"])
        for u in m["hme"]["store_day_trust"]["unverified_store_days"]] == [(MB, "2026-11-03")])
