@@ -32,16 +32,26 @@ TimeoutStartSec=5400
 #   1  hard failure (extraction exhausted, tenant/safety abort, missing VERIFIED)
 #   2  reconciliation FAILED -- needs attention or the delayed retry
 #   3  ACCEPTED PARTIAL -- reconciled, all VERIFIED present, only OUT_OF_SCOPE absent
+#   5  RECONCILIATION PENDING SCHEDULED RETRY -- only a source-settling lag
+#      (Trend/Outliers behind PA), every other gate passed, and today's 10:15
+#      Chicago hme-reconciliation-retry will revisit this exact run. The DB
+#      still records the run as partial/unreconciled and the lagging
+#      store-days stay UNVERIFIED; the retry owns the verdict and ITS unit
+#      goes red (exit 2) if the source has not settled by then.
 #   75 harmless no-op (another run holds the lock)
 #
 # 2 is deliberately NOT listed as success: a real reconciliation problem must
-# leave the unit red. 3 IS listed, because a chronically absent OUT_OF_SCOPE
+# leave the unit red. 5 IS listed (added 2026-11-19): from 2026-11-12 to
+# 2026-11-18 the 05:30 run hit the Trend settling lag on 6 of 7 mornings
+# (store 115 Shepherd every time), the 10:15 retry reconciled the day, and
+# this unit nevertheless stayed red until the next clean morning -- a
+# permanently red unit that carried no signal. 3 IS listed, because a chronically absent OUT_OF_SCOPE
 # store (Frisco, absent since 2026-09-18) would otherwise fail this unit every
 # morning, and a unit that fails daily stops being a signal.
 #
 # The DATABASE stays authoritative for succeeded/partial: exit 3 does not mean
 # "complete". Monitoring that cares about completeness must read
 # hme_ingest_run.status / reconciliation_ok, not systemd's unit state.
-SuccessExitStatus=0 3 75
+SuccessExitStatus=0 3 5 75
 StandardOutput=append:/var/lib/laynes/hme/logs/daily-ingest.service.log
 StandardError=append:/var/lib/laynes/hme/logs/daily-ingest.service.log
