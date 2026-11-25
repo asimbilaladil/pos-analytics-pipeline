@@ -201,6 +201,10 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
               "business_date": i["business_date"], "difference": i["difference"],
               "category": i["category"], "severity": i["severity"], "status": i["status"]}
              for i in incidents if i["difference"]]
+    freshness = _freshness(results, source_rows)
+    coverage = {src: sorted({r["store_id"] for r in results
+                             if r["source"] == src and r["store_id"] is not None})
+                for src in STORE_SOURCES}
     runs = [dict(r) for r in store.recent_runs(30)]
     last_by_tier = {}
     for r in runs:
@@ -216,7 +220,69 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
         "checks": checks,
         "monitor": monitor_status(store, now, cfg),
         "states": list(STATE_RANK),
+        # Presentation helpers derived from the results above (no extra queries):
+        "freshness": freshness,
+        # store_ids each store-level source evaluated in the retained results. A
+        # store absent here is NOT covered by that source (e.g. an unmapped HME
+        # location) -- shown as "not applicable", never as healthy.
+        "coverage": coverage,
     }
+
+
+FRESHNESS_SOURCES = ("revel", "hme", "r365", "r365_financial")
+_VERIFIED_STATES = ("OK", "ACCEPTED")
+
+
+def _freshness(results: list[dict], source_rows: list[dict]) -> list[dict]:
+    """Per source: loaded vs verified, from the latest results only.
+
+    latest_expected_date  newest business date / period end the monitor evaluated
+    latest_checked_date   newest one with a full verdict (nothing PENDING), + counts
+    latest_verified_date  newest one on which EVERY evaluated result was OK or
+                          ACCEPTED (nothing failing, pending or unknown)
+    retry_pending         a PENDING result is waiting for a scheduled retry
+                          (category "settling")
+    """
+    rows = {r["source"]: r for r in source_rows}
+    out = []
+    for src in FRESHNESS_SOURCES:
+        by_date: dict[str, Counter] = defaultdict(Counter)
+        labels: dict[str, str] = {}
+        retry, pending_titles = False, set()
+        for r in results:
+            if r["source"] != src or not r["business_date"]:
+                continue
+            by_date[r["business_date"]][r["state"]] += 1
+            if r["qualifier"] and src == "r365_financial":
+                labels[r["business_date"]] = r["qualifier"]
+            if r["state"] == "PENDING":
+                pending_titles.add(r["title"])
+                retry = retry or r["category"] == "settling"
+        dates = sorted(by_date)
+        latest = dates[-1] if dates else None
+        verified = next((d for d in reversed(dates)
+                         if sum(by_date[d].values())
+                         and all(k in _VERIFIED_STATES for k in by_date[d])), None)
+        # newest date the monitor has a full verdict on (nothing still PENDING)
+        done = next((d for d in reversed(dates) if not by_date[d].get("PENDING")), None)
+        src_row = rows.get(src, {})
+        out.append({
+            "source": src, "label": SOURCE_LABELS.get(src, src),
+            "last_sync_at": src_row.get("last_success_at"),
+            "last_check_at": src_row.get("last_successful_check_at"),
+            "monitoring_state": src_row.get("monitoring_state"),
+            "latest_expected_date": latest,
+            "latest_expected_label": labels.get(latest) if latest else None,
+            "latest_expected_counts": dict(by_date[latest]) if latest else {},
+            "latest_verified_date": verified,
+            "latest_verified_label": labels.get(verified) if verified else None,
+            "latest_checked_date": done,
+            "latest_checked_label": labels.get(done) if done else None,
+            "latest_checked_counts": dict(by_date[done]) if done else {},
+            "retry_pending": retry,
+            "pending": sorted(pending_titles)[:5],
+        })
+    return out
 
 
 def daily_summary_text(store: Store, now: datetime, dashboard_url: str | None = None,

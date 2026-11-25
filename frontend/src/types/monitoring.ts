@@ -2,7 +2,7 @@
 
 export type Severity = 'CRITICAL' | 'HIGH' | 'WARNING'
 export type IncidentStatus = 'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED'
-export type ResultState = 'OK' | 'FAIL' | 'PENDING' | 'ACCEPTED'
+export type ResultState = 'OK' | 'FAIL' | 'PENDING' | 'ACCEPTED' | 'UNKNOWN'
 
 export interface MonitorIncident {
   id: string
@@ -107,6 +107,7 @@ export interface MonitorSelfStatus {
 }
 
 export interface MonitorStoreCell {
+  check?: string
   business_date?: string
   state?: ResultState
   severity?: Severity
@@ -147,6 +148,32 @@ export interface MonitorOverview {
   checks: MonitorCheckState[]
   monitor: MonitorSelfStatus
   states: OpState[]
+  /** Loaded vs verified per source (derived from latest results). */
+  freshness?: MonitorFreshness[]
+  /** store_ids each store-level source evaluated; absent = not covered by that source. */
+  coverage?: Partial<Record<StoreSource, number[]>>
+}
+
+export type StoreSource = 'revel' | 'hme' | 'r365'
+
+export interface MonitorFreshness {
+  source: string
+  label: string
+  /** The source's own latest successful sync / ingestion. */
+  last_sync_at: string | null
+  /** The monitor's latest successful check of this source. */
+  last_check_at: string | null
+  monitoring_state: OpState | null
+  latest_expected_date: string | null
+  latest_expected_label: string | null
+  latest_expected_counts: Partial<Record<ResultState, number>>
+  latest_checked_date: string | null
+  latest_checked_label: string | null
+  latest_checked_counts: Partial<Record<ResultState, number>>
+  latest_verified_date: string | null
+  latest_verified_label: string | null
+  retry_pending: boolean
+  pending: string[]
 }
 
 export interface MonitorNotification {
