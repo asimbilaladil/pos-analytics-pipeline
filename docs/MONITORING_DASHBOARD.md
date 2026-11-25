@@ -14,7 +14,7 @@ overview gains two derived fields, `freshness` and `coverage`, documented in
 | Section | Answers |
 |---|---|
 | **Summary** | Is the system healthy? How many unresolved incidents, how many locations, how fresh is the monitor and each source? |
-| **Data sources: loaded vs verified** | For each source: last sync, latest expected date, latest date with a full verdict, latest fully verified date, last monitor check, and whether a retry is pending. |
+| **Data sources: loaded vs verified** | For each source: last sync, **expected by now** (from the readiness schedule, with its own results or "not evaluated yet"), latest *evaluated* date (not proof of ingestion), latest date with a full verdict, latest fully verified date, last monitor check, and whether a retry is pending. |
 | **Store health** | Per store and per source: HEALTHY, PENDING, DEGRADED, FAILED, UNKNOWN, STALE or N/A. Clicking a store filters the incidents to it. |
 | **Incidents** | Issues grouped by source, with filters, search and sort. |
 | **Detail** | What happened in plain English, where, when, expected vs actual, likely cause (only when evidenced), what to check, timeline, technical evidence, and Acknowledge. |
@@ -50,12 +50,37 @@ On phones:
   - Under priority sort, unresolved CRITICAL and HIGH come first, both across
     source sections and within them.
   - New (unacknowledged) incidents rank before acknowledged ones.
+- **Expected vs evaluated.** "Expected by now" comes from the same readiness rules
+  the checks use (`clock` + config, no database):
+  - Revel: each day is due at `revel.ready_after_local` the next day;
+  - HME: each day is due at `hme.morning_ready_local` the next day;
+  - R365: the week ending Wednesday is due at `r365.week_ready_local` on Thursday;
+  - R365 financials: there is no schedule here, so it shows "No schedule".
+  If that date has no results, it says "not evaluated yet". An older or newer
+  evaluated date never stands in for it.
 - **Store cells.**
   - An unresolved incident on any date wins: HIGH or CRITICAL shows FAILED,
     WARNING shows DEGRADED.
-  - A store the source never evaluated (`coverage`) shows N/A.
-  - A source whose checks are STALE or UNKNOWN shows that state.
+  - N/A appears **only** when the source's authoritative store list is known and
+    excludes the store. Each check already reads that list and records it in
+    the monitor's own `source_status` as `covered_stores`:
+    - `revel.freshness`: active establishments;
+    - `hme.days`: active VERIFIED `hme_store_mapping`;
+    - `r365.weekly`: active VERIFIED `r365_store_mapping`.
+  - The dashboard reads only that record; it never queries business tables.
+  - If the list is not known yet, for example before the first run after deploy,
+    or R365 with no loaded week, every missing cell is UNKNOWN.
+  - A mapped store with no evidence is UNKNOWN, or STALE when the source's checks
+    are stale. It still gets a row.
   - Otherwise the cell shows the newest result.
+- **Filtered counts.**
+  - Filters apply per incident record. A group appears when at least one member
+    matches.
+  - Its count, severity and status come from the **matching** members only, for
+    example "1 of 10 incidents match" or "1 of 9 stores match".
+  - A network-level parent that does not match itself is shown, labelled
+    **context**, and counted separately, for example "3 matching incident records
+    (+1 network-level shown for context)".
 - **Likely cause** appears only for categories that a check assigns from
   recorded evidence: goal conflict, payment timing, open tickets, NO_ACCESS,
   and a load before the period close.
@@ -78,15 +103,26 @@ and notifications only when that tab is opened.
   - UNKNOWN and STALE, empty states, 401, 403 and 503;
   - refresh failure, the mobile layout (no overflow) and keyboard use.
   - Screenshots are saved when `DASHBOARD_SHOTS` is set.
-- `tests/test_monitoring_dashboard_api.py` covers `freshness` and `coverage`,
-  no PostgreSQL access, route authorization, and no new routes.
+- `tests/test_monitoring_dashboard_api.py` covers:
+  - expected vs evaluated dates against the schedule at different times of day;
+  - coverage from the recorded mapping (unknown when absent);
+  - each check recording its mapping;
+  - no SQL or PostgreSQL in the overview, route authorization, and no new routes.
 
 ## Deploy (needs approval)
 
-The changes are the frontend plus `monitoring/summary.py`, which is used by
-`laynes-api` and by the monitor's daily summary text. No migration, no
-monitoring-unit change, and no change to ingestion, reconciliation, checks or
-timers.
+The changes are:
+- the frontend;
+- `monitoring/summary.py`, used by `laynes-api` and the daily summary text;
+- three checks that now also record their already-read store list in
+  `source_status.detail.covered_stores`. No new query, and no change to any
+  verdict.
+
+There is no migration, no monitoring-unit change, and no change to ingestion,
+reconciliation, thresholds or timers.
+
+Until the first data run after deploy records `covered_stores`, the coverage is
+unknown, so missing cells show UNKNOWN, not N/A. That takes up to 15 minutes.
 
 1. Merge the PR into `sidebar-redesign` (after review).
 2. Back up the web root:

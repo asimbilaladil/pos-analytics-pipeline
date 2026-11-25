@@ -160,7 +160,10 @@ def days(ctx) -> list[CheckResult]:
         for m in mapped:
             out.append(_store_result(m, d, trust, results, after_retry, accepted_stores,
                                      settling_only, latest))
-    ctx.source_status(SRC_HME, last_ok, {"mapped_stores": len(mapped)})
+    ctx.source_status(SRC_HME, last_ok, {
+        "mapped_stores": len(mapped),
+        # Authoritative coverage for the dashboard: active VERIFIED hme_store_mapping rows.
+        "covered_stores": [{"id": m["establishment_id"], "name": m["store_name"]} for m in mapped]})
     return out
 
 

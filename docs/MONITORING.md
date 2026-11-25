@@ -288,20 +288,27 @@ bottom (layout and rules: `docs/MONITORING_DASHBOARD.md`):
   - Revel, HME and R365 freshness.
 - **Data sources: loaded vs verified.** For each source:
   - last sync;
-  - latest expected date or period;
+  - expected by now: the date due under the readiness schedule, with its results or
+    "not evaluated yet";
+  - latest evaluated date or period, which is not proof of ingestion;
   - latest date or period with a full verdict, with its counts;
   - latest fully verified date or period;
   - the monitor's last check;
   - whether a scheduled retry is pending.
 - **Store health.** Each store's Revel, HME and R365 state:
   - HEALTHY, PENDING, DEGRADED, FAILED, UNKNOWN or STALE;
-  - **N/A** where the source does not cover the store;
+  - **N/A** only where the source's own store mapping excludes the store; a mapped
+    store with no evidence, or any store while the mapping is not yet known, is
+    UNKNOWN or STALE;
   - an unresolved incident on any date takes precedence;
   - clicking a store filters the incidents.
 - **Incidents.**
   - Grouped by source; related incidents shown as one expandable issue. Example:
     the HME network reconciliation failure for a day plus its store-days.
   - Filters: status, source, severity, store, business date, and search.
+    - Counts show matching records only.
+    - A network-level parent shown for context is labelled "context" and
+      counted separately.
   - Priority sort puts unresolved CRITICAL and HIGH first.
   - Notification outbox, including dry-run messages.
 - **Detail.**

@@ -5,7 +5,7 @@ import type {
   MonitorIncident, MonitorIncidentDetail, MonitorNotification, MonitorOverview, Severity,
 } from '../types/monitoring'
 import {
-  bySection, EMPTY_FILTERS, filterGroups, groupIncidents, SECTION_LABEL, SECTIONS, shortDate, sortGroups,
+  bySection, countVisible, EMPTY_FILTERS, filterGroups, groupIncidents, SECTION_LABEL, SECTIONS, shortDate, sortGroups,
   type Filters, type IncidentGroup, type Section, type SortKey, type StatusFilter, type VisibleGroup,
 } from '../lib/monitoringView'
 import {
@@ -77,7 +77,7 @@ export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; o
   const openGroups = useMemo<IncidentGroup[]>(() => groupIncidents(ov?.open_incidents ?? []), [ov])
   const groups = useMemo<VisibleGroup[]>(() => sortGroups(filterGroups(pool, filters), sort), [pool, filters, sort])
   const sections = useMemo(() => bySection(groups, sort === 'priority'), [groups, sort])
-  const visibleRecords = groups.reduce((n, g) => n + g.visible.length, 0)
+  const vis = countVisible(groups)
   const dates = useMemo(() => [...new Set(pool.map((i) => i.business_date).filter(Boolean) as string[])].sort().reverse(), [pool])
   const stores = useMemo(() => [...(ov?.stores ?? [])].sort((a, b) => (a.store_name || '').localeCompare(b.store_name || '')), [ov])
   const filtered = JSON.stringify({ ...filters, status: 'unresolved' }) !== JSON.stringify(EMPTY_FILTERS) || filters.status !== 'unresolved'
@@ -225,7 +225,8 @@ export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; o
                       </select>
                     </div>
                     <div className="flex items-center justify-between text-[11.5px] text-ink-500">
-                      <span data-testid="list-count">{groups.length} issue{groups.length === 1 ? '' : 's'} · {visibleRecords} incident record{visibleRecords === 1 ? '' : 's'}</span>
+                      <span data-testid="list-count">{vis.issues} issue{vis.issues === 1 ? '' : 's'} · {vis.matched} {filtered ? 'matching ' : ''}incident record{vis.matched === 1 ? '' : 's'}
+                        {vis.context > 0 && <span data-testid="context-count" className="text-ink-400"> (+{vis.context} network-level shown for context)</span>}</span>
                       {filtered && <button type="button" onClick={() => setFilters(EMPTY_FILTERS)} className="font-medium text-brand-700 hover:underline">Clear filters</button>}
                     </div>
                   </div>
@@ -286,7 +287,8 @@ export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; o
               )}
               {!detailOpen && <p className="p-8 text-center text-[13px] text-ink-400">Select an issue to see what happened, which stores are affected and what to check.</p>}
               {sel?.kind === 'group' && (selGroup
-                ? <GroupDetail g={selGroup} onOpen={(m) => openIncident(m.id, selGroup.key)} />
+                ? <GroupDetail g={selGroup} onOpen={(m) => openIncident(m.id, selGroup.key)}
+                    matchedIds={'matched' in selGroup ? new Set((selGroup as VisibleGroup).matched.map((m) => m.id)) : undefined} />
                 : <p className="text-[13px] text-ink-500">This issue is no longer in the current list.</p>)}
               {sel?.kind === 'incident' && (detailLoading && !detail
                 ? <p className="flex items-center gap-2 text-[13px] text-ink-500"><Loader2 size={14} className="animate-spin" /> Loading incident…</p>

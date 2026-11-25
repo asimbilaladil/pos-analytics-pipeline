@@ -113,7 +113,8 @@ def cell(state, date, title="", sev="WARNING", diff=None):
             "check": "x"}
 
 
-def overview(*, monitor_state="HEALTHY", data_tier="HEALTHY", hme_mon="HEALTHY", incs=None):
+def overview(*, monitor_state="HEALTHY", data_tier="HEALTHY", hme_mon="HEALTHY", incs=None, coverage="mapping",
+             extra_store=False):
     incs = incidents() if incs is None else incs
     stores = []
     for sid, name in STORES.items():
@@ -121,6 +122,8 @@ def overview(*, monitor_state="HEALTHY", data_tier="HEALTHY", hme_mon="HEALTHY",
         if sid in HME_MAPPED:
             srcs["hme"] = cell("FAIL" if sid in HME_FAILED else "OK", "2026-11-23", sev="HIGH")
         stores.append({"store_id": sid, "store_name": name, "sources": srcs})
+    if extra_store:   # mapped for HME, no results anywhere yet (row added by the backend from coverage)
+        stores.append({"store_id": 99, "store_name": "LCF New Store", "sources": {}})
     srcs = []
     for src, label in [("revel", "Revel POS"), ("hme", "HME drive-thru"), ("r365", "R365 operations"),
                        ("r365_financial", "R365 financials"), ("ai_chat", "AI Chat"), ("mcp", "MCP server"),
@@ -146,8 +149,10 @@ def overview(*, monitor_state="HEALTHY", data_tier="HEALTHY", hme_mon="HEALTHY",
     fr = lambda src, label, verified, retry=False: {  # noqa: E731
         "source": src, "label": label, "last_sync_at": "2026-11-24T15:18:36+00:00",
         "last_check_at": "2026-11-25T08:47:13+00:00", "monitoring_state": hme_mon if src == "hme" else "HEALTHY",
-        "latest_expected_date": "2026-11-24", "latest_expected_label": None,
-        "latest_expected_counts": {"PENDING": 12}, "latest_checked_date": "2026-11-23", "latest_checked_label": None,
+        "expected_date": "2026-11-23", "expected_rule": "each day is due 09:45 Chicago the next day",
+        "expected_counts": {} if src == "revel" else {"OK": 10, "FAIL": 2},
+        "latest_evaluated_date": "2026-11-24", "latest_evaluated_label": None,
+        "latest_evaluated_counts": {"PENDING": 12}, "latest_checked_date": "2026-11-23", "latest_checked_label": None,
         "latest_checked_counts": {"OK": 10, "FAIL": 2}, "latest_verified_date": verified,
         "latest_verified_label": None, "retry_pending": retry, "pending": ["Awaiting daily sync"]}
     return {"generated_at": "2026-11-25T08:50:00+00:00", "sources": srcs, "stores": stores,
@@ -160,7 +165,10 @@ def overview(*, monitor_state="HEALTHY", data_tier="HEALTHY", hme_mon="HEALTHY",
             "states": ["HEALTHY", "PENDING", "DEGRADED", "UNKNOWN", "STALE", "FAILED"],
             "freshness": [fr("revel", "Revel POS", None), fr("hme", "HME drive-thru", "2026-11-22", True),
                           fr("r365", "R365 operations", "2026-11-18")],
-            "coverage": {"revel": list(STORES), "hme": HME_MAPPED, "r365": list(STORES)}}
+            "coverage": None if coverage is None else {
+                k: {"basis": "mapping", "as_of": T, "store_ids": ids, "stores": [{"id": i, "name": STORES.get(i, "LCF New Store")} for i in ids]}
+                for k, ids in (("revel", list(STORES)), ("hme", HME_MAPPED + ([99] if extra_store else [])),
+                               ("r365", list(STORES)))}}
 
 
 RESOLVED = []
@@ -305,30 +313,46 @@ async def main():
         print("2. filtering, search and sorting")
         cnt = lambda: text(p, "[data-testid=list-count]")  # noqa: E731
         await p.get_by_label("Filter by severity").select_option("WARNING")
-        check("severity WARNING -> 5 issues / 5 records", await cnt() == "5 issues · 5 incident records", await cnt())
+        check("severity WARNING -> 5 issues / 5 records", await cnt() == "5 issues · 5 matching incident records", await cnt())
         await p.get_by_label("Filter by severity").select_option("")
         await p.get_by_label("Filter by source").select_option("revel")
-        check("source Revel -> 3 issues", await cnt() == "3 issues · 3 incident records", await cnt())
+        check("source Revel -> 3 issues", await cnt() == "3 issues · 3 matching incident records", await cnt())
         await p.get_by_label("Filter by source").select_option("")
         await p.get_by_label("Filter by store").select_option("15")
         c = await cnt()
-        check("store Shepherd -> HME group (parent kept for context) + 2 Revel days", c == "3 issues · 4 incident records", c)
+        check("store Shepherd -> 3 issues, 3 MATCHING records; the network parent is counted separately as context",
+              c == "3 issues · 3 matching incident records (+1 network-level shown for context)", c)
+        hg = p.locator('[data-group="hme|reconciliation|2026-11-23"]')
+        check("filtered group says '1 of 10 incidents match' and '1 of 9 stores match'",
+              await hg.locator("[data-testid=group-count]").inner_text() == "1 of 10 incidents match"
+              and "1 of 9 stores match" in await hg.inner_text(), await hg.inner_text())
+        if await hg.locator("[aria-controls]").get_attribute("aria-expanded") != "true":
+            await hg.locator("[aria-controls]").click()
+        ctxs = await hg.locator("[data-testid=group-members] [data-context=true]").count()
+        rows_ = await hg.locator("[data-testid=group-members] [data-incident]").count()
+        check("expanded filtered group: Shepherd + the network parent marked CONTEXT (2 rows, 1 context)",
+              rows_ == 2 and ctxs == 1 and "context" in (await hg.locator("[data-context=true]").inner_text()).lower())
+        await hg.locator("[data-testid=group-open]").click()
+        check("group detail: '1 of 10 match the current filters'",
+              "1 of 10 match the current filters" in await text(p, "[data-testid=group-detail-matches]"))
         await p.get_by_label("Filter by store").select_option("")
         await p.get_by_label("Filter by business date").select_option("2026-11-22")
-        check("business date Nov 22 -> 2 Revel issues", await cnt() == "2 issues · 2 incident records", await cnt())
+        check("business date Nov 22 -> 2 Revel issues", await cnt() == "2 issues · 2 matching incident records", await cnt())
         await p.get_by_label("Filter by business date").select_option("")
         await p.get_by_label("Search incidents").fill("rosenberg")
-        check("search 'rosenberg' -> NO_ACCESS issue + HME group", await cnt() == "2 issues · 3 incident records", await cnt())
+        check("search 'rosenberg' -> NO_ACCESS issue + HME group: 2 matching (+1 context)",
+              await cnt() == "2 issues · 2 matching incident records (+1 network-level shown for context)", await cnt())
         await p.get_by_label("Search incidents").fill("")
         await p.get_by_label("Filter by status").select_option("acknowledged")
-        check("status Acknowledged -> only the acknowledged record", await cnt() == "1 issue · 1 incident record", await cnt())
+        check("status Acknowledged -> only the acknowledged record", await cnt() == "1 issue · 1 matching incident record", await cnt())
         await p.get_by_label("Filter by status").select_option("new")
-        check("status New -> 16 records", (await cnt()).endswith("16 incident records"), await cnt())
+        check("status New -> 7 issues / 16 matching records (the acknowledged job drops out), no context needed",
+              (await cnt()) == "7 issues · 16 matching incident records", await cnt())
         RESOLVED.append({**incidents()[0], "id": "INC-R001", "status": "RESOLVED", "business_date": "2026-11-18",
                          "dedup_key": "hme:day:-:2026-11-18", "resolved_at": T, "resolution": "cleared: check passed"})
         await p.get_by_label("Filter by status").select_option("resolved")
         await p.wait_for_function("document.querySelector('[data-testid=list-count]').innerText.startsWith('1 issue')")
-        check("status Resolved -> fetched from the incidents API (1)", await cnt() == "1 issue · 1 incident record")
+        check("status Resolved -> fetched from the incidents API (1)", await cnt() == "1 issue · 1 matching incident record")
         check("resolved incidents requested only when needed",
               sum(1 for m, u in api.calls if "status=RESOLVED" in u) >= 1)
         await p.get_by_label("Filter by status").select_option("unresolved")
@@ -353,8 +377,8 @@ async def main():
         check("Missouri City Revel with WARNING incident -> DEGRADED", await st(36, "revel") == "DEGRADED")
         check("Rosenberg HME (two HIGH incidents, two dates) -> FAILED", await st(40, "hme") == "FAILED")
         await p.locator('[data-store="36"] th button').click()
-        check("clicking a store filters incidents to it", await p.get_by_label("Filter by store").input_value() == "36"
-              and (await cnt()) == "2 issues · 3 incident records", await cnt())
+        check("clicking a store filters incidents to it (2 matching + 1 context)", await p.get_by_label("Filter by store").input_value() == "36"
+              and (await cnt()) == "2 issues · 2 matching incident records (+1 network-level shown for context)", await cnt())
         check("store button reports aria-pressed", await p.locator('[data-store="36"] th button').get_attribute("aria-pressed") == "true")
         await p.locator('[data-store="36"] th button').click()
         check("clicking again clears the store filter", await p.get_by_label("Filter by store").input_value() == "")
@@ -363,7 +387,12 @@ async def main():
         print("4. data-source freshness")
         ft = await text(p, "[data-testid=freshness-table]")
         check("freshness table shows loaded vs verified columns",
-              all(x.lower() in ft.lower() for x in ("Last sync", "Latest expected", "Latest checked", "Latest verified", "Monitor check", "Retry")))
+              all(x.lower() in ft.lower() for x in ("Last sync", "Expected by now", "Latest evaluated", "Latest checked", "Latest verified", "Monitor check", "Retry")))
+        check("expected date not evaluated -> says 'not evaluated yet' (an older/newer evaluated date never stands in)",
+              await text(p, "[data-testid=expected-revel]") == "Nov 23\nnot evaluated yet"
+              and (await text(p, "[data-testid=evaluated-revel]")).startswith("Nov 24"), await text(p, "[data-testid=expected-revel]"))
+        check("expected date evaluated -> its own counts", "10 ok, 2 failing" in await text(p, "[data-testid=expected-hme]"))
+        check("no 'Latest expected' label anywhere", "latest expected" not in (await p.locator("main").inner_text()).lower())
         check("Revel with no fully verified date says so (never blank or healthy)",
               await text(p, "[data-testid=verified-revel]") == "None in the monitored window")
         check("HME retry pending shown", "pending" in await p.locator('[data-source=hme]').inner_text())
@@ -398,6 +427,55 @@ async def main():
         await p.keyboard.press("Enter")
         check("keyboard: Enter on the focused expand control toggles the group both ways",
               before != mid and await tog.get_attribute("aria-expanded") == before, (before, mid))
+        await ctx.close()
+
+        # 5b. mixed-status / mixed-severity groups under filters -------------
+        print("5b. filtered groups show matched status/severity, never the group's")
+        incs = incidents()
+        katy = next(i for i in incs if i["store_id"] == 6 and i["business_date"] == "2026-11-23")
+        katy.update(status="ACKNOWLEDGED", acknowledged_by="ops@example.com", acknowledged_at=T)
+        ella = next(i for i in incs if i["store_id"] == 7 and i["business_date"] == "2026-11-23")
+        ella["severity"] = "WARNING"
+        api = Api(overview(incs=incs))
+        ctx, p = await open_dash(api)
+        await p.wait_for_selector("[data-testid=summary]")
+        cnt = lambda: text(p, "[data-testid=list-count]")  # noqa: E731
+        hg = p.locator('[data-group="hme|reconciliation|2026-11-23"]')
+        check("unfiltered mixed group: PARTLY ACK, HIGH, 10 incidents",
+              "PARTLY ACK" in await hg.inner_text() and await hg.locator("[data-badge]").first.get_attribute("data-badge") == "HIGH")
+        await p.get_by_label("Filter by status").select_option("acknowledged")
+        check("status Acknowledged: group shows ACKNOWLEDGED (its matched member), 1 of 10, parent as context",
+              await hg.locator("[data-badge]").nth(1).get_attribute("data-badge") == "ACKNOWLEDGED"
+              and await hg.locator("[data-testid=group-count]").inner_text() == "1 of 10 incidents match"
+              and (await cnt()).startswith("2 issues · 2 matching incident records (+1"), await cnt())
+        await p.get_by_label("Filter by status").select_option("unresolved")
+        await p.get_by_label("Filter by severity").select_option("WARNING")
+        check("severity WARNING: the HIGH group appears as WARNING (only its WARNING member matches), parent is context",
+              await hg.locator("[data-badge]").first.get_attribute("data-badge") == "WARNING"
+              and await hg.locator("[data-testid=group-count]").inner_text() == "1 of 10 incidents match")
+        await p.get_by_label("Filter by severity").select_option("HIGH")
+        c = await cnt()
+        check("severity HIGH: 8 of 10 match in the group; parent itself HIGH so it is a match, not context",
+              await hg.locator("[data-testid=group-count]").inner_text() == "9 of 10 incidents match" and "context" not in c, c)
+        await ctx.close()
+
+        # 5c. coverage -----------------------------------------------------
+        print("5c. N/A only from a known mapping; missing evidence is UNKNOWN")
+        api = Api(overview(coverage=None))
+        ctx, p = await open_dash(api)
+        await p.wait_for_selector("[data-testid=summary]")
+        check("mapping unknown -> Downtown Houston HME is UNKNOWN, not N/A",
+              await p.locator('[data-cell="61:hme"]').get_attribute("data-state") == "UNKNOWN")
+        check("header says the mapping is not yet known", "mapping not yet known" in await p.locator("section[aria-labelledby=stores-h]").inner_text())
+        await ctx.close()
+        api = Api(overview(extra_store=True))
+        ctx, p = await open_dash(api)
+        await p.wait_for_selector("[data-testid=summary]")
+        check("store mapped for HME with no evidence -> UNKNOWN (not N/A, not healthy)",
+              await p.locator('[data-cell="99:hme"]').get_attribute("data-state") == "UNKNOWN")
+        check("same store not in the Revel mapping -> N/A", await p.locator('[data-cell="99:revel"]').get_attribute("data-state") == "NOT_APPLICABLE")
+        check("known mapping excluding Downtown Houston -> HME N/A",
+              await p.locator('[data-cell="61:hme"]').get_attribute("data-state") == "NOT_APPLICABLE")
         await ctx.close()
 
         # 6. UNKNOWN / STALE --------------------------------------------------

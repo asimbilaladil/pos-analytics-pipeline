@@ -139,6 +139,20 @@ const counts = (c: Partial<Record<string, number>>) =>
   Object.entries(c).filter(([, n]) => n).map(([k, n]) => `${n} ${k === 'FAIL' ? 'failing' : k.toLowerCase()}`).join(', ')
 const dateWithLabel = (d: string | null, l: string | null) => (d ? `${shortDate(d)}${l ? ` (${l})` : ''}` : null)
 
+/** The date the source should have delivered by now and whether it has been evaluated.
+ *  An evaluated older date never stands in for it. */
+function ExpectedCell({ f }: { f: MonitorFreshness }) {
+  if (!f.expected_date) return <span className="text-ink-400">No schedule (periods)</span>
+  const n = Object.values(f.expected_counts).reduce((a, b) => a + (b || 0), 0)
+  return (
+    <>
+      {shortDate(f.expected_date)}
+      <div className={`text-[11px] ${n ? 'text-ink-400' : 'text-amber-800'}`}>
+        {n ? counts(f.expected_counts) : 'not evaluated yet'}</div>
+    </>
+  )
+}
+
 export function SourceFreshness({ ov }: { ov: MonitorOverview }) {
   const rows: MonitorFreshness[] = ov.freshness ?? []
   if (!rows.length) return null
@@ -155,7 +169,8 @@ export function SourceFreshness({ ov }: { ov: MonitorOverview }) {
                 {st && <Badge v={st.state} />}</div>
               <dl className="mt-1 grid grid-cols-[110px_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-ink-700">
                 <dt className="text-ink-500">Last sync</dt><dd>{ago(f.last_sync_at)}</dd>
-                <dt className="text-ink-500">Latest expected</dt><dd>{dateWithLabel(f.latest_expected_date, f.latest_expected_label) ?? '—'}</dd>
+                <dt className="text-ink-500">Expected by now</dt><dd><ExpectedCell f={f} /></dd>
+                <dt className="text-ink-500">Latest evaluated</dt><dd>{dateWithLabel(f.latest_evaluated_date, f.latest_evaluated_label) ?? '—'}</dd>
                 <dt className="text-ink-500">Latest checked</dt><dd>{dateWithLabel(f.latest_checked_date, f.latest_checked_label) ?? '—'}
                   {f.latest_checked_date && <span className="text-ink-400"> · {counts(f.latest_checked_counts)}</span>}</dd>
                 <dt className="text-ink-500">Latest verified</dt><dd>{f.latest_verified_date
@@ -167,11 +182,12 @@ export function SourceFreshness({ ov }: { ov: MonitorOverview }) {
         })}
       </ul>
       <div className="hidden overflow-x-auto scroll-thin sm:block">
-        <table className="w-full min-w-[760px] text-left text-[12.5px]" data-testid="freshness-table">
+        <table className="w-full min-w-[880px] text-left text-[12.5px]" data-testid="freshness-table">
           <thead><tr className="border-y border-line bg-app/60 text-[10.5px] uppercase tracking-wide text-ink-400">
             <th scope="col" className="px-4 py-1.5 font-semibold">Source</th>
             <th scope="col" className="px-3 py-1.5 font-semibold">Last sync</th>
-            <th scope="col" className="px-3 py-1.5 font-semibold">Latest expected</th>
+            <th scope="col" className="px-3 py-1.5 font-semibold">Expected by now</th>
+            <th scope="col" className="px-3 py-1.5 font-semibold">Latest evaluated</th>
             <th scope="col" className="px-3 py-1.5 font-semibold">Latest checked</th>
             <th scope="col" className="px-3 py-1.5 font-semibold">Latest verified</th>
             <th scope="col" className="px-3 py-1.5 font-semibold">Monitor check</th>
@@ -185,7 +201,9 @@ export function SourceFreshness({ ov }: { ov: MonitorOverview }) {
                   <th scope="row" className="px-4 py-2 font-medium text-ink-900">
                     <div className="flex items-center gap-2">{f.label}{st && <Badge v={st.state} />}</div></th>
                   <td className="px-3 py-2 text-ink-700">{ago(f.last_sync_at)}<div className="text-[11px] text-ink-400">{when(f.last_sync_at)}</div></td>
-                  <td className="px-3 py-2 text-ink-700">{dateWithLabel(f.latest_expected_date, f.latest_expected_label) ?? '—'}
+                  <td className="px-3 py-2 text-ink-700" data-testid={`expected-${f.source}`} title={f.expected_rule ?? undefined}>
+                    <ExpectedCell f={f} /></td>
+                  <td className="px-3 py-2 text-ink-700" data-testid={`evaluated-${f.source}`}>{dateWithLabel(f.latest_evaluated_date, f.latest_evaluated_label) ?? '—'}
                     {!!f.pending.length && <div className="text-[11px] text-ink-400">{f.pending[0]}</div>}</td>
                   <td className="px-3 py-2 text-ink-700">{dateWithLabel(f.latest_checked_date, f.latest_checked_label) ?? '—'}
                     {f.latest_checked_date && <div className="text-[11px] text-ink-400">{counts(f.latest_checked_counts)}</div>}</td>
@@ -218,13 +236,13 @@ export function StoreMatrix({ ov, selected, onSelect }: {
   ov: MonitorOverview; selected: number | null; onSelect: (id: number | null) => void
 }) {
   const stores = [...ov.stores].sort((a, b) => (a.store_name || '').localeCompare(b.store_name || ''))
-  const covered = (src: 'revel' | 'hme' | 'r365') => ov.coverage?.[src]?.length
+  const covered = (src: 'revel' | 'hme' | 'r365') => ov.coverage?.[src]?.store_ids.length
   return (
     <section aria-labelledby="stores-h" className="rounded-xl border border-line bg-white shadow-card">
       <div className="flex flex-wrap items-baseline justify-between gap-2 px-4 pb-1.5 pt-3">
         <H2 id="stores-h">Store health</H2>
         <span className="text-[11px] text-ink-400">
-          {STORE_SOURCES.map((s) => `${SECTION_LABEL[s]} ${covered(s) ?? '?'} stores`).join(' · ')} · click a store to filter incidents</span>
+          {STORE_SOURCES.map((s) => `${SECTION_LABEL[s]} ${covered(s) ?? 'mapping not yet known'}${covered(s) !== undefined ? ' stores' : ''}`).join(' · ')} · click a store to filter incidents</span>
       </div>
       <div className="overflow-x-auto scroll-thin">
         <table className="w-full min-w-[520px] text-left text-[12.5px]" data-testid="store-matrix">
@@ -262,8 +280,9 @@ export function StoreMatrix({ ov, selected, onSelect }: {
         </table>
       </div>
       <p className="px-4 py-2 text-[11px] text-ink-400">
-        N/A = the source does not cover that store (for example, an HME-unmapped location). Unresolved incidents
-        on any date take precedence over the newest checked date.</p>
+        N/A = the source's own store mapping excludes that store (for example, an HME-unmapped location). A mapped
+        store with no current evidence, or any store while the mapping is not yet known, shows UNKNOWN or STALE.
+        Unresolved incidents on any date take precedence over the newest checked date.</p>
     </section>
   )
 }
@@ -276,9 +295,12 @@ export function GroupRow({ g, selectedId, expanded, onToggle, onOpen }: {
   const multi = g.members.length > 1
   const single = g.members[0]
   const storeCount = g.storeIds.length
+  const filtered = g.matched.length < g.members.length
   const isSel = selectedId === g.key || (!multi && selectedId === single.id)
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`
   const meta = [
-    multi ? `${storeCount} store${storeCount === 1 ? '' : 's'}` : (single.store_name || single.qualifier || 'Network-level'),
+    multi ? (filtered ? `${g.matchedStoreIds.length} of ${plural(storeCount, 'store')} match`
+      : plural(storeCount, 'store')) : (single.store_name || single.qualifier || 'Network-level'),
     g.business_date ? longDate(g.business_date) : null,
     !multi && single.difference ? single.difference : null,
   ].filter(Boolean).join(' · ')
@@ -297,9 +319,10 @@ export function GroupRow({ g, selectedId, expanded, onToggle, onOpen }: {
           className="min-w-0 flex-1 py-2.5 pr-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-300"
           data-testid="group-open">
           <div className="flex flex-wrap items-center gap-1.5">
-            <Badge v={g.severity} />
-            <Badge v={multi ? g.status : incidentStatusLabel(single.status)} />
-            {multi && <span className="text-[11px] font-medium text-ink-500">{g.members.length} incidents</span>}
+            <Badge v={g.shownSeverity} />
+            <Badge v={multi ? g.shownStatus : incidentStatusLabel(single.status)} />
+            {multi && <span className="text-[11px] font-medium text-ink-500" data-testid="group-count">
+              {filtered ? `${g.matched.length} of ${g.members.length} incidents match` : `${g.members.length} incidents`}</span>}
           </div>
           <p className="mt-1 text-[13px] font-medium leading-snug text-ink-900">{g.title}</p>
           <p className="truncate text-[12px] text-ink-500">{meta}</p>
@@ -308,19 +331,25 @@ export function GroupRow({ g, selectedId, expanded, onToggle, onOpen }: {
       </div>
       {multi && expanded && (
         <ul id={panelId} className="border-t border-line bg-app/50 py-1 pl-8" data-testid="group-members">
-          {g.visible.map((m) => (
-            <li key={m.id}>
-              <button type="button" onClick={() => onOpen({ incident: m })} data-incident={m.id}
-                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-300 ${selectedId === m.id ? 'bg-brand-50' : 'hover:bg-white'}`}>
-                <MapPin size={12} className="shrink-0 text-ink-400" />
-                <span className="min-w-0 flex-1 truncate">
-                  <span className="font-medium text-ink-900">{m.store_name || 'Network-level'}</span>
-                  <span className="text-ink-500"> · {categoryLabel(m.category, m.title)}</span>
-                </span>
-                <Badge v={incidentStatusLabel(m.status)} />
-              </button>
-            </li>
-          ))}
+          {g.visible.map((m) => {
+            const ctx = g.context.includes(m)
+            return (
+              <li key={m.id}>
+                <button type="button" onClick={() => onOpen({ incident: m })} data-incident={m.id}
+                  data-context={ctx ? 'true' : undefined}
+                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-300 ${selectedId === m.id ? 'bg-brand-50' : 'hover:bg-white'} ${ctx ? 'opacity-70' : ''}`}>
+                  <MapPin size={12} className="shrink-0 text-ink-400" />
+                  <span className="min-w-0 flex-1 truncate">
+                    <span className="font-medium text-ink-900">{m.store_name || 'Network-level'}</span>
+                    <span className="text-ink-500"> · {categoryLabel(m.category, m.title)}</span>
+                  </span>
+                  {ctx && <span className="shrink-0 rounded border border-dashed border-line px-1 text-[10px] font-medium uppercase tracking-wide text-ink-400"
+                    title="Shown for context: this network-level incident does not match the current filters and is not counted">context</span>}
+                  <Badge v={incidentStatusLabel(m.status)} />
+                </button>
+              </li>
+            )
+          })}
         </ul>
       )}
     </li>
@@ -332,8 +361,11 @@ const Field = ({ k, children }: { k: string; children: React.ReactNode }) => (
   <><dt className="text-ink-500">{k}</dt><dd className="min-w-0 break-words text-ink-900">{children}</dd></>
 )
 
-export function GroupDetail({ g, onOpen }: { g: IncidentGroup; onOpen: (i: MonitorIncident) => void }) {
+export function GroupDetail({ g, onOpen, matchedIds }: {
+  g: IncidentGroup; onOpen: (i: MonitorIncident) => void; matchedIds?: Set<string>
+}) {
   const head = g.parent ?? g.members[0]
+  const filtered = !!matchedIds && matchedIds.size < g.members.length
   return (
     <div className="space-y-3 text-[13px]" data-testid="group-detail">
       <div className="flex flex-wrap items-center gap-1.5"><Badge v={g.severity} /><Badge v={g.status} />
@@ -348,7 +380,9 @@ export function GroupDetail({ g, onOpen }: { g: IncidentGroup; onOpen: (i: Monit
         {likelyCause(head) && <Field k="Likely cause">{likelyCause(head)}</Field>}
       </dl>
       <div>
-        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Incidents in this group</p>
+        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Incidents in this group
+          {filtered && <span className="ml-1 normal-case tracking-normal text-ink-500" data-testid="group-detail-matches">
+            · {matchedIds!.size} of {g.members.length} match the current filters</span>}</p>
         <ul className="divide-y divide-line rounded-lg border border-line">
           {g.members.map((m) => (
             <li key={m.id}>
@@ -356,6 +390,7 @@ export function GroupDetail({ g, onOpen }: { g: IncidentGroup; onOpen: (i: Monit
                 className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-app focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-300">
                 <span className="min-w-0 flex-1 truncate"><b className="font-medium">{m.store_name || 'Network-level'}</b>
                   <span className="text-ink-500"> · {categoryLabel(m.category, m.title)}</span></span>
+                {filtered && matchedIds!.has(m.id) && <span className="text-[10px] font-medium uppercase text-brand-700">match</span>}
                 <Badge v={m.severity} /><Badge v={incidentStatusLabel(m.status)} />
               </button>
             </li>

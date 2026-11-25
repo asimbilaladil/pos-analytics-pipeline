@@ -144,7 +144,11 @@ def freshness(ctx) -> list[CheckResult]:
         else:
             out.append(CheckResult(state=OK, title="Revel sync fresh", **base))
     ctx.source_status(SRC_REVEL, newest, {"oldest_store_sync": oldest.isoformat() if oldest else None,
-                                          "stores": len(by_store)})
+                                          "stores": len(by_store),
+                                          # Authoritative store list for the dashboard's coverage
+                                          # (active establishments), read by this check anyway.
+                                          "covered_stores": [{"id": est, "name": s["name"]}
+                                                             for est, s in sorted(by_store.items())]})
     return out
 
 

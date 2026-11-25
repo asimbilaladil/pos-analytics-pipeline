@@ -150,11 +150,19 @@ export interface MonitorOverview {
   states: OpState[]
   /** Loaded vs verified per source (derived from latest results). */
   freshness?: MonitorFreshness[]
-  /** store_ids each store-level source evaluated; absent = not covered by that source. */
-  coverage?: Partial<Record<StoreSource, number[]>>
+  /** Authoritative store list per store-level source (from the checks' own mapping
+   *  reads). null = not known yet: missing cells are UNKNOWN, never N/A. */
+  coverage?: Partial<Record<StoreSource, MonitorCoverage | null>>
 }
 
 export type StoreSource = 'revel' | 'hme' | 'r365'
+
+export interface MonitorCoverage {
+  basis: 'mapping'
+  as_of: string | null
+  store_ids: number[]
+  stores: { id: number; name: string }[]
+}
 
 export interface MonitorFreshness {
   source: string
@@ -164,9 +172,15 @@ export interface MonitorFreshness {
   /** The monitor's latest successful check of this source. */
   last_check_at: string | null
   monitoring_state: OpState | null
-  latest_expected_date: string | null
-  latest_expected_label: string | null
-  latest_expected_counts: Partial<Record<ResultState, number>>
+  /** Date the source SHOULD have delivered by now (readiness schedule); null = no schedule. */
+  expected_date: string | null
+  expected_rule: string | null
+  /** Result states on expected_date; empty = not evaluated yet. */
+  expected_counts: Partial<Record<ResultState, number>>
+  /** Newest date the monitor evaluated -- NOT proof that ingestion succeeded. */
+  latest_evaluated_date: string | null
+  latest_evaluated_label: string | null
+  latest_evaluated_counts: Partial<Record<ResultState, number>>
   latest_checked_date: string | null
   latest_checked_label: string | null
   latest_checked_counts: Partial<Record<ResultState, number>>

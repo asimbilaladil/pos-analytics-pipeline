@@ -258,33 +258,59 @@ export function incidentMatches(i: MonitorIncident, f: Filters): boolean {
 }
 
 export interface VisibleGroup extends IncidentGroup {
-  /** Members that match the filters (the parent is kept for context when any store matches). */
+  /** Members that match EVERY filter. Counts, severity and status shown for a
+   *  filtered group come from these only. */
+  matched: MonitorIncident[]
+  /** The network-level parent, shown for context when it does not match itself.
+   *  Never counted as a match. */
+  context: MonitorIncident[]
+  /** context + matched, in display order. */
   visible: MonitorIncident[]
+  /** Status / severity of the matched members (equal to the group's when unfiltered). */
+  shownStatus: GroupStatus
+  shownSeverity: Severity
+  matchedStoreIds: number[]
 }
 
-/** Group first (so an issue is never split by a filter), then keep groups with a match. */
+/** Group first over the whole pool (so an issue is never split by a filter), then
+ *  keep groups with at least one matching member. */
 export function filterGroups(incidents: MonitorIncident[], f: Filters): VisibleGroup[] {
-  const pool = incidents.filter((i) => statusMatches(i, f.status))
-  return groupIncidents(pool).flatMap((g) => {
-    const hit = g.members.filter((m) => incidentMatches(m, f))
-    if (!hit.length) return []
-    const visible = g.parent && !hit.includes(g.parent) ? [g.parent, ...hit] : hit
-    return [{ ...g, visible }]
+  return groupIncidents(incidents).flatMap((g) => {
+    const matched = g.members.filter((m) => incidentMatches(m, f))
+    if (!matched.length) return []
+    const context = g.parent && !matched.includes(g.parent) ? [g.parent] : []
+    return [{
+      ...g, matched, context, visible: [...context, ...matched],
+      shownStatus: groupStatus(matched),
+      shownSeverity: matched.reduce<Severity>((s, m) => (SEV_RANK[m.severity] > SEV_RANK[s] ? m.severity : s), 'WARNING'),
+      matchedStoreIds: [...new Set(matched.map((m) => m.store_id).filter((x): x is number => x !== null))],
+    }]
   })
+}
+
+export function countVisible(groups: VisibleGroup[]) {
+  return {
+    issues: groups.length,
+    matched: groups.reduce((n, g) => n + g.matched.length, 0),
+    context: groups.reduce((n, g) => n + g.context.length, 0),
+  }
 }
 
 const GROUP_STATUS_RANK: Record<GroupStatus, number> = { NEW: 3, PARTLY_ACKNOWLEDGED: 2, ACKNOWLEDGED: 1, RESOLVED: 0 }
 
+const sev = (g: IncidentGroup) => ('shownSeverity' in g ? (g as VisibleGroup).shownSeverity : g.severity)
+const stat = (g: IncidentGroup) => ('shownStatus' in g ? (g as VisibleGroup).shownStatus : g.status)
+
 export function sortGroups<T extends IncidentGroup>(groups: T[], key: SortKey): T[] {
-  const unresolved = (g: IncidentGroup) => (g.status === 'RESOLVED' ? 0 : 1)
+  const unresolved = (g: IncidentGroup) => (stat(g) === 'RESOLVED' ? 0 : 1)
   const cmp: Record<SortKey, (a: T, b: T) => number> = {
     // Unresolved CRITICAL/HIGH first, then new before acknowledged, then most recent change.
-    priority: (a, b) => unresolved(b) - unresolved(a) || SEV_RANK[b.severity] - SEV_RANK[a.severity] ||
-      GROUP_STATUS_RANK[b.status] - GROUP_STATUS_RANK[a.status] || b.last_changed_at.localeCompare(a.last_changed_at),
+    priority: (a, b) => unresolved(b) - unresolved(a) || SEV_RANK[sev(b)] - SEV_RANK[sev(a)] ||
+      GROUP_STATUS_RANK[stat(b)] - GROUP_STATUS_RANK[stat(a)] || b.last_changed_at.localeCompare(a.last_changed_at),
     newest: (a, b) => b.first_detected_at.localeCompare(a.first_detected_at),
     oldest: (a, b) => a.first_detected_at.localeCompare(b.first_detected_at),
     business_date: (a, b) => (b.business_date || '').localeCompare(a.business_date || '') ||
-      SEV_RANK[b.severity] - SEV_RANK[a.severity],
+      SEV_RANK[sev(b)] - SEV_RANK[sev(a)],
   }
   return [...groups].sort(cmp[key])
 }
@@ -296,7 +322,7 @@ export function bySection<T extends IncidentGroup>(groups: T[], byPriority = fal
   const out = SECTIONS.map((s) => [s, groups.filter((g) => g.section === s)] as [Section, T[]])
     .filter(([, gs]) => gs.length > 0)
   if (!byPriority) return out
-  const urgency = (gs: T[]) => Math.max(...gs.map((g) => (g.status === 'RESOLVED' ? 0 : SEV_RANK[g.severity])))
+  const urgency = (gs: T[]) => Math.max(...gs.map((g) => (stat(g) === 'RESOLVED' ? 0 : SEV_RANK[sev(g)])))
   return out.map((x, idx) => ({ x, idx })).sort((a, b) => urgency(b.x[1]) - urgency(a.x[1]) || a.idx - b.idx).map(({ x }) => x)
 }
 
@@ -363,9 +389,10 @@ export function cellView(ov: MonitorOverview, storeId: number, src: StoreSource)
   const base = { date: c?.business_date ?? null, title: c?.title ?? null,
     openIncidents: open.length, difference: c?.difference ?? null }
   if (worstOpen) return { ...base, state: worstOpen === 'WARNING' ? 'DEGRADED' : 'FAILED' }
+  // N/A only when the source's AUTHORITATIVE store list is known and excludes the
+  // store. An unknown list, or a covered store with no evidence, is UNKNOWN/STALE.
   const cov = ov.coverage?.[src]
-  const covered = cov ? cov.includes(storeId) : !!c?.state
-  if (!covered) return { ...base, state: 'NOT_APPLICABLE' }
+  if (cov && !cov.store_ids.includes(storeId)) return { ...base, state: 'NOT_APPLICABLE' }
   const srcRow = ov.sources.find((s) => s.source === src)
   if (srcRow && (srcRow.monitoring_state === 'STALE' || srcRow.monitoring_state === 'UNKNOWN')) {
     return { ...base, state: srcRow.monitoring_state }

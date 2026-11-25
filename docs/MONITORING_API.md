@@ -62,9 +62,12 @@ dashboard shows the message; it never renders an empty all-clear.
   // Presentation helpers derived from the latest results (no extra queries):
   "freshness": [{"source": "hme", "label": "HME drive-thru",
                  "last_sync_at": "...", "last_check_at": "...", "monitoring_state": "HEALTHY",
-                 "latest_expected_date": "2026-11-24",           // newest date/period evaluated
-                 "latest_expected_label": null,                   // e.g. "FY2026 P12" for R365 financials
-                 "latest_expected_counts": {"PENDING": 12},
+                 "expected_date": "2026-11-23",                   // due by now per the readiness schedule
+                 "expected_rule": "each day is due 06:30 Chicago the next day",   // null/None: no schedule (R365 financials)
+                 "expected_counts": {"OK": 2, "FAIL": 9},         // results ON expected_date; {} = not evaluated yet
+                 "latest_evaluated_date": "2026-11-24",           // newest date the monitor evaluated (NOT proof of ingestion)
+                 "latest_evaluated_label": null,                  // e.g. "FY2026 P12" for R365 financials
+                 "latest_evaluated_counts": {"PENDING": 12},
                  "latest_checked_date": "2026-11-23",             // newest with nothing PENDING
                  "latest_checked_label": null,
                  "latest_checked_counts": {"OK": 2, "FAIL": 9},
@@ -72,7 +75,12 @@ dashboard shows the message; it never renders an empty all-clear.
                  "latest_verified_label": null,
                  "retry_pending": false,                          // a PENDING "settling" result awaits the retry
                  "pending": ["Awaiting HME morning ingestion"]}],
-  "coverage": {"revel": [6, 7, ...], "hme": [...], "r365": [...]}   // store_ids each source evaluated; absent = N/A
+  // Authoritative store list per source, as the source's own check last read it
+  // (Revel: active establishments; HME, R365: active VERIFIED mappings), stored in
+  // the monitor's source_status. null = not known yet (cells then show UNKNOWN, never N/A).
+  "coverage": {"hme": {"basis": "mapping", "as_of": "...", "store_ids": [6, 7, ...],
+                       "stores": [{"id": 6, "name": "LCF Katy"}, ...]},
+               "revel": {...}, "r365": null}
 }
 ```
 
