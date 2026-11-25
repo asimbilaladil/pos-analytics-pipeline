@@ -51,6 +51,8 @@ export const CATEGORY_LABEL: Record<string, string> = {
   source_stale: 'Sync is stale',
   stale_data: 'Data not refreshed',
   stale_after_close: 'Period not refreshed after close',
+  refresh_overdue: 'Closed period not refreshed recently',
+  not_refreshed_after_repair_window: 'Closed period may be missing late postings',
   latest_refresh_failed: 'Latest refresh failed',
   incomplete: 'Week incomplete',
   coverage_gap: 'Missing store-days',
@@ -101,6 +103,10 @@ const SUMMARY: Record<string, string> = {
     'Sales and payments for this store-day differ by more than the allowed tolerance, and the monitor found no recorded explanation.',
   stale_after_close:
     'The financial period has closed, but R365 data was last loaded before the close, so late postings may be missing.',
+  refresh_overdue:
+    'The financial period has closed but the source still accepts corrections for several weeks; it has not been re-loaded recently, so recent postings may be missing.',
+  not_refreshed_after_repair_window:
+    "The source's correction window for this closed period has ended, but the period was last loaded before that, so late postings and approvals may be missing.",
   job_failed: "A scheduled job's most recent run ended with an error.",
   source_stale: 'The source has not synced within its expected window.',
   no_data: 'No data was found for this store-day.',
@@ -117,6 +123,7 @@ const CAUSE: Record<string, string> = {
   open_unpaid_tickets: 'Open or unpaid tickets account for the gap (recorded ticket evidence).',
   no_access: 'HME reported NO_ACCESS for this store in the ingestion run.',
   stale_after_close: 'The last R365 load happened before the period close date.',
+  not_refreshed_after_repair_window: "The last R365 load happened before the source's correction window ended.",
 }
 export const likelyCause = (i: MonitorIncident): string | null => (i.category && CAUSE[i.category]) || null
 

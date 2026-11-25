@@ -39,7 +39,51 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import r365_load as R  # noqa: E402  (shared: connect, load_mapping, secrets guard)
 import psycopg2.extras  # noqa: E402
 
-LOADER_VERSION = "r365_financial_load/1.0.0"
+LOADER_VERSION = "r365_financial_load/1.1.0"
+
+# Deletion safety (rows the source no longer reports for a period's scope):
+#  * deletions happen only when the source reports the period COMPLETE (and the
+#    summary-vs-detail reconciliation already passed, or we would not be writing);
+#    a PARTIAL response is applied upsert-only and the deletions are DEFERRED;
+#  * even then a refresh that would
+#      - EMPTY a table's non-empty scope (every row gone, none returned), or
+#      - delete NEAR-TOTALLY (> DELETION_NEAR_TOTAL of a scope of 2+ rows), or
+#      - delete more than max(DELETION_MIN_ROWS, DELETION_MAX_FRACTION of the scope)
+#    fails the target and the whole period rolls back -- a truncated or re-scoped
+#    but self-consistent response can never wipe a period, whatever the table size;
+#  * an operator who has verified an intentional mass removal re-runs ONE period with
+#    `--period FY P --allow-mass-delete`; the override is recorded in the run and still
+#    requires a COMPLETE source.
+DELETION_MAX_FRACTION = float(os.environ.get("R365_FIN_DELETION_MAX_FRACTION", "0.25"))
+DELETION_MIN_ROWS = int(os.environ.get("R365_FIN_DELETION_MIN_ROWS", "5"))
+DELETION_NEAR_TOTAL = float(os.environ.get("R365_FIN_DELETION_NEAR_TOTAL", "0.8"))
+
+
+def deletion_decision(table, scope_rows, gone, policy, new_rows=None):
+    """PURE. -> ("delete" | "defer"), or raises ReconciliationError when the
+    deletion would exceed a safety bound. `new_rows` = rows the source returned for
+    this table's scope (None = unknown, treated as possibly empty)."""
+    if not gone:
+        return "delete"
+    if policy is not None and not policy.get("allow", True):
+        return "defer"
+    if policy is not None and policy.get("override"):
+        return "delete"                 # explicit, recorded, COMPLETE-source-only override
+    bound = max(DELETION_MIN_ROWS, int(DELETION_MAX_FRACTION * scope_rows))
+    why = None
+    if gone >= scope_rows and not new_rows:
+        why = "would EMPTY the table's scope for this period"
+    elif scope_rows >= 2 and gone / scope_rows > DELETION_NEAR_TOTAL:
+        why = f"near-total deletion (> {DELETION_NEAR_TOTAL:.0%})"
+    elif gone > bound:
+        why = f"exceeds the bound of {bound} rows"
+    if why:
+        raise ReconciliationError(
+            f"{table}: refusing to delete {gone} of {scope_rows} rows in one refresh ({why}); "
+            "the source response may be truncated or re-scoped -- investigate, and only if the "
+            "removal is intentional re-run this period with --allow-mass-delete")
+    return "delete"
+
 STATUS_COMPLETE, STATUS_PARTIAL, STATUS_FAILED = "COMPLETE", "PARTIAL", "FAILED"
 ROW_ACTIVITY, ROW_NO_ACTIVITY = "ACTIVITY", "NO_ACTIVITY"
 UNMAPPED_BUCKET = "UNMAPPED"
@@ -591,7 +635,7 @@ def fail_run(conn, run_id, code, message, fetch=None):
 
 
 def _replace(cur, table, pk_cols, value_cols, rows, run_id, scope_sql, scope_params,
-             stamp=None):
+             stamp=None, deletion=None):
     """Make `table` hold exactly `rows` within one scope. Returns
     (upserted, changed, deleted). Rows the source no longer reports for the
     scope (a re-classified or reversed posting) are deleted, so a refresh is a
@@ -604,6 +648,9 @@ def _replace(cur, table, pk_cols, value_cols, rows, run_id, scope_sql, scope_par
     before = {tuple(r[:len(pk_cols)]): tuple(r[len(pk_cols):]) for r in cur.fetchall()}
     new_keys = {tuple(r[c] for c in pk_cols) for r in rows}
     gone = [k for k in before if k not in new_keys]
+    if deletion_decision(table, len(before), len(gone), deletion, new_rows=len(rows)) == "defer":
+        deletion.setdefault("deferred", {})[table] = len(gone)
+        gone = []
     for k in gone:
         cur.execute(f"DELETE FROM {table} WHERE ({', '.join(pk_cols)}) = %s", (k,))
     changed = sum(1 for r in rows
@@ -650,11 +697,11 @@ _TXN_VALS = ["source_transaction_id", "transaction_number", "transaction_type",
              "source_class"]
 
 
-def _write_transactions(cur, run_id, plan, fetch, scope_sql, scope_params):
+def _write_transactions(cur, run_id, plan, fetch, scope_sql, scope_params, deletion=None):
     fetched_at = fetch.get("fetched_at") or datetime.datetime.now(datetime.timezone.utc)
     return _replace(cur, "r365_financial_transaction", _TXN_PK, _TXN_VALS,
                     plan["transaction_rows"], run_id, scope_sql, scope_params,
-                    stamp={"source_fetched_at": fetched_at})
+                    stamp={"source_fetched_at": fetched_at}, deletion=deletion)
 
 
 def _finish(cur, run_id, status, **f):
@@ -694,25 +741,35 @@ def _fetch_cols(fetch):
             "raw_archive_path": fetch.get("raw_archive_path")}
 
 
-def write_period(conn, run_id, plan, fetch):
+def write_period(conn, run_id, plan, fetch, allow_mass_delete=False):
     """Replace one fiscal period's rows in all three period tables. Caller commits."""
     fy, pn = plan["fiscal_year"], plan["period_number"]
     sync_at = plan["source_last_sync_at"]
     for r in plan["expense_rows"]:
         r["source_updated_at"] = sync_at
+    # Deletions only on a COMPLETE source response; otherwise upsert-only (deferred).
+    deletion = {"allow": plan["status"] == STATUS_COMPLETE,
+                "override": bool(allow_mass_delete) and plan["status"] == STATUS_COMPLETE}
     with conn.cursor() as cur:
         e = _replace(cur, "r365_financial_period_expense", _EXPENSE_PK, _EXPENSE_VALS,
                      plan["expense_rows"], run_id,
-                     "fiscal_year = %s AND period_number = %s", (fy, pn))
+                     "fiscal_year = %s AND period_number = %s", (fy, pn), deletion=deletion)
         c = _replace(cur, "r365_financial_candidate_expense", _CAND_PK, _CAND_VALS,
                      plan["candidate_rows"], run_id,
-                     "fiscal_year = %s AND period_number = %s", (fy, pn))
+                     "fiscal_year = %s AND period_number = %s", (fy, pn), deletion=deletion)
         a = _replace(cur, "r365_financial_account_period", _ACCT_PERIOD_PK, _ACCT_PERIOD_VALS,
                      plan["account_period_rows"], run_id,
                      "bucket_kind = 'FISCAL_PERIOD' AND fiscal_year = %s AND period_number = %s",
-                     (fy, pn))
+                     (fy, pn), deletion=deletion)
         t = _write_transactions(cur, run_id, plan, fetch,
-                                "fiscal_year = %s AND period_number = %s", (fy, pn))
+                                "fiscal_year = %s AND period_number = %s", (fy, pn),
+                                deletion=deletion)
+        plan["reconciliation"] = dict(plan["reconciliation"], deletion_policy={
+            "deletions_allowed": deletion["allow"], "source_status": plan["status"],
+            "mass_delete_override": deletion["override"],
+            "deferred_deletions": deletion.get("deferred", {}),
+            "bound": {"max_fraction": DELETION_MAX_FRACTION, "min_rows": DELETION_MIN_ROWS,
+                      "near_total": DELETION_NEAR_TOTAL, "never_empty_a_scope": True}})
         _finish(cur, run_id, plan["status"],
                 rows_received=plan["rows_received"], rows_upserted=e[0] + c[0],
                 rows_changed=e[1] + c[1], rows_deleted=e[2] + c[2] + a[2],
