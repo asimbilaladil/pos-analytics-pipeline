@@ -68,6 +68,7 @@ def weekly(ctx) -> list[CheckResult]:
     weeks = {r["week_start"]: r for r in rows(pg, _WEEKS_SQL, {"starts": starts})}
     out: list[CheckResult] = []
     newest_loaded = None
+    covered: dict[int, str] | None = None   # VERIFIED active r365_store_mapping, when read
     for ws in starts:
         we = ws + timedelta(days=6)
         q = f"{ws.isoformat()}..{we.isoformat()}"
@@ -103,6 +104,8 @@ def weekly(ctx) -> list[CheckResult]:
         else:
             out.append(CheckResult(state=OK, title="R365 week complete", evidence=ev, **base))
         for s in rows(pg, _STORE_DAYS_SQL, {"ws": ws}):
+            covered = covered if covered is not None else {}
+            covered[s["establishment_id"]] = s["store_name"]
             sb = dict(source=SRC_R365, check=CHECK_STORE_WEEK, store_id=s["establishment_id"],
                       store_name=s["store_name"], qualifier=q, business_date=we.isoformat(),
                       expected="7 days")
@@ -118,9 +121,11 @@ def weekly(ctx) -> list[CheckResult]:
                     actual=f"{s['days_present']} of 7 days", evidence={"week_start": ws.isoformat()},
                     actions=_actions("incomplete"), **sb))
     last = rows(pg, _LAST_RUN_SQL)
-    ctx.source_status(SRC_R365, newest_loaded,
-                      {"last_run": {k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                                    for k, v in (last[0] if last else {}).items()}})
+    detail = {"last_run": {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                           for k, v in (last[0] if last else {}).items()}}
+    if covered is not None:     # omitted (coverage unknown) when no expected week was loaded
+        detail["covered_stores"] = [{"id": k, "name": v} for k, v in sorted(covered.items())]
+    ctx.source_status(SRC_R365, newest_loaded, detail)
     return out
 
 

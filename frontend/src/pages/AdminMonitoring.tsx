@@ -1,331 +1,303 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Activity, AlertCircle, ArrowLeft, CheckCircle2, Clock, RefreshCw } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Activity, AlertCircle, ArrowLeft, Loader2, RefreshCw, Search, X } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import type {
-  MonitorIncident, MonitorIncidentDetail, MonitorNotification, MonitorOverview, MonitorStoreCell,
+  MonitorIncident, MonitorIncidentDetail, MonitorNotification, MonitorOverview, Severity,
 } from '../types/monitoring'
+import {
+  bySection, countVisible, EMPTY_FILTERS, filterGroups, groupIncidents, SECTION_LABEL, SECTIONS, shortDate, sortGroups,
+  type Filters, type IncidentGroup, type Section, type SortKey, type StatusFilter, type VisibleGroup,
+} from '../lib/monitoringView'
+import {
+  Badge, GroupDetail, GroupRow, IncidentDetailView, SourceFreshness, StoreMatrix, SummaryStrip, when,
+} from '../components/monitoring/parts'
 
 /**
  * Super-admin data-quality monitoring. Everything shown comes from the data
  * monitor's own incident store; the server enforces super_admin on every call
- * (401/403 otherwise) and this page only decides what to draw.
+ * (401/403 otherwise) and this page only decides what to draw. Grouping,
+ * filtering and the store matrix are presentation only -- no incident record is
+ * merged, hidden from its group, or changed (acknowledging is the one write, and
+ * it never changes a verdict).
  */
-const SEV_STYLE: Record<string, string> = {
-  CRITICAL: 'bg-red-600 text-white',
-  HIGH: 'bg-red-100 text-red-800',
-  WARNING: 'bg-amber-100 text-amber-900',
-  OK: 'bg-emerald-100 text-emerald-800',
-  PENDING: 'bg-slate-100 text-slate-600',
-  ACCEPTED: 'bg-slate-100 text-slate-500',
-  FAIL: 'bg-red-100 text-red-800',
-  // operational states
-  HEALTHY: 'bg-emerald-100 text-emerald-800',
-  DEGRADED: 'bg-amber-100 text-amber-900',
-  FAILED: 'bg-red-100 text-red-800',
-  UNKNOWN: 'bg-slate-200 text-slate-700',
-  STALE: 'bg-orange-100 text-orange-900',
-  // run / delivery statuses
-  SUCCESS: 'bg-emerald-100 text-emerald-800',
-  RUNNING: 'bg-slate-100 text-slate-600',
-  QUEUED: 'bg-slate-100 text-slate-600',
-  RETRYING: 'bg-amber-100 text-amber-900',
-  SENT: 'bg-emerald-100 text-emerald-800',
-  DRY_RUN: 'bg-slate-100 text-slate-600',
-}
+type Tab = 'incidents' | 'notifications'
+type Selection = { kind: 'group'; key: string } | { kind: 'incident'; id: string; fromGroup?: string } | null
 
-function Badge({ v }: { v: string }) {
-  return (
-    <span className={`inline-block rounded px-1.5 py-0.5 text-[11px] font-semibold ${SEV_STYLE[v] || 'bg-slate-100'}`}>
-      {v}
-    </span>
-  )
-}
-
-const when = (s: string | null | undefined) => (s ? new Date(s).toLocaleString() : '—')
-const ago = (s: string | null | undefined) => {
-  if (!s) return '—'
-  const m = Math.round((Date.now() - new Date(s).getTime()) / 60000)
-  if (m < 60) return `${m} min ago`
-  if (m < 48 * 60) return `${Math.round(m / 60)} h ago`
-  return `${Math.round(m / 1440)} d ago`
-}
-const show = (v: unknown) => (v === null || v === undefined ? '—' : typeof v === 'string' ? v : JSON.stringify(v))
-
-type Tab = 'open' | 'history' | 'notifications'
+const selectCls = 'h-8 rounded-lg border border-line bg-white px-2 text-[12.5px] text-ink-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-300'
 
 export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; onSignedOut: () => void }) {
   const [ov, setOv] = useState<MonitorOverview | null>(null)
-  const [tab, setTab] = useState<Tab>('open')
-  const [history, setHistory] = useState<MonitorIncident[]>([])
-  const [notes, setNotes] = useState<MonitorNotification[]>([])
+  const [loadedAt, setLoadedAt] = useState<string | null>(null)
+  const [resolved, setResolved] = useState<MonitorIncident[] | null>(null)
+  const [notes, setNotes] = useState<MonitorNotification[] | null>(null)
+  const [tab, setTab] = useState<Tab>('incidents')
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
+  const [sort, setSort] = useState<SortKey>('priority')
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [sel, setSel] = useState<Selection>(null)
   const [detail, setDetail] = useState<MonitorIncidentDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [ackNote, setAckNote] = useState('')
+  const [acking, setAcking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const incidentsRef = useRef<HTMLElement>(null)
 
   const handleError = useCallback((err: unknown) => {
     if (err instanceof ApiError && err.status === 401) { onSignedOut(); return }
-    setError(err instanceof ApiError ? err.message : 'Something went wrong.')
+    if (err instanceof ApiError && err.status === 403) {
+      setError('Your account does not have access to data monitoring.'); return
+    }
+    setError(err instanceof ApiError ? err.message : 'Could not reach the server.')
   }, [onSignedOut])
 
+  const needResolved = filters.status === 'resolved' || filters.status === 'all'
+
   const load = useCallback(async () => {
-    setLoading(true); setError(null)
+    setLoading(true)
     try {
-      setOv(await api.monitorOverview())
-      if (tab === 'history') setHistory(await api.monitorIncidents())
+      const o = await api.monitorOverview()
+      setOv(o); setLoadedAt(new Date().toISOString()); setError(null)
+      if (needResolved) setResolved(await api.monitorIncidents('RESOLVED'))
       if (tab === 'notifications') setNotes(await api.monitorNotifications())
     } catch (e) { handleError(e) } finally { setLoading(false) }
-  }, [tab, handleError])
+  }, [needResolved, tab, handleError])
 
   useEffect(() => { load() }, [load])
-  useEffect(() => {                 // refresh every 60 s while open
+  useEffect(() => {                 // one overview read per minute while the page is open
     const t = setInterval(load, 60_000)
     return () => clearInterval(t)
   }, [load])
 
-  const openIncident = async (id: string) => {
-    try { setDetail(await api.monitorIncident(id)); setAckNote('') } catch (e) { handleError(e) }
+  // ── derived ──────────────────────────────────────────────────────────────
+  const pool = useMemo<MonitorIncident[]>(() => {
+    const open = ov?.open_incidents ?? []
+    return needResolved ? [...open, ...(resolved ?? [])] : open
+  }, [ov, resolved, needResolved])
+  const openGroups = useMemo<IncidentGroup[]>(() => groupIncidents(ov?.open_incidents ?? []), [ov])
+  const groups = useMemo<VisibleGroup[]>(() => sortGroups(filterGroups(pool, filters), sort), [pool, filters, sort])
+  const sections = useMemo(() => bySection(groups, sort === 'priority'), [groups, sort])
+  const vis = countVisible(groups)
+  const dates = useMemo(() => [...new Set(pool.map((i) => i.business_date).filter(Boolean) as string[])].sort().reverse(), [pool])
+  const stores = useMemo(() => [...(ov?.stores ?? [])].sort((a, b) => (a.store_name || '').localeCompare(b.store_name || '')), [ov])
+  const filtered = JSON.stringify({ ...filters, status: 'unresolved' }) !== JSON.stringify(EMPTY_FILTERS) || filters.status !== 'unresolved'
+
+  const selGroup = sel?.kind === 'group' ? groups.find((g) => g.key === sel.key) ?? openGroups.find((g) => g.key === sel.key) ?? null : null
+
+  // ── actions ──────────────────────────────────────────────────────────────
+  const set = <K extends keyof Filters>(k: K, v: Filters[K]) => setFilters((f) => ({ ...f, [k]: v }))
+  const openIncident = useCallback(async (id: string, fromGroup?: string) => {
+    setSel({ kind: 'incident', id, fromGroup }); setAckNote(''); setDetailLoading(true)
+    try { setDetail(await api.monitorIncident(id)) } catch (e) { handleError(e); setDetail(null) } finally { setDetailLoading(false) }
+  }, [handleError])
+  const onOpen = (t: { group: VisibleGroup } | { incident: MonitorIncident }) => {
+    if ('group' in t) { setSel({ kind: 'group', key: t.group.key }); setDetail(null); return }
+    const parent = groups.find((g) => g.members.length > 1 && g.members.some((m) => m.id === t.incident.id))
+    openIncident(t.incident.id, parent?.key)
   }
+  const toggle = (key: string) => setExpanded((s) => { const n = new Set(s); if (n.has(key)) n.delete(key); else n.add(key); return n })
   const acknowledge = async () => {
     if (!detail) return
+    setAcking(true)
     try {
-      await api.monitorAck(detail.incident.id, ackNote)
-      await openIncident(detail.incident.id)
+      await api.monitorAck(detail.incident.id, ackNote || undefined)
+      await openIncident(detail.incident.id, sel?.kind === 'incident' ? sel.fromGroup : undefined)
       await load()
-    } catch (e) { handleError(e) }
+    } catch (e) { handleError(e) } finally { setAcking(false) }
   }
+  const pickStore = (id: number | null) => {
+    set('storeId', id); setTab('incidents')
+    if (id !== null) incidentsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+  const closeDetail = () => { setSel(null); setDetail(null) }
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && sel) closeDetail() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [sel])
+  useEffect(() => {
+    if (tab === 'notifications' && notes === null) api.monitorNotifications().then(setNotes).catch(handleError)
+  }, [tab, notes, handleError])
 
-  const cell = (c?: MonitorStoreCell) => {
-    if (!c || (!c.state && !c.open_incidents)) return <span className="text-ink-300">—</span>
+  // ── render ───────────────────────────────────────────────────────────────
+  const header = (
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-line bg-white px-3 sm:h-16 sm:gap-3 sm:px-6">
+      <button type="button" onClick={onBack}
+        className="flex h-9 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-ink-700 transition-colors hover:bg-app">
+        <ArrowLeft size={15} /> <span className="hidden sm:inline">Back to chat</span>
+      </button>
+      <span className="h-6 w-px bg-line" aria-hidden />
+      <h1 className="flex items-center gap-2 text-[15px] font-semibold text-ink-900">
+        <Activity size={16} className="text-brand-500" /> Data monitoring
+      </h1>
+      <span className="ml-auto hidden text-[11px] text-ink-400 md:inline">{loadedAt ? `Updated ${when(loadedAt)}` : ''}</span>
+      <button type="button" onClick={load} disabled={loading} aria-label="Refresh"
+        className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-ink-600 hover:bg-app max-md:ml-auto">
+        <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> <span className="hidden sm:inline">Refresh</span>
+      </button>
+    </header>
+  )
+
+  if (!ov) {
     return (
-      <div className="space-y-0.5">
-        <div className="flex items-center gap-1.5">
-          {c.state && <Badge v={c.state === 'FAIL' && c.severity ? c.severity : c.state} />}
-          {c.business_date && <span className="text-[11px] text-ink-400">{c.business_date}</span>}
+      <div className="flex h-[100dvh] flex-col bg-app">
+        {header}
+        <div className="flex flex-1 items-center justify-center p-6">
+          {error ? (
+            <div role="alert" className="max-w-md rounded-xl border border-amber-200 bg-amber-50 p-5 text-center text-[13px] text-amber-900" data-testid="load-error">
+              <AlertCircle className="mx-auto mb-2" size={20} />
+              <p className="font-medium">Monitoring data could not be loaded.</p>
+              <p className="mt-1">{error}</p>
+              <p className="mt-1 text-[12px] text-amber-800">This is not an all-clear: the status of the data is unknown.</p>
+              <button type="button" onClick={load} className="mt-3 rounded-lg bg-white px-3 py-1.5 font-medium ring-1 ring-amber-300 hover:bg-amber-100">Try again</button>
+            </div>
+          ) : (
+            <p className="flex items-center gap-2 text-[13px] text-ink-500" data-testid="loading"><Loader2 size={15} className="animate-spin" /> Loading monitoring status…</p>
+          )}
         </div>
-        {c.difference && <div className="text-[11px] text-ink-600">{c.difference}</div>}
-        {!!c.open_incidents && (
-          <div className="text-[11px] text-red-700">{c.open_incidents} open ({c.worst_open})</div>
-        )}
       </div>
     )
   }
 
-  const incidentRow = (i: MonitorIncident) => (
-    <button key={i.id} onClick={() => openIncident(i.id)}
-      className={`grid w-full grid-cols-[86px_minmax(0,1fr)] gap-2 border-b border-line px-4 py-2.5 text-left
-                  transition-colors hover:bg-app ${detail?.incident.id === i.id ? 'bg-brand-50' : ''}`}>
-      <div className="space-y-1"><Badge v={i.severity} />
-        {i.status !== 'OPEN' && <div className="text-[10px] text-ink-400">{i.status}</div>}</div>
-      <div className="min-w-0">
-        <p className="truncate text-[13px] font-medium text-ink-900">{i.title}</p>
-        <p className="truncate text-[12px] text-ink-500">
-          {i.store_name || i.qualifier || 'network'} · {i.source}{i.business_date ? ` · ${i.business_date}` : ''}
-          {i.difference ? ` · ${i.difference}` : ''}
-        </p>
-        <p className="text-[11px] text-ink-400">first seen {ago(i.first_detected_at)} · checked {ago(i.last_checked_at)}</p>
-      </div>
-    </button>
-  )
-
+  const detailOpen = sel !== null
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-canvas-50">
-      <header className="flex h-16 shrink-0 items-center gap-3 border-b border-line bg-white px-4 sm:px-6">
-        <button onClick={onBack}
-          className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] font-medium text-ink-700 transition-colors hover:bg-app">
-          <ArrowLeft size={15} /> Back to chat
-        </button>
-        <span className="h-6 w-px bg-line" aria-hidden />
-        <h1 className="flex items-center gap-2 text-[15px] font-semibold text-ink-900">
-          <Activity size={16} className="text-brand-500" /> Data monitoring
-        </h1>
-        <button onClick={load} disabled={loading}
-          className="ml-auto flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-ink-600 hover:bg-app">
-          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
-        </button>
-      </header>
-
+    <div className="flex h-[100dvh] flex-col overflow-hidden bg-app">
+      {header}
       {error && (
-        <div role="alert" className="mx-4 mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-[13px] text-amber-900">
-          <AlertCircle size={15} className="mt-px shrink-0" /><span className="flex-1">{error}</span>
+        <div role="alert" data-testid="refresh-error" className="mx-3 mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-[13px] text-amber-900 sm:mx-6">
+          <AlertCircle size={15} className="mt-px shrink-0" />
+          <span className="flex-1">{error} Showing data last loaded {when(loadedAt)} — it may be out of date.</span>
+          <button type="button" onClick={() => setError(null)} aria-label="Dismiss"><X size={14} /></button>
         </div>
       )}
+      <main className="min-h-0 flex-1 overflow-y-auto scroll-thin">
+        <div className="mx-auto w-full max-w-[1440px] space-y-4 px-3 py-4 sm:px-6">
+          <SummaryStrip ov={ov} groups={openGroups} />
+          <SourceFreshness ov={ov} />
+          <StoreMatrix ov={ov} selected={filters.storeId} onSelect={pickStore} />
 
-      <div className="min-h-0 flex-1 overflow-y-auto scroll-thin">
-        <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-5 sm:px-6">
-          {/* Sources + monitor heartbeat */}
-          <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {ov?.sources.map((s) => (
-              <div key={s.source} className="rounded-xl border border-line bg-white p-3.5">
-                <div className="flex items-center justify-between">
-                  <p className="text-[13px] font-semibold text-ink-900">{s.label}</p>
-                  <Badge v={s.state} />
-                </div>
-                <p className="mt-1 text-[11px] text-ink-500">
-                  data <b>{s.data_state}</b> · monitoring <b>{s.monitoring_state}</b>
-                </p>
-                <p className="mt-0.5 text-[12px] text-ink-500">
-                  ok {s.counts.OK ?? 0} · pending {s.counts.PENDING ?? 0} · failing {s.counts.FAIL ?? 0}
-                  {s.open_incidents ? ` · ${s.open_incidents} open` : ''}
-                </p>
-                <p className="mt-0.5 flex items-center gap-1 text-[11px] text-ink-400">
-                  <Clock size={11} /> source synced {s.last_success_at ? `${when(s.last_success_at)} (${ago(s.last_success_at)})` : '—'}
-                </p>
-                <p className="mt-0.5 text-[11px] text-ink-400">
-                  checked OK {ago(s.last_successful_check_at)} · last attempt {ago(s.last_attempted_check_at)}
-                </p>
-              </div>
-            ))}
-            <div className="rounded-xl border border-line bg-white p-3.5">
-              <div className="flex items-center justify-between">
-                <p className="text-[13px] font-semibold text-ink-900">Monitor itself</p>
-                {ov && <Badge v={ov.monitor.state} />}
-              </div>
-              {ov && Object.entries(ov.monitor.tiers).map(([tier, t]) => (
-                <p key={tier} className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-600">
-                  {t.state === 'HEALTHY' ? <CheckCircle2 size={12} className="text-emerald-600" />
-                    : <AlertCircle size={12} className="text-red-600" />}
-                  {tier}: <Badge v={t.state} />{' '}
-                  success {ago(t.last_success_at)}
-                  {t.last_attempt_status && t.last_attempt_status !== 'SUCCESS'
-                    ? ` · last attempt ${t.last_attempt_status}${t.last_attempt_error ? ` — ${t.last_attempt_error}` : ''}` : ''}
-                </p>
-              ))}
-              {ov && (
-                <p className="mt-1.5 text-[12px] text-ink-600">
-                  alerts: <Badge v={ov.monitor.notifications.state} />{' '}
-                  {ov.monitor.notifications.FAILED} failed · {ov.monitor.notifications.RETRYING} retrying
-                  {' '}· {ov.monitor.notifications.QUEUED} queued
-                </p>
-              )}
-            </div>
-          </section>
-
-          {/* Per-store status */}
-          <section className="overflow-x-auto rounded-xl border border-line bg-white">
-            <h2 className="px-4 pb-2 pt-3.5 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Per-store status (latest checked business day)</h2>
-            <table className="w-full min-w-[640px] text-left text-[13px]">
-              <thead><tr className="border-y border-line text-[11px] uppercase text-ink-400">
-                <th className="px-4 py-2">Store</th><th className="px-4 py-2">Revel POS</th>
-                <th className="px-4 py-2">HME</th><th className="px-4 py-2">R365</th></tr></thead>
-              <tbody>
-                {ov?.stores.map((s) => (
-                  <tr key={s.store_id} className="border-b border-line align-top">
-                    <td className="px-4 py-2 font-medium text-ink-900">{s.store_name || `#${s.store_id}`}</td>
-                    <td className="px-4 py-2">{cell(s.sources.revel)}</td>
-                    <td className="px-4 py-2">{cell(s.sources.hme)}</td>
-                    <td className="px-4 py-2">{cell(s.sources.r365)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </section>
-
-          {/* Reconciliation differences */}
-          {!!ov?.reconciliation_differences.length && (
-            <section className="rounded-xl border border-line bg-white">
-              <h2 className="px-4 pb-2 pt-3.5 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Unresolved reconciliation differences</h2>
-              {ov.reconciliation_differences.map((r) => (
-                <button key={r.id} onClick={() => openIncident(r.id)}
-                  className="flex w-full items-center gap-3 border-t border-line px-4 py-2 text-left text-[13px] hover:bg-app">
-                  <Badge v={r.severity} />
-                  <span className="w-40 truncate font-medium">{r.store_name || 'network'}</span>
-                  <span className="w-24 text-ink-500">{r.business_date}</span>
-                  <span className="flex-1 truncate">{r.difference}</span>
-                  <span className="hidden text-[12px] text-ink-400 sm:inline">{r.category}</span>
-                </button>
-              ))}
-            </section>
-          )}
-
-          {/* Incidents + detail */}
-          <section className="grid min-h-[420px] grid-cols-1 overflow-hidden rounded-xl border border-line bg-white lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
-            <div className="min-h-0 border-r border-line">
-              <div className="flex gap-1 border-b border-line px-3 py-2">
-                {(['open', 'history', 'notifications'] as Tab[]).map((t) => (
-                  <button key={t} onClick={() => setTab(t)}
-                    className={`rounded-lg px-2.5 py-1 text-[12px] font-medium ${tab === t ? 'bg-brand-50 text-brand-700' : 'text-ink-500 hover:bg-app'}`}>
-                    {t === 'open' ? `Unresolved (${ov?.open_incidents.length ?? 0})` : t === 'history' ? 'History' : 'Notifications'}
+          <section ref={incidentsRef} aria-label="Incidents"
+            className="grid scroll-mt-4 grid-cols-1 overflow-hidden rounded-xl border border-line bg-white shadow-card lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]">
+            {/* list */}
+            <div className={`min-w-0 lg:border-r lg:border-line ${detailOpen ? 'max-lg:hidden' : ''}`}>
+              <div className="flex items-center gap-1 border-b border-line px-3 py-2" role="tablist">
+                {(['incidents', 'notifications'] as Tab[]).map((t) => (
+                  <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)}
+                    className={`rounded-lg px-2.5 py-1 text-[12.5px] font-medium ${tab === t ? 'bg-brand-50 text-brand-700' : 'text-ink-500 hover:bg-app'}`}>
+                    {t === 'incidents' ? 'Incidents' : 'Notifications'}
                   </button>
                 ))}
               </div>
-              <div className="max-h-[640px] overflow-y-auto scroll-thin">
-                {tab === 'open' && (ov?.open_incidents.length
-                  ? ov.open_incidents.map(incidentRow)
-                  : <p className="p-6 text-center text-[13px] text-ink-400">
-                      No unresolved incidents.
-                      {ov && ov.monitor.state !== 'HEALTHY' && (
-                        <span className="mt-1 block text-amber-800">
-                          The monitor itself is {ov.monitor.state}: this is not an all-clear.
-                        </span>
-                      )}
-                    </p>)}
-                {tab === 'history' && history.map(incidentRow)}
-                {tab === 'notifications' && notes.map((n) => (
-                  <div key={n.id} className="border-b border-line px-4 py-2.5">
-                    <p className="text-[11px] text-ink-400">{when(n.created_at)} · {n.kind} · {n.channel} · <Badge v={n.status} />{n.attempts ? ` · ${n.attempts} attempt(s)` : ''}{n.status === 'RETRYING' && n.next_attempt_at ? ` · next ${when(n.next_attempt_at)}` : ''}
-                      {n.last_error ? ` · ${n.last_error}` : ''}</p>
-                    <pre className="mt-1 whitespace-pre-wrap text-[12px] text-ink-700">{n.body}</pre>
+
+              {tab === 'incidents' && (
+                <>
+                  <div className="space-y-2 border-b border-line px-3 py-2.5" data-testid="filters">
+                    <div className="relative">
+                      <Search size={14} className="pointer-events-none absolute left-2.5 top-2 text-ink-400" />
+                      <input type="search" value={filters.q} onChange={(e) => set('q', e.target.value)}
+                        placeholder="Search incidents, stores, IDs…" aria-label="Search incidents"
+                        className="h-8 w-full rounded-lg border border-line pl-8 pr-2 text-[12.5px] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-300" />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                      <select aria-label="Filter by status" className={selectCls} value={filters.status} onChange={(e) => set('status', e.target.value as StatusFilter)}>
+                        <option value="unresolved">Unresolved</option><option value="new">New</option>
+                        <option value="acknowledged">Acknowledged</option><option value="resolved">Resolved</option><option value="all">All</option>
+                      </select>
+                      <select aria-label="Filter by source" className={selectCls} value={filters.section} onChange={(e) => set('section', e.target.value as Section | '')}>
+                        <option value="">All sources</option>
+                        {SECTIONS.map((s) => <option key={s} value={s}>{SECTION_LABEL[s]}</option>)}
+                      </select>
+                      <select aria-label="Filter by severity" className={selectCls} value={filters.severity} onChange={(e) => set('severity', e.target.value as Severity | '')}>
+                        <option value="">All severities</option><option value="CRITICAL">Critical</option>
+                        <option value="HIGH">High</option><option value="WARNING">Warning</option>
+                      </select>
+                      <select aria-label="Filter by store" className={selectCls} value={filters.storeId ?? ''} onChange={(e) => set('storeId', e.target.value ? Number(e.target.value) : null)}>
+                        <option value="">All stores</option>
+                        {stores.map((s) => <option key={s.store_id} value={s.store_id}>{s.store_name || `#${s.store_id}`}</option>)}
+                      </select>
+                      <select aria-label="Filter by business date" className={selectCls} value={filters.date} onChange={(e) => set('date', e.target.value)}>
+                        <option value="">All dates</option>
+                        {dates.map((d) => <option key={d} value={d}>{shortDate(d)}</option>)}
+                      </select>
+                      <select aria-label="Sort incidents" className={selectCls} value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
+                        <option value="priority">Sort: priority</option><option value="newest">Sort: newest</option>
+                        <option value="oldest">Sort: oldest</option><option value="business_date">Sort: business date</option>
+                      </select>
+                    </div>
+                    <div className="flex items-center justify-between text-[11.5px] text-ink-500">
+                      <span data-testid="list-count">{vis.issues} issue{vis.issues === 1 ? '' : 's'} · {vis.matched} {filtered ? 'matching ' : ''}incident record{vis.matched === 1 ? '' : 's'}
+                        {vis.context > 0 && <span data-testid="context-count" className="text-ink-400"> (+{vis.context} network-level shown for context)</span>}</span>
+                      {filtered && <button type="button" onClick={() => setFilters(EMPTY_FILTERS)} className="font-medium text-brand-700 hover:underline">Clear filters</button>}
+                    </div>
                   </div>
-                ))}
-              </div>
-            </div>
-            <div className="min-h-0 overflow-y-auto p-4 scroll-thin">
-              {!detail ? (
-                <p className="p-6 text-center text-[13px] text-ink-400">Select an incident for evidence and investigation steps.</p>
-              ) : (
-                <div className="space-y-3 text-[13px]">
-                  <div className="flex items-center gap-2"><Badge v={detail.incident.severity} />
-                    <span className="text-[12px] text-ink-500">{detail.incident.status}</span>
-                    <span className="ml-auto font-mono text-[11px] text-ink-400">{detail.incident.id}</span></div>
-                  <h3 className="text-[15px] font-semibold text-ink-900">{detail.incident.title}</h3>
-                  <dl className="grid grid-cols-[130px_minmax(0,1fr)] gap-x-3 gap-y-1">
-                    <dt className="text-ink-400">Store</dt><dd>{detail.incident.store_name || '—'}</dd>
-                    <dt className="text-ink-400">Source / check</dt><dd>{detail.incident.source} / {detail.incident.check_name}</dd>
-                    <dt className="text-ink-400">Business date</dt><dd>{detail.incident.business_date || '—'}{detail.incident.qualifier ? ` · ${detail.incident.qualifier}` : ''}</dd>
-                    <dt className="text-ink-400">Expected</dt><dd>{show(detail.incident.expected)}</dd>
-                    <dt className="text-ink-400">Actual</dt><dd className="break-words">{show(detail.incident.actual)}</dd>
-                    <dt className="text-ink-400">Difference</dt><dd>{detail.incident.difference || '—'}</dd>
-                    <dt className="text-ink-400">Category</dt><dd>{detail.incident.category || '—'}</dd>
-                    <dt className="text-ink-400">First detected</dt><dd>{when(detail.incident.first_detected_at)}</dd>
-                    <dt className="text-ink-400">Last checked</dt><dd>{when(detail.incident.last_checked_at)} ({detail.incident.check_count} checks)</dd>
-                    {detail.incident.acknowledged_by && (<><dt className="text-ink-400">Acknowledged</dt>
-                      <dd>{detail.incident.acknowledged_by}, {when(detail.incident.acknowledged_at)}{detail.incident.ack_note ? ` — ${detail.incident.ack_note}` : ''}</dd></>)}
-                    {detail.incident.resolved_at && (<><dt className="text-ink-400">Resolved</dt>
-                      <dd>{when(detail.incident.resolved_at)} — {detail.incident.resolution}</dd></>)}
-                  </dl>
-                  <div>
-                    <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Manual investigation</p>
-                    <ol className="list-decimal space-y-1 pl-5">{detail.incident.actions.map((a, k) => <li key={k}>{a}</li>)}</ol>
-                  </div>
-                  <details>
-                    <summary className="cursor-pointer text-[12px] text-ink-500">Evidence</summary>
-                    <pre className="mt-1 overflow-x-auto rounded-lg bg-app p-2 text-[11px]">{JSON.stringify(detail.incident.evidence, null, 2)}</pre>
-                  </details>
-                  <div>
-                    <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-400">Timeline</p>
-                    {detail.events.map((e) => (
-                      <p key={e.id} className="text-[12px] text-ink-600">{when(e.at)} · <b>{e.event}</b> · {e.actor}</p>
+                  <div className="max-h-[70vh] overflow-y-auto scroll-thin" data-testid="incident-list">
+                    {needResolved && resolved === null && <p className="p-4 text-[12.5px] text-ink-500">Loading resolved incidents…</p>}
+                    {sections.length === 0 ? (
+                      <div className="p-8 text-center text-[13px] text-ink-500" data-testid="empty">
+                        {filtered ? <>No incidents match these filters. <button type="button" className="font-medium text-brand-700 hover:underline" onClick={() => setFilters(EMPTY_FILTERS)}>Clear filters</button></>
+                          : <>No unresolved incidents.
+                            {ov.monitor.state !== 'HEALTHY' && <span className="mt-1 block text-amber-800">The monitor itself is {ov.monitor.state}: this is not an all-clear.</span>}</>}
+                      </div>
+                    ) : sections.map(([sec, gs]) => (
+                      <section key={sec} aria-label={SECTION_LABEL[sec]} data-section={sec}>
+                        <h3 className="sticky top-0 z-10 flex items-center justify-between border-b border-line bg-app/95 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-500 backdrop-blur">
+                          <span>{SECTION_LABEL[sec]}</span>
+                          <span className="font-normal normal-case tracking-normal">{gs.length} issue{gs.length === 1 ? '' : 's'}</span>
+                        </h3>
+                        <ul>
+                          {gs.map((g) => (
+                            <GroupRow key={g.key} g={g} expanded={expanded.has(g.key)} onToggle={() => toggle(g.key)}
+                              selectedId={sel?.kind === 'group' ? sel.key : sel?.kind === 'incident' ? sel.id : null}
+                              onOpen={onOpen} />
+                          ))}
+                        </ul>
+                      </section>
                     ))}
                   </div>
-                  {detail.incident.status === 'OPEN' && (
-                    <div className="flex flex-col gap-2 border-t border-line pt-3 sm:flex-row">
-                      <input value={ackNote} onChange={(e) => setAckNote(e.target.value)} maxLength={500}
-                        placeholder="Note (optional): who is looking at it, why it is accepted…"
-                        className="flex-1 rounded-lg border border-line px-3 py-1.5 text-[13px]" />
-                      <button onClick={acknowledge}
-                        className="rounded-lg bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-700">
-                        Acknowledge
-                      </button>
-                    </div>
-                  )}
-                  <p className="text-[11px] text-ink-400">Acknowledging stops nothing: the issue is still re-checked, escalations still alert, and it resolves itself when the data clears. The monitor never repairs data.</p>
+                </>
+              )}
+
+              {tab === 'notifications' && (
+                <div className="max-h-[70vh] overflow-y-auto scroll-thin" data-testid="notifications">
+                  {notes === null ? <p className="p-4 text-[12.5px] text-ink-500">Loading…</p>
+                    : notes.length === 0 ? <p className="p-8 text-center text-[13px] text-ink-500">No notifications yet.</p>
+                    : notes.map((n) => (
+                      <div key={n.id} className="border-b border-line px-4 py-2.5">
+                        <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-ink-500">{when(n.created_at)} · {n.kind} · {n.channel} <Badge v={n.status} />
+                          {n.attempts ? ` · ${n.attempts} attempt(s)` : ''}{n.status === 'RETRYING' && n.next_attempt_at ? ` · next ${when(n.next_attempt_at)}` : ''}
+                          {n.last_error ? ` · ${n.last_error}` : ''}</p>
+                        <pre className="mt-1 whitespace-pre-wrap font-sans text-[12px] text-ink-700">{n.body}</pre>
+                      </div>
+                    ))}
                 </div>
               )}
             </div>
+
+            {/* detail */}
+            <div className={`min-w-0 p-4 ${detailOpen ? '' : 'max-lg:hidden'}`} data-testid="detail-pane">
+              {detailOpen && (
+                <div className="mb-3 flex items-center gap-3 text-[12.5px]">
+                  <button type="button" onClick={closeDetail} className="flex items-center gap-1 font-medium text-ink-600 hover:text-ink-900 lg:hidden" data-testid="back-to-list">
+                    <ArrowLeft size={14} /> All incidents</button>
+                  {sel?.kind === 'incident' && sel.fromGroup && (
+                    <button type="button" onClick={() => { setSel({ kind: 'group', key: sel.fromGroup! }); setDetail(null) }}
+                      className="font-medium text-brand-700 hover:underline">Back to group</button>
+                  )}
+                </div>
+              )}
+              {!detailOpen && <p className="p-8 text-center text-[13px] text-ink-400">Select an issue to see what happened, which stores are affected and what to check.</p>}
+              {sel?.kind === 'group' && (selGroup
+                ? <GroupDetail g={selGroup} onOpen={(m) => openIncident(m.id, selGroup.key)}
+                    matchedIds={'matched' in selGroup ? new Set((selGroup as VisibleGroup).matched.map((m) => m.id)) : undefined} />
+                : <p className="text-[13px] text-ink-500">This issue is no longer in the current list.</p>)}
+              {sel?.kind === 'incident' && (detailLoading && !detail
+                ? <p className="flex items-center gap-2 text-[13px] text-ink-500"><Loader2 size={14} className="animate-spin" /> Loading incident…</p>
+                : detail ? <IncidentDetailView d={detail} ackNote={ackNote} setAckNote={setAckNote} onAck={acknowledge} acking={acking} />
+                : <p className="text-[13px] text-ink-500">The incident could not be loaded.</p>)}
+            </div>
           </section>
         </div>
-      </div>
+      </main>
     </div>
   )
 }

@@ -201,6 +201,14 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
               "business_date": i["business_date"], "difference": i["difference"],
               "category": i["category"], "severity": i["severity"], "status": i["status"]}
              for i in incidents if i["difference"]]
+    freshness = _freshness(results, source_rows, now, cfg)
+    coverage = _coverage(src_status)
+    # A store a source covers but has no retained result for still gets a row
+    # (its cells then show UNKNOWN / STALE, never disappear).
+    for src, cov in coverage.items():
+        for st_ in (cov or {}).get("stores", []):
+            m = matrix[st_["id"]]
+            m["store_name"] = m["store_name"] or st_["name"]
     runs = [dict(r) for r in store.recent_runs(30)]
     last_by_tier = {}
     for r in runs:
@@ -216,7 +224,111 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
         "checks": checks,
         "monitor": monitor_status(store, now, cfg),
         "states": list(STATE_RANK),
+        # Presentation helpers derived from the results above (no extra queries):
+        "freshness": freshness,
+        # Per store-level source, the AUTHORITATIVE store list its check last read
+        # (Revel: active establishments; HME / R365: active VERIFIED mappings), as
+        # recorded in the monitor's own source_status. A store not in a known list is
+        # not covered by that source (N/A). null = the list is not known yet: the
+        # dashboard then shows missing cells as UNKNOWN, never N/A.
+        "coverage": coverage,
     }
+
+
+FRESHNESS_SOURCES = ("revel", "hme", "r365", "r365_financial")
+_VERIFIED_STATES = ("OK", "ACCEPTED")
+
+
+def _coverage(src_status: dict) -> dict:
+    out = {}
+    for src in STORE_SOURCES:
+        st = src_status.get(src) or {}
+        stores = (st.get("detail") or {}).get("covered_stores") if isinstance(st.get("detail"), dict) else None
+        out[src] = None if stores is None else {
+            "basis": "mapping", "as_of": st.get("checked_at"),
+            "store_ids": sorted(x["id"] for x in stores),
+            "stores": [{"id": x["id"], "name": x["name"]} for x in stores]}
+    return out
+
+
+def expected_by_now(src: str, now: datetime, cfg: dict) -> tuple[str | None, str | None]:
+    """(date, rule) the source SHOULD have delivered by `now`, from the same readiness
+    rules the checks use (config + clock only, no database). R365 financial periods
+    come from the database, so they have no schedule here (None)."""
+    from datetime import timedelta as _td
+    from . import clock
+    if src in ("revel", "hme"):
+        c = cfg[src]
+        hhmm = c["ready_after_local"] if src == "revel" else c["morning_ready_local"]
+        for day in clock.closed_business_days(now, max(int(c["lookback_days"]), 2)):
+            if now >= clock.ready_at(day, hhmm):
+                return day.isoformat(), f"each day is due {hhmm} Chicago the next day"
+        return None, None
+    if src == "r365":
+        from .checks.r365 import expected_weeks
+        ws = expected_weeks(now, cfg["r365"]["week_ready_local"], 1)[0]
+        return (ws + _td(days=6)).isoformat(), f"week ending Wednesday, due Thursday {cfg['r365']['week_ready_local']} Chicago"
+    return None, None
+
+
+def _freshness(results: list[dict], source_rows: list[dict], now: datetime, cfg: dict) -> list[dict]:
+    """Per source: expected vs evaluated vs verified, from the latest results only.
+
+    expected_date         the date the source SHOULD have delivered by now, from the
+                          readiness schedule (None where no schedule applies)
+    expected_counts       result states on expected_date; {} = not evaluated yet
+    latest_evaluated_date newest business date / period end the monitor evaluated
+                          (says nothing about whether ingestion succeeded)
+    latest_checked_date   newest one with a full verdict (nothing PENDING), + counts
+    latest_verified_date  newest one on which EVERY evaluated result was OK or
+                          ACCEPTED (nothing failing, pending or unknown)
+    retry_pending         a PENDING result is waiting for a scheduled retry
+                          (category "settling")
+    """
+    rows = {r["source"]: r for r in source_rows}
+    out = []
+    for src in FRESHNESS_SOURCES:
+        by_date: dict[str, Counter] = defaultdict(Counter)
+        labels: dict[str, str] = {}
+        retry, pending_titles = False, set()
+        for r in results:
+            if r["source"] != src or not r["business_date"]:
+                continue
+            by_date[r["business_date"]][r["state"]] += 1
+            if r["qualifier"] and src == "r365_financial":
+                labels[r["business_date"]] = r["qualifier"]
+            if r["state"] == "PENDING":
+                pending_titles.add(r["title"])
+                retry = retry or r["category"] == "settling"
+        dates = sorted(by_date)
+        latest = dates[-1] if dates else None
+        verified = next((d for d in reversed(dates)
+                         if sum(by_date[d].values())
+                         and all(k in _VERIFIED_STATES for k in by_date[d])), None)
+        # newest date the monitor has a full verdict on (nothing still PENDING)
+        done = next((d for d in reversed(dates) if not by_date[d].get("PENDING")), None)
+        exp, rule = expected_by_now(src, now, cfg)
+        src_row = rows.get(src, {})
+        out.append({
+            "source": src, "label": SOURCE_LABELS.get(src, src),
+            "last_sync_at": src_row.get("last_success_at"),
+            "last_check_at": src_row.get("last_successful_check_at"),
+            "monitoring_state": src_row.get("monitoring_state"),
+            "expected_date": exp,
+            "expected_rule": rule,
+            "expected_counts": dict(by_date[exp]) if exp and exp in by_date else {},
+            "latest_evaluated_date": latest,
+            "latest_evaluated_label": labels.get(latest) if latest else None,
+            "latest_evaluated_counts": dict(by_date[latest]) if latest else {},
+            "latest_checked_date": done,
+            "latest_checked_label": labels.get(done) if done else None,
+            "latest_checked_counts": dict(by_date[done]) if done else {},
+            "latest_verified_date": verified,
+            "latest_verified_label": labels.get(verified) if verified else None,
+            "retry_pending": retry,
+            "pending": sorted(pending_titles)[:5],
+        })
+    return out
 
 
 def daily_summary_text(store: Store, now: datetime, dashboard_url: str | None = None,

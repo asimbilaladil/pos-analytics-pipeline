@@ -275,16 +275,53 @@ credentials, customer data, chat questions or answers, or raw rows.
 
 ## Dashboard
 
-The dashboard is reached from the admin menu: **Data monitoring**. It shows:
+The dashboard is reached from the admin menu: **Data monitoring**. From top to
+bottom (layout and rules: `docs/MONITORING_DASHBOARD.md`):
 
-- source health cards: state counts, latest successful sync, open incidents;
-- monitor run ages;
-- a per-store grid for Revel, HME and R365;
-- unresolved reconciliation differences;
-- unresolved incidents, history and the notification outbox, including dry-run
-  messages;
-- incident detail: expected vs actual, evidence, manual investigation steps,
-  timeline, and an Acknowledge button with a note.
+- **Summary.**
+  - Overall state, with **business-data** health and **monitoring** health shown
+    separately. The overall state is the worse of the two, so stale or missing
+    checks are never shown as HEALTHY.
+  - Unresolved incident and issue counts, split into new and acknowledged.
+  - Affected locations.
+  - Last successful monitor run.
+  - Revel, HME and R365 freshness.
+- **Data sources: loaded vs verified.** For each source:
+  - last sync;
+  - expected by now: the date due under the readiness schedule, with its results or
+    "not evaluated yet";
+  - latest evaluated date or period, which is not proof of ingestion;
+  - latest date or period with a full verdict, with its counts;
+  - latest fully verified date or period;
+  - the monitor's last check;
+  - whether a scheduled retry is pending.
+- **Store health.** Each store's Revel, HME and R365 state:
+  - HEALTHY, PENDING, DEGRADED, FAILED, UNKNOWN or STALE;
+  - **N/A** only where the source's own store mapping excludes the store; a mapped
+    store with no evidence, or any store while the mapping is not yet known, is
+    UNKNOWN or STALE;
+  - an unresolved incident on any date takes precedence;
+  - clicking a store filters the incidents.
+- **Incidents.**
+  - Grouped by source; related incidents shown as one expandable issue. Example:
+    the HME network reconciliation failure for a day plus its store-days.
+  - Filters: status, source, severity, store, business date, and search.
+    - Counts show matching records only.
+    - A network-level parent shown for context is labelled "context" and
+      counted separately.
+  - Priority sort puts unresolved CRITICAL and HIGH first.
+  - Notification outbox, including dry-run messages.
+- **Detail.**
+  - A plain-English summary, location and business date.
+  - Expected vs actual, and the difference.
+  - Likely cause, only for categories derived from recorded evidence.
+  - Recommended investigation steps, first detected and last checked times, and
+    a timeline.
+  - Technical evidence, collapsed by default.
+  - Acknowledge, with a note.
+
+Grouping is presentation only: every incident keeps its own ID, status and
+history, and acknowledging never changes a verdict or resolves anything.
 
 Access is enforced on the server:
 
