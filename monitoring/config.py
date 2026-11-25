@@ -163,6 +163,20 @@ DEFAULTS: dict = {
         "offsite_max_age_hours": 30,
         "restore_test_status_glob": "",
         "restore_test_max_age_hours": 24 * 8,
+        # Provider-managed VPS backups (whole-disk images), separate from local dumps.
+        # "" = not monitored; "hetzner" = Hetzner Cloud API, read-only token (Read
+        # permission) in the env var named below. See docs/BACKUP_MONITORING.md.
+        "provider_backup": "",
+        "provider_server_id": "auto",          # "auto" = Hetzner metadata service
+        "provider_token_env": "MONITOR_HCLOUD_TOKEN",
+        "provider_api_url": "https://api.hetzner.cloud/v1",
+        "provider_metadata_url": "http://169.254.169.254/hetzner/v1/metadata/instance-id",
+        "provider_timeout_seconds": 10,
+        "provider_max_age_hours": 30,          # daily backups: one window plus slack
+        "provider_min_available": 1,
+        "provider_unknown_alert_hours": 24,    # API unreadable this long -> WARNING (not "no backups")
+        # Local-dump severity when a provider backup has been VERIFIED current this run.
+        "local_dump_severity_when_provider_ok": "WARNING",
     },
     "notify": {
         # "log" writes notifications to the log only. Real delivery needs
@@ -236,6 +250,23 @@ def validate(cfg: dict) -> None:
         raise ValueError("monitor.tier_period_minutes / tier_timers must cover every tier")
     if set(m["disabled_tiers"]) - tiers:
         raise ValueError(f"monitor.disabled_tiers: unknown {sorted(set(m['disabled_tiers']) - tiers)}")
+    i = cfg["infra"]
+    if i["provider_backup"] not in ("", "hetzner"):
+        raise ValueError("infra.provider_backup must be \"\" or \"hetzner\"")
+    sid = str(i["provider_server_id"])
+    if sid != "auto" and not sid.isdigit():
+        raise ValueError("infra.provider_server_id must be \"auto\" or a numeric server id")
+    if i["provider_backup"] and not str(i["provider_api_url"]).startswith("https://"):
+        raise ValueError("infra.provider_api_url must be https")
+    if not str(i["provider_token_env"]).isidentifier():
+        raise ValueError("infra.provider_token_env must be an environment variable NAME")
+    for k in ("provider_timeout_seconds", "provider_max_age_hours", "provider_unknown_alert_hours"):
+        if not (0 < float(i[k]) <= 24 * 30):
+            raise ValueError(f"infra.{k} out of range")
+    if not (0 <= int(i["provider_min_available"]) <= 50):
+        raise ValueError("infra.provider_min_available must be 0..50")
+    if i["local_dump_severity_when_provider_ok"] not in SEVERITIES:
+        raise ValueError("infra.local_dump_severity_when_provider_ok must be a severity")
     n = cfg["notify"]
     if not (1 <= int(n["max_attempts"]) <= 20):
         raise ValueError("notify.max_attempts must be 1..20")

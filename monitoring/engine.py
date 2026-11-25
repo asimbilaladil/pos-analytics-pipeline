@@ -9,6 +9,7 @@ Per result, against the ONE active incident for its dedup key:
   OK, active incident             -> RESOLVED                       (alert if it was alerted)
   ACCEPTED, active incident       -> RESOLVED as accepted exclusion (no alert)
   PENDING                          -> left as is (no verdict yet)
+  UNKNOWN                          -> left as is (could not evaluate; never resolves)
 
 A key that a check did not evaluate this run is never touched, and a check
 that raises opens a monitor incident for itself instead of resolving anything.
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta
 from . import VERSION, pg
 from .checks import CheckSpec, registry
 from .checks import infra as infra_checks
+from .checks import provider_backup
 from .checks import mcp as mcp_checks
 from .checks import services as svc_checks
 from .model import (ACCEPTED, FAIL, HIGH, OK, SEVERITY_RANK, SRC_MONITOR, CheckResult)
@@ -44,7 +46,7 @@ class Context:
     def __init__(self, cfg: dict, store: Store, now: datetime, tier: str, *,
                  pg_connect=None, http=None, systemctl=None, disk_usage=None,
                  mem_available_mb=None, newest_backup=None, cert_expiry=None,
-                 backup_format=None, read_status_json=None):
+                 backup_format=None, read_status_json=None, provider_backup_status=None):
         self.cfg, self.store, self.now, self.tier = cfg, store, now, tier
         self._pg_connect = pg_connect or (lambda: pg.connect(cfg))
         # A SEPARATE, fresh monitor session for code that manages its own
@@ -60,6 +62,7 @@ class Context:
         self.cert_expiry = cert_expiry or svc_checks.cert_expiry
         self.backup_format = backup_format or infra_checks.dump_format
         self.read_status_json = read_status_json or infra_checks.read_status_json
+        self.provider_backup_status = provider_backup_status or provider_backup.hetzner_status
         self.source_updates: dict[str, tuple] = {}
 
     def pg(self):
@@ -72,6 +75,13 @@ class Context:
                 self._pg_error = f"{type(e).__name__}: {str(e)[:200]}"
                 raise PgUnavailable(self._pg_error) from None
         return self._pg
+
+    def previous_source_status(self, source: str) -> dict | None:
+        """The stored source_status row from earlier runs (detail decoded)."""
+        for r in self.store.source_statuses():
+            if r["source"] == source:
+                return row_dict(r)
+        return None
 
     def source_status(self, source: str, last_success_at, detail: dict):
         self.source_updates[source] = (

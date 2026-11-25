@@ -2,7 +2,7 @@
 
 export type Severity = 'CRITICAL' | 'HIGH' | 'WARNING'
 export type IncidentStatus = 'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED'
-export type ResultState = 'OK' | 'FAIL' | 'PENDING' | 'ACCEPTED'
+export type ResultState = 'OK' | 'FAIL' | 'PENDING' | 'ACCEPTED' | 'UNKNOWN'
 
 export interface MonitorIncident {
   id: string

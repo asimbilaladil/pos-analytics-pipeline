@@ -75,7 +75,7 @@ check, so the swap cannot happen in AI Chat's process. A test asserts this. The 
 | AI Chat | `chat_jobs`, `chat_query_log` (status / error columns only) | `chat.stuck_jobs`, `chat.errors` (failed jobs, provider and SQL errors, trust-gate refusals) | 5 / 15 min |
 | MCP | `/healthz`, `usage_log` outcomes | `mcp.health`, `mcp.tool_errors` (errors, auth-failure bursts) | 5 / 15 min |
 | Infrastructure | `systemctl show`, public HTTPS, TLS, disk, memory | `services.*`, `infra.*` | 5 / 15 min; TLS 12-hourly |
-| Backups | newest dump file (mtime, size, pg_dump header); optional offsite and restore-test status files | `infra.backups`: **freshness only**, never "recoverable" without a recorded restore test | hourly |
+| Backups | **provider** VPS backups (Hetzner API, read-only token: status, age, count) and **local** dumps (mtime, size, pg_dump header), reported separately; optional offsite and restore-test status files | `infra.backups`: provider UNKNOWN when the API is unreadable (never "no backups"); a stale local dump is WARNING while a provider backup is verified current, HIGH otherwise; never "recoverable" without a recorded restore test. See `docs/BACKUP_MONITORING.md` | hourly |
 | Monitor | `monitor_runs` (SUCCESS only), the monitor timers, the outbox | `monitor.heartbeat` (in both tiers), `monitor.notification_delivery` per channel, per-check crash and per-unit failure incidents | 5 / 15 min |
 
 ### Source settling vs accepted exclusions vs genuine failures
@@ -84,6 +84,7 @@ check, so the swap cannot happen in AI Chat's process. A test asserts this. The 
 |---|---|---|---|
 | `PENDING` | Inside the source's readiness window (Revel before 09:45; HME Trend lag before the 10:15 retry; open fiscal period) | no; an existing one is left as is | no |
 | `ACCEPTED` | Configured exclusion (store not open yet, accepted HME date, holiday closure) | resolves any open one | no |
+| `UNKNOWN` | Could not be evaluated (e.g. the provider backup API is unreachable or no token is configured). Never "missing" and never OK. Makes the source's data state UNKNOWN. | leaves any open one exactly as it is | no |
 | `FAIL` / WARNING | Real, but not corruption: payment timing, open tickets, chat trust-gate refusals, R365 period not refreshed | yes | dashboard and daily summary only |
 | `FAIL` / HIGH, CRITICAL | Genuine failure: unexplained mismatch, missing or stale data, persistent HME mismatch after the retry, service down | yes | immediately |
 

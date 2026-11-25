@@ -23,8 +23,10 @@ FAIL = "FAIL"          # a genuine problem: open or keep an incident
 OK = "OK"              # evaluated and fine: resolve an open incident
 PENDING = "PENDING"    # inside the source's readiness / settling window: no verdict yet
 ACCEPTED = "ACCEPTED"  # a known, accepted exclusion (configured): shown, never alerted
+UNKNOWN = "UNKNOWN"    # could not be evaluated (e.g. provider API unavailable): incident left as is,
+                       # shown as UNKNOWN -- never treated as OK and never as "missing"
 
-STATES = (FAIL, OK, PENDING, ACCEPTED)
+STATES = (FAIL, OK, PENDING, ACCEPTED, UNKNOWN)
 
 # Sources (stable identifiers used in keys, the dashboard and notifications).
 SRC_REVEL = "revel"

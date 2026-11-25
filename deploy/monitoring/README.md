@@ -48,7 +48,7 @@ The analytics-role credentials (`DB_RO_*`) are no longer used by the monitor.
 ## 2. Install the units in dry-run (no alerts leave the host)
 
 ```
-install -d -m 750 /etc/laynes /var/lib/laynes/monitor
+[ -d /etc/laynes ] || install -d -m 700 /etc/laynes     # never loosen an existing /etc/laynes (0700)
 install -m 644 deploy/monitoring/monitor.example.toml /etc/laynes/monitor.toml        # review first
 install -m 600 deploy/monitoring/monitor.env.example  /etc/laynes/monitor.env          # then fill in values
 install -m 644 deploy/monitoring/laynes-monitor-*.service deploy/monitoring/laynes-monitor-*.timer \
@@ -141,7 +141,8 @@ store: move `monitor.db*` aside.
 - Restart `laynes-api` **only with zero queued/processing `chat_jobs`**, as for
   every API deploy.
 - Then build and publish the frontend:
-  `cd frontend && npm run build && rsync -a --delete dist/ /var/www/laynes-intelligence/`.
+  `/root/pos-analytics-pipeline-release/deploy-frontend.sh` (the established script: it builds,
+  publishes and restores root:www-data 750/640 on the web root).
   Back up the current directory first.
 - Rollback:
   - API: `git -C /root/pos-analytics-pipeline-release checkout --detach c6d743c`,
@@ -191,6 +192,14 @@ notices on, and WARNING via the 07:00 summary only.
 - If stores close on holidays (e.g. Thanksgiving, 2026-11-26), add the date to
   `[revel].accepted_closed_dates`. Otherwise each closed store raises a
   no-data incident.
+- Provider backups (Hetzner, confirmed enabled 2026-11-25): to let the monitor verify
+  them, add a **Read** API token as `MONITOR_HCLOUD_TOKEN` and set
+  `provider_backup = "hetzner"`. Both are steps that need approval, described in
+  `docs/BACKUP_MONITORING.md`. Without them, provider status is UNKNOWN, never
+  "no backups".
+- **Do not** run `install -d -m 750 /etc/laynes` on a host where it already exists. It
+  would loosen it from 0700. Only `/var/lib/laynes/monitor` needs creating, and
+  `StateDirectory=` does that.
 - Decide on a scheduled database backup. Until one exists, the backup incident
   stays open by design.
 - The monitor's own timers are watched by the heartbeat; they do not need to be

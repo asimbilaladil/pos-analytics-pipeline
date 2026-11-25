@@ -924,10 +924,9 @@ check("a recent file that is not a pg_dump -> FAIL backup_unrecognised",
       infra.backups(ctx)[0].category == "backup_unrecognised")
 ctx = bctx(newest_backup=lambda g: ("/b/x.dump", now - timedelta(days=8)),
            backup_format=lambda p: "pg_dump custom archive")
-check("stale dump -> FAIL stale_backup", infra.backups(ctx)[0].category == "stale_backup")
-check("no dump -> FAIL no_backup",
-      bctx(newest_backup=lambda g: (None, None)).__class__ and
-      infra.backups(bctx(newest_backup=lambda g: (None, None)))[0].category == "no_backup")
+check("stale dump -> FAIL stale_local_dump", infra.backups(ctx)[0].category == "stale_local_dump")
+check("no dump -> FAIL no_local_dump",
+      infra.backups(bctx(newest_backup=lambda g: (None, None)))[0].category == "no_local_dump")
 rt = {"ok": True, "completed_at": (now - timedelta(days=1)).isoformat(), "dump": "/b/x.dump"}
 ctx = bctx(infra={"restore_test_status_glob": "/r/*.json"},
            newest_backup=lambda g: ("/b/x.dump", now - timedelta(hours=2)),

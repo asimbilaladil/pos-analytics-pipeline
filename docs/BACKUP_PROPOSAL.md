@@ -8,8 +8,14 @@
 - There is no scheduled `pg_dump`, `pg_basebackup` or WAL archiving on the host.
 - The only dumps are manual pre-deploy archives under `/root/deploy-backups/*/`.
   They are pg_dump custom format, and the newest is from 2026-11-17.
-- It is unknown whether the hosting provider takes disk snapshots. Someone with
-  access to the provider console needs to confirm.
+- **Provider backups exist (owner-confirmed in the Hetzner Cloud Console,
+  2026-11-25):** Hetzner automatic backups are enabled on `revel-system`. There are 7 rolling
+  daily images; the newest is 2026-11-24 22:29 UTC, 10.65 GB. These are whole-disk images
+  managed by Hetzner. The monitor can read their status through a read-only API token
+  (docs/BACKUP_MONITORING.md), and no duplicate scheduler is needed for them.
+- What is still missing is a **database-level** backup: a scheduled logical dump, which
+  allows a database-only restore, and a restore test. The proposal below is about those.
+  It stays optional and needs separate approval.
 
 ## What the monitor can and cannot say
 
