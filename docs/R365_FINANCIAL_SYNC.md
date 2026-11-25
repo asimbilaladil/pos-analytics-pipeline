@@ -13,6 +13,18 @@
      doesn't exist.
    - systemd opens `StandardOutput=append:` files before starting the process, so the first run
      would have failed with 209/STDOUT before any code ran.
+   - **Correction (2026-11-25, found during the production install):** PR #42's
+     `StateDirectory=…/logs` does **not** fix this. On systemd 259 the output file is opened
+     *before* `StateDirectory=` directories are created, and before any `ExecStartPre=` (which
+     has its own output to open). Transient units on a scratch path: the production layout
+     (`state/` present, `logs/` absent) and a fully empty layout both exit **209**; with
+     `logs/` pre-created, exit 0. The timer was disabled again before its first elapse.
+   - **Fix:** an installation prerequisite,
+     `systemd/r365-financial-ingest.tmpfiles.conf` → `/etc/tmpfiles.d/laynes-r365-financial.conf`.
+     It creates `state/` and `logs/` (0700 root, never aged out) at install, through
+     `systemd-tmpfiles --create`, and on every boot. Regression test:
+     `tests/test_r365_financial_unit_startup.py` (static + isolated tmpfiles; live
+     clean-directory start with `R365_UNIT_LIVE_TEST=1` as root).
 3. **Nothing reported it.**
    - The monitor's financial check hardcoded `timer_installed: False` and only asked "loaded
      after close?".
@@ -135,12 +147,18 @@ All of these are genuine.
    - restart `laynes-api` with 0 chat jobs, for the chat labels;
    - redeploy the MCP app (`/opt/laynes-mcp/app`, git-archive) with 0 ask jobs;
    - the monitor picks the change up on its next run.
-3. **Install the units:**
+3. **Install the prerequisite, then the units:**
    ```bash
+   # PREREQUISITE (before the unit can ever start): the log directory systemd opens before exec
+   install -m 644 $REL/systemd/r365-financial-ingest.tmpfiles.conf /etc/tmpfiles.d/laynes-r365-financial.conf
+   systemd-tmpfiles --create /etc/tmpfiles.d/laynes-r365-financial.conf
+   stat -c '%n %a %U:%G' /var/lib/laynes/r365-financial/state /var/lib/laynes/r365-financial/logs   # 700 root:root
    install -m 644 $REL/systemd/r365-financial-ingest.service $REL/systemd/r365-financial-ingest.timer /etc/systemd/system/
    systemctl daemon-reload
    systemd-analyze calendar --iterations=2 '*-*-* 07:00:00 America/Chicago'   # 12:00/13:00 UTC
    ```
+   Every later release that touches these units re-installs all three files. The tmpfiles file
+   is the only thing that creates `logs/`; don't remove it while the unit is installed.
 4. **First run (manual, observed),** in a window clear of HME and Revel:
    - `systemctl start r365-financial-ingest.service`;
    - expect P11 and P12 refreshed (P10 too on a Monday);
@@ -148,10 +166,17 @@ All of these are genuine.
    - **This is the production refresh of the current data.** It is covered by the backup and
      rollback in the 2026-11-25 recovery plan; take that backup first.
 5. `systemctl enable --now r365-financial-ingest.timer`.
+   - `Persistent=true`: if the timer's stamp
+     (`/var/lib/systemd/timers/stamp-r365-financial-ingest.timer`) is older than the most recent
+     07:00 Chicago elapse, enabling starts one **catch-up run immediately**. Enable before the
+     next elapse after the stamp, or treat the catch-up as the observed first run.
 
 **Rollback:**
 - `systemctl disable --now r365-financial-ingest.timer`, remove the two unit files, then
   `daemon-reload`;
+- remove `/etc/tmpfiles.d/laynes-r365-financial.conf` only together with the units. Leave
+  `/var/lib/laynes/r365-financial/{state,logs}` in place; they hold the lock and the log
+  history;
 - restore the recorded release SHA;
 - data: the scoped P10/P11 rollback from the backup.
 
