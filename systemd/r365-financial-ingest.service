@@ -24,10 +24,14 @@ Environment=R365_FIN_RAW_DIR=/var/lib/laynes/r365-financial/raw
 Environment=R365_FIN_LOCK_PATH=/var/lib/laynes/r365-financial/state/ingest.lock
 # ~15 requests on a normal day (~3 s observed), ~150 on a Monday repair.
 TimeoutStartSec=1800
-# The log files below are opened by systemd BEFORE the process starts; their
-# directory must exist or the unit fails with 209/STDOUT before any code runs (the
-# reason the unit as first written could not have run). StateDirectory= creates
-# /var/lib/laynes/r365-financial/{state,logs} (0700, root) on every start.
+# PREREQUISITE: the log files at the bottom are opened by systemd BEFORE it creates
+# StateDirectory= directories and before any ExecStartPre= (verified on systemd 259).
+# If /var/lib/laynes/r365-financial/logs is missing, the unit fails with 209/STDOUT
+# before any code runs. That directory is therefore created at INSTALL and on every
+# boot by systemd/r365-financial-ingest.tmpfiles.conf, installed as
+# /etc/tmpfiles.d/laynes-r365-financial.conf
+# (tests/test_r365_financial_unit_startup.py). StateDirectory= then re-asserts
+# root ownership and 0700 on every start.
 StateDirectory=laynes/r365-financial/state laynes/r365-financial/logs
 StateDirectoryMode=0700
 # Light and bounded: ~15 GET requests on a normal day, ~150 on Mondays.
