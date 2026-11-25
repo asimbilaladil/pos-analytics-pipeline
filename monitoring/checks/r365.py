@@ -24,6 +24,7 @@ from ..pg import rows
 CHECK_WEEK = "weekly_coverage"
 CHECK_STORE_WEEK = "store_week_coverage"
 CHECK_PERIOD = "period_coverage"
+CHECK_PERIOD_SOURCE = "period_source_sync"
 
 _WEEKS_SQL = """
 SELECT week_start, week_end, week_status, source_complete, reconciliation_ok,
@@ -147,7 +148,32 @@ ORDER BY requested_fiscal_year, requested_period_number, id DESC
 """
 
 
+def _timer_state(ctx, unit: str) -> dict:
+    """Is the scheduled financial ingest actually installed and enabled? Never raises."""
+    try:
+        st = ctx.systemctl(unit) or {}
+    except Exception as e:  # noqa: BLE001
+        return {"unit": unit, "installed": None, "error": type(e).__name__}
+    loaded = st.get("LoadState") == "loaded"
+    return {"unit": unit, "installed": loaded,
+            "enabled": loaded and st.get("UnitFileState") in ("enabled", "enabled-runtime"),
+            "active": st.get("ActiveState") == "active"}
+
+
 def financial(ctx) -> list[CheckResult]:
+    """Per closed fiscal period, three separate questions:
+
+      period_coverage   is OUR copy current?  never loaded / loaded before close /
+                        refresh overdue inside the source's repair window / never
+                        re-pulled after that window (late postings may be missing) /
+                        reconciliation failed
+      period_source_sync is the SOURCE fresh?  (its own sync flag, as recorded by the
+                        last load) -- reported separately from reconciliation
+
+    The source changes closed periods for ~5 weeks (late postings, approvals,
+    re-classification): 2026-11-25, FY2026 P10 -- loaded after close, so it passed
+    the old check -- had since gained new and re-approved lines at the source.
+    """
     cfg = ctx.cfg["r365"]
     if not cfg["financial_enabled"]:
         return []
@@ -156,32 +182,59 @@ def financial(ctx) -> list[CheckResult]:
     periods = rows(pg, _PERIODS_SQL, {"today": today, "n": cfg["financial_lookback_periods"] + 1})
     runs = {(r["requested_fiscal_year"], r["requested_period_number"]): r
             for r in rows(pg, _PERIOD_RUN_SQL)}
+    timer = _timer_state(ctx, cfg["financial_timer"])
+    window = timedelta(days=cfg["financial_repair_window_days"])
+    max_age = timedelta(hours=cfg["financial_refresh_max_age_hours"])
     out: list[CheckResult] = []
     newest = None
     for p in periods:
         label = f"FY{p['fiscal_year']} {p['period_label'] or 'P' + str(p['period_number'])}"
         base = dict(source=SRC_R365_FIN, check=CHECK_PERIOD, qualifier=label,
                     business_date=p["end_date"].isoformat(),
-                    expected="loaded after period close and reconciled")
+                    expected="loaded after close, kept current through the source's repair "
+                             "window, and reconciled")
+        sbase = dict(source=SRC_R365_FIN, check=CHECK_PERIOD_SOURCE, qualifier=label,
+                     business_date=p["end_date"].isoformat(),
+                     expected="source reports its own data sync as current")
         run = runs.get((p["fiscal_year"], p["period_number"]))
         if run and run["completed_at"]:
             newest = max(newest or run["completed_at"], run["completed_at"])
+        window_end = p["end_date"] + window
         ev = {"period_start": p["start_date"].isoformat(), "period_end": p["end_date"].isoformat(),
+              "repair_window_end": window_end.isoformat(),
+              "scheduled_ingest": timer,
               "last_load": None if not run else {
                   "run_id": run["id"], "status": run["status"],
-                  "completed_at": run["completed_at"].isoformat() if run["completed_at"] else None,
-                  "reconciliation_ok": run["reconciliation_ok"],
-                  "source_sync_stale": run["source_sync_stale"]}}
+                  "completed_at": run["completed_at"].isoformat() if run["completed_at"] else None},
+              # kept apart on purpose: reconciliation of OUR load vs freshness of the SOURCE
+              "reconciliation": None if not run else {"reconciliation_ok": run["reconciliation_ok"]},
+              "source_freshness": None if not run else {
+                  "source_sync_stale": run["source_sync_stale"],
+                  "source_last_sync_at": run["source_last_sync_at"].isoformat()
+                  if hasattr(run["source_last_sync_at"], "isoformat") else run["source_last_sync_at"]}}
         if p["end_date"] >= today:
             out.append(CheckResult(state=PENDING, title="Fiscal period still open", evidence=ev,
                                    **base))
             continue
+        # -- source freshness: its own result, independent of our load ----------
+        if run is None:
+            out.append(CheckResult(state=PENDING, title="No load yet: source freshness unknown",
+                                   evidence=ev, **sbase))
+        elif run["source_sync_stale"]:
+            out.append(CheckResult(state=FAIL, severity=WARNING, category="source_stale",
+                                   title="R365 reported its own data sync as stale",
+                                   actual=f"source_last_sync_at {run['source_last_sync_at']}",
+                                   evidence=ev, actions=_actions("fin"), **sbase))
+        else:
+            out.append(CheckResult(state=OK, title="Source sync reported current at last load",
+                                   evidence=ev, **sbase))
+        # -- our copy ---------------------------------------------------------------
         due = p["end_date"] + timedelta(days=cfg["financial_refresh_grace_days"])
         if run is None:
             out.append(CheckResult(
                 state=FAIL, severity=WARNING if today <= due else HIGH,
                 category="missing_ingestion", title="R365 financial period never loaded",
-                actual="no load", evidence=ev, actions=_actions("fin"), **base))
+                actual="no load", evidence=ev, actions=_actions("fin", timer), **base))
             continue
         if run["reconciliation_ok"] is False:
             out.append(CheckResult(state=FAIL, severity=HIGH, category="reconciliation_failed",
@@ -189,31 +242,59 @@ def financial(ctx) -> list[CheckResult]:
                                    actual=f"run {run['id']} reconciliation_ok=false",
                                    evidence=ev, actions=_actions("fin"), **base))
             continue
-        loaded_after_close = run["completed_at"] and \
-            clock.chicago(run["completed_at"]).date() > p["end_date"]
-        if not loaded_after_close and today > due:
+        loaded = clock.chicago(run["completed_at"]) if run["completed_at"] else None
+        loaded_after_close = bool(loaded) and loaded.date() > p["end_date"]
+        last = f"last load {loaded:%Y-%m-%d} ({run['status']})" if loaded else "no completed load"
+        if not loaded_after_close:
+            if today > due:
+                out.append(CheckResult(
+                    state=FAIL, severity=WARNING, category="stale_after_close",
+                    title="R365 financial period closed but last loaded before close",
+                    actual=f"{last}; period ended {p['end_date']}",
+                    evidence=ev, actions=_actions("fin", timer), **base))
+            else:
+                out.append(CheckResult(state=PENDING, title="Awaiting post-close refresh",
+                                       evidence=ev, **base))
+        elif today <= window_end:
+            if ctx.now - run["completed_at"] > max_age:
+                out.append(CheckResult(
+                    state=FAIL, severity=WARNING, category="refresh_overdue",
+                    title="Closed period inside the source's repair window not refreshed recently",
+                    actual=f"{last}; repair window open until {window_end}",
+                    evidence=ev, actions=_actions("fin", timer), **base))
+            else:
+                out.append(CheckResult(state=PENDING,
+                                       title="Within the source's repair window; refreshed recently",
+                                       evidence=ev, **base))
+        elif loaded.date() <= window_end:
             out.append(CheckResult(
-                state=FAIL, severity=WARNING, category="stale_after_close",
-                title="R365 financial period closed but last loaded before close",
-                actual=f"last load {clock.chicago(run['completed_at']):%Y-%m-%d} "
-                       f"({run['status']}); period ended {p['end_date']}",
-                evidence=ev, actions=_actions("fin"), **base))
-        elif run["source_sync_stale"]:
-            out.append(CheckResult(state=FAIL, severity=WARNING, category="source_stale",
-                                   title="R365 reported its own data sync as stale",
-                                   actual=f"source_last_sync_at {run['source_last_sync_at']}",
-                                   evidence=ev, actions=_actions("fin"), **base))
-        elif not loaded_after_close:
-            out.append(CheckResult(state=PENDING, title="Awaiting post-close refresh",
-                                   evidence=ev, **base))
+                state=FAIL, severity=WARNING, category="not_refreshed_after_repair_window",
+                title="Closed period not re-pulled after the source's repair window",
+                actual=f"{last}; repair window ended {window_end}",
+                evidence=ev, actions=_actions("fin", timer), **base))
         else:
-            out.append(CheckResult(state=OK, title="Financial period loaded after close",
-                                   evidence=ev, **base))
-    ctx.source_status(SRC_R365_FIN, newest, {"timer_installed": False})
+            out.append(CheckResult(state=OK, title="Financial period final (loaded after the "
+                                                   "repair window)", evidence=ev, **base))
+    ctx.source_status(SRC_R365_FIN, newest, {"timer_installed": timer.get("installed"),
+                                             "scheduled_ingest": timer})
     return out
 
 
-def _actions(kind: str) -> list[str]:
+def _actions(kind: str, timer: dict | None = None) -> list[str]:
+    fin = []
+    if timer is not None:
+        if timer.get("installed") is False or timer.get("enabled") is False:
+            fin.append(f"Scheduled financial ingest ({timer.get('unit')}) is not installed/enabled: "
+                       "closed periods are only refreshed manually, so late source postings are "
+                       "missed. Installing it is a separate, approved change.")
+        elif timer.get("installed") is None:
+            fin.append("Could not read the scheduled financial ingest timer state.")
+    fin += ["Compare the period with the source read-only first "
+            "(`r365_financial_ingest.py --period <FY> <P> --dry-run` writes nothing).",
+            "Then refresh it with approval (`--period <FY> <P>`, after a backup); the refresh "
+            "replaces the period's rows with the source's current, reconciled state.",
+            "AI Chat serves VERIFIED categories only and labels source status; it never invents "
+            "figures, but an old load can under-report late postings."]
     return {
         "missing": ["Check `systemctl status r365-weekly-ingest` and "
                     "`journalctl -u r365-weekly-ingest`.",
@@ -222,9 +303,5 @@ def _actions(kind: str) -> list[str]:
         "incomplete": ["Read r365_ingest_run.missing_stores / source_missing_days for the week.",
                        "If R365 itself has not finished posting, the next weekly run refreshes it.",
                        "AI Chat's R365 gate refuses incomplete weeks; nothing wrong is served."],
-        "fin": ["r365-financial-ingest has no installed timer; financial periods are loaded "
-                "manually.",
-                "Run the period refresh manually (with approval) after the books close, then "
-                "re-check v_r365_financial_coverage_llm.",
-                "AI Chat labels financial data by source status; no figure is fabricated."],
+        "fin": fin,
     }[kind]

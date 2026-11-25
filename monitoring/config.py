@@ -99,6 +99,13 @@ DEFAULTS: dict = {
         # A closed fiscal period should be refreshed at least once after close
         # within this many days.
         "financial_refresh_grace_days": 10,
+        # The R365 source re-syncs postings for ~5 weeks after a period closes; the
+        # orchestrator's scheduled mode re-pulls every period overlapping the last
+        # 42 days. Inside this window a closed period must keep being refreshed;
+        # after it, the last load must postdate the window to count as final.
+        "financial_repair_window_days": 42,
+        "financial_refresh_max_age_hours": 72,
+        "financial_timer": "r365-financial-ingest.timer",
         "financial_lookback_periods": 2,
     },
     "chat": {
@@ -236,6 +243,11 @@ def validate(cfg: dict) -> None:
         raise ValueError("monitor.tier_period_minutes / tier_timers must cover every tier")
     if set(m["disabled_tiers"]) - tiers:
         raise ValueError(f"monitor.disabled_tiers: unknown {sorted(set(m['disabled_tiers']) - tiers)}")
+    r = cfg["r365"]
+    if not (1 <= int(r["financial_refresh_grace_days"]) <= int(r["financial_repair_window_days"]) <= 120):
+        raise ValueError("r365: need 1 <= financial_refresh_grace_days <= financial_repair_window_days <= 120")
+    if not (1 <= int(r["financial_refresh_max_age_hours"]) <= 24 * 14):
+        raise ValueError("r365.financial_refresh_max_age_hours must be 1..336")
     n = cfg["notify"]
     if not (1 <= int(n["max_attempts"]) <= 20):
         raise ValueError("notify.max_attempts must be 1..20")

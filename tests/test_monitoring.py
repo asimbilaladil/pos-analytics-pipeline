@@ -610,11 +610,13 @@ RUNS = [{"requested_fiscal_year": 2026, "requested_period_number": 11, "id": 31,
          "source_sync_stale": False, "source_last_sync_at": None, "error_code": None}]
 pg = FakePG([("FROM ayg_business_periods", P), ("FROM r365_financial_ingest_run", RUNS)])
 ctx = engine.Context(make_cfg(), Store(":memory:"), now, "data", pg_connect=lambda: pg)
-fres = {r.qualifier: r for r in r365.financial(ctx)}
+fres = {r.qualifier: r for r in r365.financial(ctx) if r.check == "period_coverage"}
 check("open fiscal period -> PENDING", fres["FY2026 P12"].state == PENDING)
 check("closed period last loaded before close -> WARNING stale_after_close",
       fres["FY2026 P11"].severity == WARNING and fres["FY2026 P11"].category == "stale_after_close")
-check("period loaded after close -> OK", fres["FY2026 P10"].state == OK)
+check("P10 loaded after close but before the 42-day repair window ended -> WARNING "
+      "not_refreshed_after_repair_window (the old check passed it as OK)",
+      fres["FY2026 P10"].severity == WARNING and fres["FY2026 P10"].category == "not_refreshed_after_repair_window")
 
 # ═══════════════════════════════════════════════════════════════════════════
 print("6. services, jobs, AI Chat and MCP failures, host")
