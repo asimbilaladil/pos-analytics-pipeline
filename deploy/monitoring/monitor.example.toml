@@ -1,0 +1,59 @@
+# /etc/laynes/monitor.toml -- data monitor settings (no secrets in this file).
+# Every key is optional; defaults live in monitoring/config.py. Times are
+# America/Chicago. Financial reconciliation tolerances are NOT configurable:
+# the Revel ±0.5% comes from chat_sql.RECON_TOLERANCE_PCT at run time.
+
+[monitor]
+state_db = "/var/lib/laynes/monitor/monitor.db"
+log_file = "/var/lib/laynes/monitor/monitor.log"
+release_dir = "/root/pos-analytics-pipeline-release"
+
+[revel]
+ready_after_local = "09:45"      # revel-daily-sync 09:00 + ~25 min
+lookback_days = 3
+sync_max_age_hours = 26
+payment_timing_severity = "WARNING"
+# Days the stores did not trade (no-data store-days are then ACCEPTED), e.g.:
+# accepted_closed_dates = { "2026-11-26" = "Thanksgiving -- confirm stores closed" }
+
+[hme]
+morning_ready_local = "06:30"    # 05:30 run
+retry_ready_local = "10:45"      # 10:15 retry
+lookback_days = 7
+# accepted_dates = { "2026-10-06" = "account-wide HME outage, accepted 2026-11-xx" }
+
+[r365]
+week_ready_local = "21:30"       # Thu 20:00 weekly run
+lookback_weeks = 3
+financial_enabled = true
+financial_refresh_grace_days = 10
+
+[notify]
+# Start with the log channel and dry_run = true (the default). To go live, add an
+# approved channel AND set dry_run = false; credentials go in monitor.env.
+channels = ["log"]
+dry_run = true
+immediate_min_severity = "HIGH"  # WARNING goes to the dashboard + daily summary only
+notify_resolutions = true
+dashboard_url = "https://intelligence.aygchicken.com/"
+
+# [notify.email]
+# smtp_host = "smtp.example.com"
+# smtp_port = 587
+# starttls = true
+# from_addr = "monitor@example.com"
+# to_addrs = ["owner@example.com"]
+
+[services]
+# Once the monitor timers are installed, add them so a disabled timer is caught:
+# timers = ["revel-daily-sync.timer", "hme-daily-ingest.timer",
+#           "hme-reconciliation-retry.timer", "r365-weekly-ingest.timer",
+#           "laynes-loyalty-labor-sync.timer", "revel-items-selfheal.timer",
+#           "laynes-monitor-data.timer", "laynes-monitor-summary.timer"]
+
+[infra]
+backup_globs = ["/root/deploy-backups/*/*.dump", "/var/backups/laynes/*.dump"]
+backup_max_age_hours = 26
+
+[summary]
+local_times = ["07:00"]

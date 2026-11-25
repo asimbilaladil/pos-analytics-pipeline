@@ -59,6 +59,11 @@ _PROCESS_STARTED_AT = _dt.now(_tz.utc)
 
 app = FastAPI(title="Laynes Intelligence API", docs_url=None, redoc_url=None)
 
+# Data-quality monitor dashboard (super_admin only; reads the monitor's own
+# incident store, never the business database).
+from .monitoring_api import router as _monitoring_router  # noqa: E402
+app.include_router(_monitoring_router)
+
 # In production the SPA is served same-origin by nginx and this list is empty.
 # It exists so the Vite dev server can talk to the API during development.
 _origins = [o for o in os.getenv("API_CORS_ORIGINS", "").split(",") if o]

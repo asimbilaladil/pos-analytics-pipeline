@@ -1,3 +1,4 @@
+import type { MonitorIncident, MonitorIncidentDetail, MonitorNotification, MonitorOverview } from '../types/monitoring'
 import type { AdminUser, AskAccepted, ChatJob, Conversation, ConversationDetail, ModelsInfo, User } from '../types'
 
 /**
@@ -134,4 +135,15 @@ export const api = {
     request<Conversation[]>(`/api/admin/users/${uid}/conversations`),
   adminConversation: (id: number) =>
     request<ConversationDetail>(`/api/admin/conversations/${id}`),
+
+  // Data-quality monitor (super_admin only, enforced server-side).
+  monitorOverview: () => request<MonitorOverview>('/api/admin/monitoring/overview'),
+  monitorIncidents: (status?: string) =>
+    request<MonitorIncident[]>(`/api/admin/monitoring/incidents${status ? `?status=${status}` : ''}`),
+  monitorIncident: (id: string) =>
+    request<MonitorIncidentDetail>(`/api/admin/monitoring/incidents/${encodeURIComponent(id)}`),
+  monitorAck: (id: string, note?: string) =>
+    request<{ acknowledged: string }>(`/api/admin/monitoring/incidents/${encodeURIComponent(id)}/ack`,
+      { method: 'POST', body: JSON.stringify({ note: note || null }) }),
+  monitorNotifications: () => request<MonitorNotification[]>('/api/admin/monitoring/notifications'),
 }

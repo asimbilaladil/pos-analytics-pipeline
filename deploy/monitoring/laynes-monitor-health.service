@@ -1,0 +1,29 @@
+# Laynes data monitor -- health tier (services, endpoints, host, MCP, stuck chat
+# jobs, the monitor's own heartbeat). NOT INSTALLED: see deploy/monitoring/README.md.
+#
+# Read-only by construction: ProtectSystem=strict makes the whole filesystem
+# read-only for this process except the monitor's own state directory, and the
+# PostgreSQL session is forced read-only (monitoring/pg.py). The monitor never
+# starts, stops or restarts a unit; it only runs `systemctl show`.
+[Unit]
+Description=Laynes data monitor (health tier)
+After=network-online.target postgresql.service
+OnFailure=laynes-monitor-crash@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pos-analytics-pipeline-release
+EnvironmentFile=/etc/laynes/monitor.env
+Environment=LAYNES_MONITOR_CONFIG=/etc/laynes/monitor.toml PYTHONDONTWRITEBYTECODE=1
+ExecStart=/root/pos-analytics-pipeline/venv/bin/python -m monitoring run --tier health
+TimeoutStartSec=4min
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=300M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/laynes/monitor
+StateDirectory=laynes/monitor
+StateDirectoryMode=0750
