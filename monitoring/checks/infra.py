@@ -8,7 +8,8 @@ import os
 import shutil
 from datetime import datetime, timezone
 
-from ..model import CRITICAL, FAIL, HIGH, OK, SRC_INFRA, WARNING, CheckResult
+from ..model import CRITICAL, FAIL, HIGH, OK, SRC_INFRA, UNKNOWN, WARNING, CheckResult
+from . import provider_backup
 from ..pg import rows
 
 
@@ -123,43 +124,55 @@ def read_status_json(path_glob: str) -> tuple[str | None, dict | None]:
 
 
 def backups(ctx) -> list[CheckResult]:
-    """Backup FRESHNESS -- plus offsite and restore-test status only where a
-    status file gives real evidence. A file's modification time proves a dump
-    was written, not that it can be restored: nothing here calls a backup
-    "recoverable" unless a restore test recorded success."""
+    """Two separate kinds of backup, reported separately:
+
+    * provider-managed VPS backups (checks/provider_backup.py; Hetzner API, read-only)
+    * local PostgreSQL dumps (file freshness + pg_dump header)
+
+    A missing or stale LOCAL dump never means "no backups exist": its wording
+    and severity depend on what the provider check could verify THIS run.
+    Nothing here calls any backup "recoverable": only a restore-test status file
+    that records success sets newest_verified_backup."""
     c = ctx.cfg["infra"]
-    out = []
+    out, provider_detail, provider_verdict = provider_backup.evaluate(ctx)
     path, ts = ctx.newest_backup(c["backup_globs"])
     base = dict(source=SRC_INFRA, check="backup_freshness",
-                expected=f"a local database dump newer than {c['backup_max_age_hours']}h "
+                expected=f"a local PostgreSQL dump newer than {c['backup_max_age_hours']}h "
                          f"(freshness only, not restore-verified)")
-    detail = {"local": None, "offsite": "not monitored (no offsite status configured)",
-              "restore_test": "not monitored (no restore-test status configured)"}
+    detail = {"provider": provider_detail, "local": None,
+              "offsite": "not monitored (no offsite status configured)",
+              "restore_test": "not monitored (no restore-test status configured)",
+              "restore_verified": False}
+    if provider_verdict == OK:
+        sev, ctxt = c["local_dump_severity_when_provider_ok"], "provider VPS backup is current"
+    elif provider_verdict == FAIL:
+        sev, ctxt = c["backup_severity"], "provider VPS backup is NOT current"
+    else:
+        sev, ctxt = c["backup_severity"], "provider VPS backup status unknown"
     if ts is None:
-        out.append(CheckResult(state=FAIL, severity=c["backup_severity"], category="no_backup",
-                               title="No local database backup found", actual="none",
-                               evidence={"searched": c["backup_globs"], **detail},
-                               actions=_backup_actions(), **base))
+        out.append(CheckResult(state=FAIL, severity=sev, category="no_local_dump",
+                               title=f"No local PostgreSQL dump found ({ctxt})",
+                               actual="no local dump", evidence={"searched": c["backup_globs"], **detail},
+                               actions=_backup_actions(provider_verdict), **base))
     else:
         fmt = ctx.backup_format(path)
         age_h = round((ctx.now - ts).total_seconds() / 3600, 1)
         detail["local"] = {"path": path, "modified_at": ts.isoformat(timespec="seconds"),
                            "age_hours": age_h, "format": fmt, "restore_verified": False}
-        ev = {**detail, "note": "freshness = file modification time; not a restore test"}
+        ev = {**detail, "note": "local freshness = file modification time; not a restore test"}
         if fmt == "unrecognised" or fmt.startswith("unreadable"):
             out.append(CheckResult(state=FAIL, severity=c["backup_severity"],
                                    category="backup_unrecognised",
-                                   title="Newest backup file is not a recognisable pg_dump",
+                                   title="Newest local dump file is not a recognisable pg_dump",
                                    actual=f"{path}: {fmt}", evidence=ev,
-                                   actions=_backup_actions(), **base))
+                                   actions=_backup_actions(provider_verdict), **base))
         elif age_h > c["backup_max_age_hours"]:
-            out.append(CheckResult(state=FAIL, severity=c["backup_severity"],
-                                   category="stale_backup",
-                                   title="Database backup is stale (freshness check)",
+            out.append(CheckResult(state=FAIL, severity=sev, category="stale_local_dump",
+                                   title=f"Local PostgreSQL dump is stale ({ctxt})",
                                    actual=f"newest local dump written {ts:%Y-%m-%d %H:%M} UTC",
-                                   evidence=ev, actions=_backup_actions(), **base))
+                                   evidence=ev, actions=_backup_actions(provider_verdict), **base))
         else:
-            out.append(CheckResult(state=OK, title="Local backup fresh (not restore-verified)",
+            out.append(CheckResult(state=OK, title="Local PostgreSQL dump fresh (not restore-verified)",
                                    actual=f"{age_h}h old", evidence=ev, **base))
     out += _status_file_check(ctx, detail, "offsite", c.get("offsite_status_glob"),
                               c["offsite_max_age_hours"], "backup_offsite",
@@ -209,10 +222,20 @@ def _status_file_check(ctx, detail, kind, path_glob, max_h, check, expected):
                         evidence=detail[kind], **base)]
 
 
-def _backup_actions() -> list[str]:
-    return ["No scheduled pg_dump exists on this host (only manual pre-deploy dumps). "
-            "Confirm whether the hosting provider takes snapshots.",
-            "See docs/BACKUP_PROPOSAL.md; point infra.backup_globs (and the offsite / "
-            "restore-test status globs) at the scheduled job once one is approved. Until "
-            "then this incident stays open by design.",
-            "This check never creates, deletes or modifies backups."]
+def _backup_actions(provider_verdict: str = UNKNOWN) -> list[str]:
+    acts = []
+    if provider_verdict == OK:
+        acts.append("Provider-managed VPS backups are current (see evidence.provider); this "
+                    "incident is about LOCAL PostgreSQL dumps only, which give a database-level "
+                    "restore point independent of the whole-disk image.")
+    elif provider_verdict == FAIL:
+        acts.append("Provider VPS backups are not current either: see the provider_backup "
+                    "incident and the Hetzner Cloud Console.")
+    else:
+        acts.append("Provider VPS backup status is unknown to the monitor (not configured or API "
+                    "unavailable); this does not mean no backups exist. Configure "
+                    "infra.provider_backup (docs/BACKUP_MONITORING.md).")
+    acts += ["No scheduled pg_dump exists on this host (only manual pre-deploy dumps); see "
+             "docs/BACKUP_PROPOSAL.md.",
+             "This check never creates, deletes or modifies backups."]
+    return acts

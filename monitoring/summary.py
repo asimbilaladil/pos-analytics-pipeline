@@ -140,8 +140,8 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
             data_state = FAILED
         elif worst == "WARNING":
             data_state = DEGRADED
-        elif not c:
-            data_state = UNKNOWN
+        elif not c or c.get("UNKNOWN"):
+            data_state = UNKNOWN        # e.g. provider backup status unreadable
         elif c.get("PENDING"):
             data_state = PENDING
         else:
@@ -173,7 +173,7 @@ def overview(store: Store, now: datetime, cfg: dict | None = None) -> dict:
 
     # Per-store matrix: newest business date per (store, source), worst state.
     matrix: dict[int, dict] = defaultdict(lambda: {"store_name": None, "sources": {}})
-    rank = {"FAIL": 3, "PENDING": 2, "ACCEPTED": 1, "OK": 0}
+    rank = {"FAIL": 4, "UNKNOWN": 3, "PENDING": 2, "ACCEPTED": 1, "OK": 0}
     for r in results:
         if r["source"] not in STORE_SOURCES or r["store_id"] is None:
             continue

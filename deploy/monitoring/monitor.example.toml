@@ -58,6 +58,14 @@ retry_max_seconds = 3600
 [infra]
 backup_globs = ["/root/deploy-backups/*/*.dump", "/var/backups/laynes/*.dump"]
 backup_max_age_hours = 26       # FRESHNESS only -- not proof of recoverability
+# Provider-managed VPS backups (Hetzner Cloud automatic backups), reported SEPARATELY
+# from the local dumps above. Read-only: needs MONITOR_HCLOUD_TOKEN (Read permission) in
+# monitor.env. Without a token the provider status is UNKNOWN -- never "no backups".
+# provider_backup = "hetzner"
+# provider_server_id = "auto"            # from the Hetzner metadata service
+# provider_max_age_hours = 30
+# provider_min_available = 1
+# provider_unknown_alert_hours = 24
 # Evidence from future offsite / restore-test jobs (docs/BACKUP_PROPOSAL.md).
 # Empty = "not monitored" on the dashboard.
 # offsite_status_glob = "/var/backups/laynes/status/offsite-*.json"

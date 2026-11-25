@@ -48,7 +48,7 @@ dashboard shows the message; it never renders an empty all-clear.
     "data_state": "FAILED",                       // source-data health
     "monitoring_state": "HEALTHY",                // are the checks of it running?
     "worst_open_severity": "HIGH", "open_incidents": 3,
-    "counts": {"OK": 30, "FAIL": 3},
+    "counts": {"OK": 30, "FAIL": 3},                // result states: OK FAIL PENDING ACCEPTED UNKNOWN
     "last_success_at": "...",                     // the SOURCE's own latest sync
     "detail": {...},
     "last_successful_check_at": "...", "oldest_successful_check_at": "...",
