@@ -41,11 +41,11 @@ RAW_DIR = os.environ.get("HME_RAW_DIR", "/var/lib/laynes/hme/raw")
 LOG_DIR = os.environ.get("HME_LOG_DIR", "/var/lib/laynes/hme/logs")
 LOCK_PATH = os.environ.get("HME_LOCK_PATH", "/var/lib/laynes/hme/state/ingest.lock")
 ENV_FILE = os.environ.get("HME_ENV_FILE", "/etc/laynes/hme-downloader.env")
-ORCHESTRATOR_VERSION = "hme_daily_ingest/1.3.0"
+ORCHESTRATOR_VERSION = "hme_daily_ingest/1.4.0"
 
 # --- process exit contract (shared with hme_reconciliation_retry.py) --------
 # systemd's SuccessExitStatus decides which of these light the unit red. The
-# unit lists "0 3 75" and deliberately omits 2.
+# unit lists "0 3 5 75" and deliberately omits 2.
 #
 #   0  complete AND reconciled -- a fully clean production day.
 #   1  hard failure: extraction exhausted, safety/tenant abort, missing
@@ -62,6 +62,17 @@ ORCHESTRATOR_VERSION = "hme_daily_ingest/1.3.0"
 #      least one VERIFIED store FAILED (no access / no data) or is PARTIAL.
 #      Red on purpose: a stale or inaccessible location must keep alerting.
 #      Per-store outcomes are in hme_store_ingest_result.
+#   5  RECONCILIATION PENDING SCHEDULED RETRY (scheduled primary run only).
+#      Exactly the exit-2 shape, narrowed: the ONLY failed checks are the
+#      source-settling cross-checks (Trend or Outliers still behind
+#      Performance Analysis), every other gate passed, the run is precisely
+#      the one hme_reconciliation_retry will judge eligible, and that retry
+#      is still due today. The database is unchanged by this code: the run
+#      stays status='partial', reconciliation_ok=false, and the lagging
+#      store-days stay PARTIAL / UNVERIFIED (excluded by the trust gate)
+#      until a reconciled run exists. Not red, because the verdict belongs
+#      to the retry: if the source has not settled by then, the retry exits
+#      2 and ITS unit goes red. See assess_pending_retry().
 #   75 EX_TEMPFAIL: harmless no-op -- another run holds the lock, or the
 #      retry found nothing eligible to do.
 #
@@ -74,7 +85,26 @@ EXIT_HARD_FAILURE = 1
 EXIT_RECONCILIATION_FAILED = 2
 EXIT_ACCEPTED_PARTIAL = 3
 EXIT_PARTIAL_STORES = 4
+EXIT_RECONCILIATION_PENDING_RETRY = 5
 EXIT_NOOP = 75
+
+# Cross-checks whose failure is the observed "source has not settled yet"
+# signature: HME's Trend dashboard (Oct-Nov 2026) or Outliers report (Sep
+# 2026) lagging Performance Analysis for a store for hours after close, then
+# catching up to an exact match by the 10:15 retry. Any other failed check --
+# goal_d_matches_pa_threshold, store_rows_sum_vs_source_total -- is not a lag
+# and keeps exit 2.
+SETTLING_CHECKS = frozenset({
+    "trend_total_cars_matches_pa_total_orders_per_store",
+    "pa_total_orders_vs_outliers_car_departures",
+})
+# Latest America/Chicago wall-clock time at which a morning run may still
+# defer to the same day's retry. hme-reconciliation-retry.timer fires at
+# 10:15 Chicago (+ up to 180 s randomized delay) and retries Chicago-
+# yesterday, i.e. this run's business date. A primary run that finishes
+# later than this (a Persistent= catch-up, a long backoff) keeps exit 2,
+# because no retry is guaranteed to revisit its date.
+RETRY_DEFER_DEADLINE = datetime.time(10, 0)
 
 # Per-store partial policy: one absent VERIFIED store no longer refuses the
 # whole day. Set HME_PARTIAL_STORES=0 to restore the all-or-nothing behaviour.
@@ -130,6 +160,62 @@ def classify_partial_exit(res, log=None):
     say(f"exit 3: accepted partial -- reconciled, VERIFIED {v_obs}/{v_exp} present, "
         f"only OUT_OF_SCOPE absent {c.get('missing_store_numbers')}")
     return EXIT_ACCEPTED_PARTIAL
+
+
+def assess_pending_retry(res, run, *, target, now):
+    """May a scheduled morning run defer its reconciliation verdict to the
+    same day's hme-reconciliation-retry? Pure and fail-closed.
+
+    Returns (defer: bool, reason: str). This never changes what was loaded or
+    how it is graded; it only decides whether exit 2 (red now) becomes exit 5
+    (verdict owned by the retry later today). Every condition must hold:
+
+      * the load is partial and NOT reconciled;
+      * the only failed checks are SETTLING_CHECKS (a source lag signature);
+      * every non-SUCCESS store result is PARTIAL / RECONCILIATION_MISMATCH,
+        so no FAILED, NO_ACCESS or missing VERIFIED store hides behind it;
+      * the latest network-wide run for the date IS this run, and the retry's
+        own assess_retry_eligibility() accepts it -- the decision the retry
+        will actually make, not a re-implementation of it;
+      * it is still the morning after the business date, before
+        RETRY_DEFER_DEADLINE, so the scheduled retry will revisit this date.
+
+    The caller (_maybe_defer_to_retry) additionally requires the retry timer
+    to be active in systemd.
+    """
+    if not res or not run:
+        return False, "no load result or run record"
+    if res.get("status") != "partial" or res.get("reconciliation_ok") is not False:
+        return False, "not an unreconciled partial load"
+    checks = (res.get("reconciliation") or {}).get("checks") or []
+    failed = {c.get("check") for c in checks if not c.get("ok")}
+    if not failed:
+        return False, "reconciliation failed but no failed check is identified"
+    if failed - SETTLING_CHECKS:
+        return False, ("failed check(s) are not a source-settling lag: "
+                       + ", ".join(sorted(failed - SETTLING_CHECKS)))
+    for r in res.get("store_results") or []:
+        if r.get("status") in ("SUCCESS", "SKIPPED"):
+            continue
+        if (r.get("status"), r.get("reason_code")) != ("PARTIAL", "RECONCILIATION_MISMATCH"):
+            return False, (f"store {r.get('revel_establishment_id')} is "
+                           f"{r.get('status')}/{r.get('reason_code')}, not a lag")
+    if run.get("run_id") != res.get("run_id"):
+        return False, (f"latest network run for {target} is {run.get('run_id')}, "
+                       f"not this run {res.get('run_id')}")
+    import hme_reconciliation_retry as retry     # local: retry imports this module
+    eligible, why = retry.assess_retry_eligibility(run)
+    if not eligible:
+        return False, f"the retry would not revisit it: {why}"
+    if now.tzinfo is None:
+        return False, "now must be timezone-aware"
+    local = now.astimezone(CHICAGO)
+    due = datetime.date.fromisoformat(str(target)) + datetime.timedelta(days=1)
+    if local.date() != due or local.time() >= RETRY_DEFER_DEADLINE:
+        return False, (f"no retry is still scheduled for {target} "
+                       f"(Chicago now {local.isoformat(timespec='minutes')})")
+    return True, ("source-settling lag only (" + ", ".join(sorted(failed))
+                  + "); today's 10:15 Chicago retry owns the verdict")
 
 
 def log(msg, fh=None):
@@ -349,6 +435,46 @@ def acquire_lock(fh):
     return lock
 
 
+RETRY_TIMER = "hme-reconciliation-retry.timer"
+
+
+def retry_timer_active():
+    """True only if systemd reports the retry timer active. Exit 5 hands the
+    verdict to that timer's run, so without it the morning must stay red.
+    Any error (no systemctl, not systemd, timeout) is False."""
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", RETRY_TIMER],
+                              timeout=15, check=False).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _maybe_defer_to_retry(code, res, target, fh):
+    """Exit 5 instead of 2 when assess_pending_retry() allows it. Any error
+    while deciding keeps exit 2 -- the red, attention-needed answer."""
+    if not retry_timer_active():
+        log(f"exit 2 kept: {RETRY_TIMER} is not active, so no retry will revisit {target}", fh)
+        return code
+    try:
+        import hme_reconciliation_retry as retry
+        conn = hme_load.connect()
+        try:
+            run = retry.latest_run(conn, target)
+        finally:
+            conn.close()
+        defer, why = assess_pending_retry(res, run, target=target,
+                                          now=datetime.datetime.now(CHICAGO))
+    except Exception as e:  # noqa: BLE001 -- fail closed to exit 2
+        log(f"exit 2 kept: could not assess a pending retry ({type(e).__name__}: {e})", fh)
+        return code
+    if not defer:
+        log(f"exit 2 kept: {why}", fh)
+        return code
+    log(f"exit 5: reconciliation pending scheduled retry -- {why}. The run stays "
+        f"partial/unreconciled and its lagging store-days stay UNVERIFIED.", fh)
+    return EXIT_RECONCILIATION_PENDING_RETRY
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=None,
@@ -387,6 +513,9 @@ def main():
             code, _res, _why = ingest_date(target, env=env, fh=fh,
                                            max_attempts=args.max_attempts,
                                            dry_run=args.dry_run)
+            if (code == EXIT_RECONCILIATION_FAILED and _res is not None
+                    and args.date is None and not args.dry_run):
+                code = _maybe_defer_to_retry(code, _res, target, fh)
             log(f"tenant inventory used: {inv_n} stores; exit {code}", fh)
             return code
         finally:
