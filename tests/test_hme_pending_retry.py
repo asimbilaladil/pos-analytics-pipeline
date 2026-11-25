@@ -317,6 +317,46 @@ check("retry timer unchanged: 10:15 America/Chicago", "OnCalendar=*-*-* 10:15:00
 check("defer deadline (10:00) precedes the retry elapse (10:15)",
       I.RETRY_DEFER_DEADLINE < datetime.time(10, 15))
 
+# --- drop-in merge semantics: emulate systemd's SuccessExitStatus= merging -----
+def effective(*assignments):
+    """systemd.service(5): a non-empty SuccessExitStatus= MERGES into the list; an empty
+    assignment RESETS it. Apply unit then drop-in values in order."""
+    out = set()
+    for v in assignments:
+        out = set() if v.strip() == "" else out | set(v.split())
+    return out
+
+
+live_unit = "0 3 75"                                    # the installed unit (pricing-tree symlink)
+dropin_values = [l.split("=", 1)[1] for l in dl]
+eff = effective(live_unit, *dropin_values)
+check("drop-in has exactly one NON-EMPTY SuccessExitStatus= (so it merges, never resets)",
+      len(dropin_values) == 1 and dropin_values[0].strip() != "", dropin_values)
+check("effective set after drop-in == {0,3,5,75}: only 5 is added", eff == {"0", "3", "5", "75"}, eff)
+check("after drop-in, exit 2 (reconciliation failed) and 4 (partial stores) are still failures",
+      not ({"2", "4"} & eff))
+check("an empty assignment WOULD reset (guard against a future 'SuccessExitStatus=' line)",
+      effective(live_unit, "", "5") == {"5"})
+
+# --- deploy/rollback documentation: no hardcoded rollback target ----------------
+doc = open("docs/HME_RECONCILIATION_PENDING_RETRY.md").read()
+dep = doc[doc.index("## Deploy"):doc.index("## Residual risks")]
+rb = doc[doc.index("## Rollback"):doc.index("## Residual risks")]
+import re  # noqa: E402
+check("rollback does not hardcode any commit SHA (e.g. the outdated c6d743c)",
+      "c6d743c" not in rb and not re.search(r"\b[0-9a-f]{7,40}\b", rb.replace("$PREV", "")), rb[:300])
+check("deploy captures the exact production release SHA BEFORE moving the checkout",
+      "rev-parse HEAD > $STATE/prev_release_sha" in dep
+      and dep.index("prev_release_sha") < dep.index("checkout --detach $MERGED"))
+check("deploy refuses a dirty release checkout before capturing it", "status --porcelain" in dep)
+check("rollback restores exactly the captured SHA and verifies it",
+      'PREV=$(cat $STATE/prev_release_sha)' in rb and 'checkout --detach "$PREV"' in rb
+      and '[ "$(git -C $REL rev-parse HEAD)" = "$PREV" ]' in rb)
+check("deploy verifies 0 3 5 75 present and 2/4 absent after the drop-in",
+      "for c in 0 3 5 75" in dep and "for c in 2 4" in dep)
+check("rollback removes the drop-in and verifies SuccessExitStatus returns to the captured value",
+      "rm -f $DROPIN && systemctl daemon-reload" in rb and "success_exit_status_before" in rb)
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))
 sys.exit(1 if failed else 0)

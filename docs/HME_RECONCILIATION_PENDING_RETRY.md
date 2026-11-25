@@ -100,31 +100,71 @@ The retry owns the verdict:
 ## Tests
 
 - `tests/test_hme_pending_retry.py`: 64 checks. Pure, with no DB, network or extractor.
-- Existing HME suites, run on `c6d743c` and on this branch against an isolated
-  copy (port 55432; no network; production socket hidden), give identical check results.
+- Existing HME suites, run on `c6d743c` (the release at the time of the original review) and on
+  this branch against an isolated copy (port 55432; no network; production socket hidden),
+  give identical check results.
 
 ## Deploy (needs approval; no service restart; no timer change)
 
-1. Gate:
-   - lock free;
+The rollback target is **whatever production runs at the moment of deploy**, captured in
+step 1. It is never a SHA written into this document: the release checkout moves with
+every approved release.
+
+```bash
+REL=/root/pos-analytics-pipeline-release
+MERGED=<merged-sha>                         # PR #41's merge commit on sidebar-redesign
+DROPIN=/etc/systemd/system/hme-daily-ingest.service.d/20-pending-retry.conf
+STATE=/root/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)-hme-pending-retry; install -d -m 700 $STATE
+```
+
+1. **Capture and verify the current production release** (the rollback target):
+   ```bash
+   git -C $REL rev-parse HEAD > $STATE/prev_release_sha
+   test -z "$(git -C $REL status --porcelain)" || { echo "release checkout not clean"; exit 1; }
+   echo "rollback target: $(cat $STATE/prev_release_sha)"
+   systemctl show hme-daily-ingest -p SuccessExitStatus > $STATE/success_exit_status_before   # today: 0 3 75
+   test ! -e $DROPIN || { echo "drop-in already present"; exit 1; }
+   ```
+2. **Verify that only the intended code moves:**
+   ```bash
+   git -C $REL fetch -q origin
+   git -C $REL merge-base --is-ancestor "$(cat $STATE/prev_release_sha)" $MERGED   # fast-forward of what runs now
+   git -C $REL diff --name-only "$(cat $STATE/prev_release_sha)" $MERGED | tee $STATE/files.txt
+   ```
+   Every file listed must belong to this PR or to another release that is already
+   approved. If anything else would ship with it, stop.
+3. **Gate:**
+   - the HME lock is free and no HME unit is active;
    - not within 05:25–06:30 or 10:10–10:45 Chicago;
-   - `hme-reconciliation-retry.timer` active.
-2. Move the release checkout to the merged commit:
-   `git -C /root/pos-analytics-pipeline-release checkout --detach <merged-sha>`.
+   - `hme-reconciliation-retry.timer` is active;
+   - 0 queued/processing chat jobs. The API is not restarted, but the checkout it runs from
+     moves.
+4. **Move the release checkout:** `git -C $REL checkout --detach $MERGED`, then verify
+   `[ "$(git -C $REL rev-parse HEAD)" = "$MERGED" ]`.
    - laynes-api does not import `hme_daily_ingest`, so no restart is needed.
    - MCP is unaffected.
-3. Install the drop-in:
-   `install -m 644 systemd/dropins/hme-daily-ingest-20-pending-retry.conf /etc/systemd/system/hme-daily-ingest.service.d/20-pending-retry.conf`
+5. **Install the drop-in:**
+   `install -m 644 $REL/systemd/dropins/hme-daily-ingest-20-pending-retry.conf $DROPIN`
    - The live unit is a symlink into the development tree, which must not be edited.
-4. `systemctl daemon-reload`.
+6. `systemctl daemon-reload`.
    - No `OnCalendar` changes, so `Persistent=` replays nothing.
-5. Verify `systemctl show hme-daily-ingest -p SuccessExitStatus` lists 3 5 75.
-   - Systemd omits 0 from the listing.
-   - `systemctl list-timers` should be unchanged.
-6. The unit stays red from its last exit-2 run until the next scheduled run.
-   - `systemctl reset-failed hme-daily-ingest` is optional and cosmetic.
-7. Next morning, confirm the log shows `exit 5` or `exit 0`, the DB row is still
-   partial/unreconciled on a lag day, and the 10:15 retry reconciles it.
+7. **Verify the exit contract.** The drop-in may only ADD 5. A non-empty
+   `SuccessExitStatus=` in a drop-in is merged with the unit's list (systemd.service(5));
+   only an empty assignment would reset it.
+   ```bash
+   systemctl show hme-daily-ingest -p SuccessExitStatus      # expect exactly: 0 3 5 75
+   S=$(systemctl show hme-daily-ingest -p SuccessExitStatus --value)
+   for c in 0 3 5 75; do echo " $S " | grep -q " $c " || echo "MISSING $c"; done
+   for c in 2 4; do echo " $S " | grep -q " $c " && echo "ERROR: $c would be green"; done
+   systemctl show hme-reconciliation-retry -p SuccessExitStatus   # unchanged: 0 3 75
+   ```
+   Also check that `systemctl list-timers` is unchanged.
+8. The unit stays red from its last exit-2 run until the next scheduled run.
+   `systemctl reset-failed hme-daily-ingest` is optional and cosmetic.
+9. Next morning, confirm:
+   - the log shows `exit 5` or `exit 0`;
+   - on a lag day, the DB row is still partial/unreconciled;
+   - the 10:15 retry reconciles it.
 
 Either half alone is safe:
 - New code without the drop-in: exit 5 is red, as today.
@@ -132,9 +172,16 @@ Either half alone is safe:
 
 ## Rollback
 
-- Code: `rm /etc/systemd/system/hme-daily-ingest.service.d/20-pending-retry.conf && systemctl daemon-reload`.
-- Release checkout: `git -C /root/pos-analytics-pipeline-release checkout --detach c6d743ca561092eeb25cb0260239d25ac97d8092`.
-- No data to revert.
+Restore exactly what ran before step 4. No data needs reverting.
+
+```bash
+PREV=$(cat $STATE/prev_release_sha)           # captured in step 1, never a hardcoded SHA
+rm -f $DROPIN && systemctl daemon-reload
+git -C $REL checkout --detach "$PREV"
+[ "$(git -C $REL rev-parse HEAD)" = "$PREV" ] && echo "release restored to $PREV"
+systemctl show hme-daily-ingest -p SuccessExitStatus      # back to the step-1 value (0 3 75)
+diff <(systemctl show hme-daily-ingest -p SuccessExitStatus) $STATE/success_exit_status_before
+```
 
 ## Residual risks and follow-ups
 
