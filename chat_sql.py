@@ -3743,7 +3743,8 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
         st, code, why = R365_FRESH.period_refresh_state(
             period_end=c["period_end"], today=now.date(), now=now, loaded_at=c["loaded_at"],
             period_open=c["period_status"] == "CURRENT",
-            source_complete=c["source_data_status"] == "COMPLETE",
+            source_complete=(None if c["source_data_status"] is None
+                             else c["source_data_status"] == "COMPLETE"),
             reconciliation_ok=c.get("reconciliation_ok"),
             refresh_failed=bool(c["latest_refresh_failed"]))
         return st, why
@@ -3968,6 +3969,8 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
     by_state: dict[str, dict[str, str]] = {}
     for p in f.get("periods_in_scope") or []:
         st = p.get("refresh_state")
+        if st == "UNVERIFIED" and p.get("latest_refresh_failed"):
+            continue    # already warned above ("refresh failed ... previous successful load")
         if st in ("STALE", "PROVISIONAL", "UNVERIFIED"):
             by_state.setdefault(st, {})[f"FY{p['fiscal_year']} {p['period_label']}"] = \
                 p.get("refresh_state_reason") or ""

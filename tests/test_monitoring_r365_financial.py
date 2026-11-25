@@ -195,6 +195,20 @@ cov, _, _ = evaluate([ok11], NOV25, attempts=[{**ok11, "id": 41, "status": "FAIL
                                                 "started_at": NOV25 - timedelta(hours=2)}])
 check("SOURCE FAILURE: latest refresh FAILED after a good load -> WARNING refresh_failed",
       cov["FY2026 P11"].category == "refresh_failed")
+ok12 = run(12, NOV25 - timedelta(hours=3), status="PARTIAL", rid=50)
+cov, _, _ = evaluate([ok12], NOV25, attempts=[{**ok12, "id": 51, "status": "FAILED", "error_code": "HTTP_503",
+                                                "started_at": NOV25 - timedelta(hours=1)}])
+check("CURRENT period: good load 3 h ago, then the latest refresh FAILED -> refresh_failed (not OK/provisional)",
+      cov["FY2026 P12"].category == "refresh_failed" and cov["FY2026 P12"].evidence["refresh_state"] == "UNVERIFIED",
+      cov["FY2026 P12"])
+cov, _, _ = evaluate([ok12], NOV25, attempts=[ok12 | {"started_at": ok12["completed_at"]}])
+check("...the same period with the good load as its latest attempt -> OK (provisional)", cov["FY2026 P12"].state == OK)
+cov, _, _ = evaluate([run(10, datetime(2026, 11, 20, 13, 0, tzinfo=UTC), recon=None)], NOV25)
+check("UNKNOWN reconciliation (reconciliation_ok NULL) on a closed period -> HIGH reconciliation_unknown, never final",
+      cov["FY2026 P10"].category == "reconciliation_unknown" and cov["FY2026 P10"].severity == HIGH, cov["FY2026 P10"])
+cov, _, _ = evaluate([run(12, NOV25 - timedelta(hours=3), status="PARTIAL", recon=None)], NOV25)
+check("UNKNOWN reconciliation on the current period -> HIGH reconciliation_unknown, not provisional",
+      cov["FY2026 P12"].category == "reconciliation_unknown")
 cov, _, _ = evaluate([run(11, NOV25 - timedelta(hours=5), status="PARTIAL")], NOV25)
 check("INCOMPLETE SOURCE: closed P11 loaded after close but source PARTIAL -> WARNING source_incomplete",
       cov["FY2026 P11"].category == "source_incomplete")

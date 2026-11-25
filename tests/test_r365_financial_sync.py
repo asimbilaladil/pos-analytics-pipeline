@@ -83,6 +83,34 @@ check("SOURCE FAILURE: latest refresh failed -> UNVERIFIED (figures are from an 
       st(D(2026, 11, 4), now - dt.timedelta(hours=2), failed=True)[:2] == ("UNVERIFIED", "refresh_failed"))
 check("INCOMPLETE SOURCE: closed period loaded after close but source PARTIAL -> UNVERIFIED",
       st(D(2026, 11, 4), now - dt.timedelta(hours=2), complete=False)[:2] == ("UNVERIFIED", "source_incomplete"))
+print("2b. review fixes: failed refresh and unknown verification fail closed")
+check("CURRENT period: good load 3 h ago, then the latest refresh FAILED -> UNVERIFIED refresh_failed (not PROVISIONAL)",
+      st(D(2026, 12, 2), now - dt.timedelta(hours=3), open_=True, complete=False, failed=True)[:2] == ("UNVERIFIED", "refresh_failed"))
+check("closed period inside the window, latest refresh FAILED -> UNVERIFIED refresh_failed",
+      st(D(2026, 11, 4), now - dt.timedelta(hours=3), failed=True)[:2] == ("UNVERIFIED", "refresh_failed"))
+check("closed FINAL-eligible period, latest refresh FAILED -> UNVERIFIED (never FINAL over a failure)",
+      st(D(2026, 10, 7), dt.datetime(2026, 11, 20, 7, 5, tzinfo=CHI), failed=True)[0] == "UNVERIFIED")
+check("reconciliation_ok=None (unknown) on a closed period -> UNVERIFIED reconciliation_unknown",
+      st(D(2026, 10, 7), dt.datetime(2026, 11, 20, 7, 5, tzinfo=CHI), recon=None)[:2] == ("UNVERIFIED", "reconciliation_unknown"))
+check("reconciliation_ok=None on the CURRENT period -> UNVERIFIED (not PROVISIONAL)",
+      st(D(2026, 12, 2), now - dt.timedelta(hours=2), open_=True, complete=False, recon=None)[0] == "UNVERIFIED")
+check("source_complete=None (unknown) on a closed period past the window -> UNVERIFIED, never FINAL",
+      st(D(2026, 10, 7), dt.datetime(2026, 11, 20, 7, 5, tzinfo=CHI), complete=None)[:2] == ("UNVERIFIED", "source_status_unknown"))
+check("source_complete=None on a closed period inside the window -> UNVERIFIED, not PROVISIONAL",
+      st(D(2026, 11, 4), now - dt.timedelta(hours=2), complete=None)[0] == "UNVERIFIED")
+check("an open period's PARTIAL source is EXPECTED -> PROVISIONAL (distinguished from an unverified closed period)",
+      st(D(2026, 12, 2), now - dt.timedelta(hours=2), open_=True, complete=False)[0] == "PROVISIONAL"
+      and st(D(2026, 11, 4), now - dt.timedelta(hours=2), complete=False)[0] == "UNVERIFIED")
+check("an open period with unknown source status is still PROVISIONAL (completeness not expected yet)",
+      st(D(2026, 12, 2), now - dt.timedelta(hours=2), open_=True, complete=None)[0] == "PROVISIONAL")
+check("FINAL requires BOTH confirmed reconciliation and a COMPLETE source",
+      st(D(2026, 10, 7), dt.datetime(2026, 11, 20, 7, 5, tzinfo=CHI), complete=True, recon=True)[0] == "FINAL")
+try:
+    st(D(2026, 10, 7), dt.datetime(2026, 11, 20, 7, 5)); naive = False
+except ValueError:
+    naive = True
+check("a naive load timestamp is refused, not guessed", naive)
+
 check("boundary: the last DAILY pull (on the window's last day, 11-18) makes the period FINAL",
       st(D(2026, 10, 7), dt.datetime(2026, 11, 18, 7, 5, tzinfo=CHI))[0] == "FINAL")
 check("boundary: a load the day before the window ends is not final",
@@ -102,8 +130,40 @@ try:
 except L.ReconciliationError as e:
     refused = "refusing to delete 3000 of 4279" in str(e)
 check("TRUNCATED response: 3,000 of 4,279 gone (70%) -> target FAILS (whole period rolled back)", refused)
-check("small tables: up to 50 rows may go even above 25% (5-row candidate table, 1 gone)",
-      L.deletion_decision("t", 5, 1, {"allow": True}) == "delete")
+check("P11 candidate table: 1 of 5 gone, 50 returned -> delete", L.deletion_decision("t", 5, 1, {"allow": True}, new_rows=50) == "delete")
+check("P11 account_period: 1 of 413 gone -> delete", L.deletion_decision("t", 413, 1, {"allow": True}, new_rows=774) == "delete")
+
+
+def refused(*a, **k):
+    try:
+        L.deletion_decision(*a, **k); return None
+    except L.ReconciliationError as e:
+        return str(e)
+
+
+check("EMPTY scope (0 rows before): nothing to delete -> no-op", L.deletion_decision("t", 0, 0, {"allow": True}, new_rows=0) == "delete")
+check("TOTAL deletion of a SMALL table (50 of 50 gone, nothing returned) -> refused (was allowed by max(50,25%))",
+      "EMPTY" in (refused("t", 50, 50, {"allow": True}, new_rows=0) or ""))
+check("TOTAL deletion of a 5-row table -> refused", "EMPTY" in (refused("t", 5, 5, {"allow": True}, new_rows=0) or ""))
+check("single-row scope emptied -> refused", "EMPTY" in (refused("t", 1, 1, {"allow": True}, new_rows=0) or ""))
+check("NEAR-TOTAL: 5 of 6 gone (83%) -> refused even though 5 <= the 5-row floor",
+      "near-total" in (refused("t", 6, 5, {"allow": True}, new_rows=6) or ""))
+check("NEAR-TOTAL: every row re-keyed (5 of 5 gone, 5 new) -> refused", "near-total" in (refused("t", 5, 5, {"allow": True}, new_rows=5) or ""))
+check("small legitimate change: 1 of 2 gone (50%) -> delete", L.deletion_decision("t", 2, 1, {"allow": True}, new_rows=2) == "delete")
+check("single row re-keyed (1 gone, 1 new) -> delete", L.deletion_decision("t", 1, 1, {"allow": True}, new_rows=1) == "delete")
+check("LARGE scope over the 25% bound (1,100 of 4,279) -> refused",
+      "exceeds the bound" in (refused("t", 4279, 1100, {"allow": True}, new_rows=3500) or ""))
+check("unknown returned count is treated as possibly empty (fail closed)",
+      "EMPTY" in (refused("t", 3, 3, {"allow": True}) or ""))
+check("INTENTIONAL removal of all rows: explicit --allow-mass-delete override on a COMPLETE source -> delete",
+      L.deletion_decision("t", 50, 50, {"allow": True, "override": True}, new_rows=0) == "delete")
+check("...the override never applies to a PARTIAL source (still deferred)",
+      L.deletion_decision("t", 50, 50, {"allow": False, "override": True}, new_rows=0) == "defer")
+try:
+    I.main(["--allow-mass-delete"]); cli = False
+except SystemExit as e:
+    cli = e.code == 2
+check("--allow-mass-delete without --period FY P is rejected by the CLI", cli)
 check("idempotent re-run: nothing gone -> no deletion work", L.deletion_decision("t", 100, 0, {"allow": False}) == "delete")
 check("moved line (now reported under another period): the transaction table key is the line id, so the "
       "other period's upsert MOVES it -- never a duplicate", L._TXN_PK == ["source_transaction_detail_id"])
@@ -149,7 +209,16 @@ try:
           pol["deletions_allowed"] is False and len(pol["deferred_deletions"]) == 4, pol)
     calls.clear()
     L.write_period(Conn(), 2, plan("COMPLETE"), {})
-    check("COMPLETE source -> deletions allowed (bounded)", all(d["allow"] for _, d in calls))
+    check("COMPLETE source -> deletions allowed (bounded), no override by default",
+          all(d["allow"] and not d["override"] for _, d in calls))
+    calls.clear()
+    L.write_period(Conn(), 3, plan("COMPLETE"), {}, allow_mass_delete=True)
+    pol = json.loads(finished["reconciliation"])["deletion_policy"]
+    check("explicit override is passed to every table and recorded in the run",
+          all(d["override"] for _, d in calls) and pol["mass_delete_override"] is True and pol["bound"]["never_empty_a_scope"])
+    calls.clear()
+    L.write_period(Conn(), 4, plan("PARTIAL"), {}, allow_mass_delete=True)
+    check("override requested on a PARTIAL source is NOT granted", all(not d["override"] and not d["allow"] for _, d in calls))
 finally:
     L._replace, L._finish = orig
 
@@ -226,6 +295,91 @@ check("the result note puts STALE / PROVISIONAL next to the rows, with the last 
       note and "FY2026 P10 figures are STALE -- last loaded 2026-10-16" in note and "P12 figures are PROVISIONAL" in note, note)
 check("no note when every period in scope is FINAL and nothing else applies",
       C.r365_fin_freshness_note({"periods_in_scope": [f["periods_in_scope"][2]]}) is None)
+
+print("7. AI Chat / MCP and the monitor agree on the same period")
+
+
+class Cov:
+    """Fake cursor for chat_sql._r365_fin_block: calendar, coverage, no-posting."""
+    def __init__(self, cov, cal):
+        self.cov, self.cal, self._r = cov, cal, []
+    def execute(self, sql, params=None):
+        self._r = self.cov if "v_r365_financial_coverage_llm" in sql else (
+            self.cal if "v_ayg_business_periods_llm" in sql else [])
+    def fetchall(self):
+        return [dict(r) for r in self._r]
+
+
+UTC = dt.timezone.utc
+good = dt.datetime(2026, 11, 25, 13, 0, tzinfo=UTC)
+cov = [{"fiscal_year": 2026, "period_number": 12, "period_label": "P12", "period_start": D(2026, 11, 5),
+        "period_end": D(2026, 12, 2), "period_status": "CURRENT", "analytics_category": "ELECTRICITY",
+        "source_data_status": "PARTIAL", "expected_store_count": 12, "stores_with_posting": 3,
+        "stores_without_posting": 9, "source_last_sync_at": good, "source_sync_stale": False,
+        "latest_refresh_failed": True, "loaded_at": good, "reconciliation_ok": True}]
+cal = [{"fiscal_year": 2026, "period_number": 12, "period_label": "P12", "start_date": D(2026, 11, 5), "end_date": D(2026, 12, 2)}]
+at = dt.datetime(2026, 11, 25, 16, 0, tzinfo=CHI)
+blk = C._r365_fin_block(Cov(cov, cal), None, "2026-11-05", "2026-12-03", now=at)
+chat_state = blk["periods_in_scope"][0]["refresh_state"]
+from monitoring import config as mcfg, engine  # noqa: E402
+from monitoring.checks import r365 as MR  # noqa: E402
+from monitoring.store import Store  # noqa: E402
+
+
+class MCur:
+    def __init__(self, routes): self.routes, self._r = routes, []
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, sql, params=None):
+        for k, v in self.routes:
+            if k in sql:
+                self._r = [dict(x) for x in v]; return
+        raise AssertionError(sql[:60])
+    def fetchall(self): return self._r
+
+
+class MPG:
+    def __init__(self, routes): self.routes = routes
+    def cursor(self, cursor_factory=None): return MCur(self.routes)
+    def rollback(self): pass
+    def close(self): pass
+
+
+okrun = {"requested_fiscal_year": 2026, "requested_period_number": 12, "id": 70, "status": "PARTIAL",
+         "completed_at": good, "reconciliation_ok": True, "source_sync_stale": False, "source_last_sync_at": good,
+         "error_code": None, "trigger": "scheduled", "rows_changed": 0, "rows_deleted": 0,
+         "transaction_rows_changed": 0, "transaction_rows_deleted": 0}
+failrun = {"requested_fiscal_year": 2026, "requested_period_number": 12, "id": 71, "status": "FAILED",
+           "error_code": "HTTP_503", "started_at": at}
+cfg = mcfg._merge(mcfg.DEFAULTS, {"monitor": {"state_db": ":memory:"}})
+ctx = engine.Context(cfg, Store(":memory:"), at, "data",
+                     pg_connect=lambda: MPG([("FROM ayg_business_periods", [{"fiscal_year": 2026, "period_number": 12,
+                                              "period_label": "P12", "start_date": D(2026, 11, 5), "end_date": D(2026, 12, 2)}]),
+                                             ("r365_fin_last_attempt", [failrun]),
+                                             ("r365_fin_scheduled", [{"last_started": at, "last_ok": good, "failed_36h": 1}]),
+                                             ("FROM r365_financial_ingest_run", [okrun])]),
+                     systemctl=lambda u: {"LoadState": "loaded", "UnitFileState": "enabled", "ActiveState": "active"})
+mon = {r.check: r for r in MR.financial(ctx) if r.qualifier in ("FY2026 P12", "r365-financial-ingest.timer")}
+check("FAILED refresh of the CURRENT period: AI Chat/MCP gate says UNVERIFIED", chat_state == "UNVERIFIED", blk["periods_in_scope"][0])
+check("...the monitor says refresh_failed (same shared rule, same state)",
+      mon["period_coverage"].category == "refresh_failed" and mon["period_coverage"].evidence["refresh_state"] == "UNVERIFIED")
+check("...and the scheduled-ingest check reports the failed target", mon["scheduled_ingest"].category == "scheduled_run_failed")
+gfails, gwarns = C._r365_fin_gate(blk)
+check("...the gate warns once (failed-refresh warning, no duplicate UNVERIFIED line)",
+      sum("refresh failed" in w for w in gwarns) == 1 and not any("is UNVERIFIED" in w for w in gwarns), gwarns)
+
+closed = [{**cov[0], "period_number": 11, "period_label": "P11", "period_start": D(2026, 10, 8), "period_end": D(2026, 11, 4),
+           "period_status": "CLOSED", "latest_refresh_failed": False, "source_data_status": None}]
+cal11 = [{"fiscal_year": 2026, "period_number": 11, "period_label": "P11", "start_date": D(2026, 10, 8), "end_date": D(2026, 11, 4)}]
+b = C._r365_fin_block(Cov(closed, cal11), None, "2026-10-08", "2026-11-05", now=at)["periods_in_scope"][0]
+check("AI Chat: closed period with UNKNOWN source status -> UNVERIFIED (not PROVISIONAL/FINAL)",
+      b["refresh_state"] == "UNVERIFIED" and "unknown" in b["refresh_state_reason"], b)
+closed[0].update(source_data_status="COMPLETE", reconciliation_ok=None)
+b = C._r365_fin_block(Cov(closed, cal11), None, "2026-10-08", "2026-11-05", now=at)["periods_in_scope"][0]
+check("AI Chat: UNKNOWN reconciliation -> UNVERIFIED", b["refresh_state"] == "UNVERIFIED", b)
+closed[0].update(reconciliation_ok=True)
+b = C._r365_fin_block(Cov(closed, cal11), None, "2026-10-08", "2026-11-05", now=at)["periods_in_scope"][0]
+check("AI Chat: confirmed reconciliation + COMPLETE inside the window -> PROVISIONAL", b["refresh_state"] == "PROVISIONAL", b)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

@@ -169,18 +169,6 @@ WHERE trigger = 'scheduled'
 """
 
 
-def _timer_state(ctx, unit: str) -> dict:
-    """Is the scheduled financial ingest actually installed and enabled? Never raises."""
-    try:
-        st = ctx.systemctl(unit) or {}
-    except Exception as e:  # noqa: BLE001
-        return {"unit": unit, "installed": None, "error": type(e).__name__}
-    loaded = st.get("LoadState") == "loaded"
-    return {"unit": unit, "installed": loaded,
-            "enabled": loaded and st.get("UnitFileState") in ("enabled", "enabled-runtime"),
-            "active": st.get("ActiveState") == "active"}
-
-
 CHECK_SCHEDULE = "scheduled_ingest"
 SCHEDULE_MAX_GAP = timedelta(hours=36)    # daily 07:00 Chicago run; one slip tolerated
 
@@ -191,9 +179,13 @@ except ImportError:                               # pragma: no cover - run outsi
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     import r365_financial_freshness as FR          # noqa: E402
 
-_COVERAGE = {   # refresh-state code -> (category, severity, title); None = not an incident
+_COVERAGE = {   # refresh-state code -> (category, severity, title); severity None = decided by grace
     "never_loaded": ("missing_ingestion", None, "R365 financial period never loaded"),
     "not_reconciled": ("reconciliation_failed", HIGH, "R365 financial period did not reconcile"),
+    "reconciliation_unknown": ("reconciliation_unknown", HIGH,
+                               "R365 financial load has no confirmed reconciliation result"),
+    "source_status_unknown": ("source_status_unknown", WARNING,
+                              "R365 source status unknown for this closed period"),
     "refresh_failed": ("refresh_failed", WARNING,
                        "Latest R365 financial refresh failed; figures are from an earlier load"),
     "loaded_before_close": ("stale_after_close", WARNING,

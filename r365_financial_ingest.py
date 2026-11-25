@@ -291,7 +291,7 @@ def ingest_accounts(conn, src, batch_id, trigger, dry_run, log):
 
 
 def ingest_period(conn, src, fy, pn, calendar, verified_categories, batch_id, trigger,
-                  dry_run, log):
+                  dry_run, log, allow_mass_delete=False):
     label = f"FY{fy}-P{pn}"
     cal = calendar[(fy, pn)]
 
@@ -326,7 +326,7 @@ def ingest_period(conn, src, fy, pn, calendar, verified_categories, batch_id, tr
 
     def work(fetch):
         plan = fetch_and_plan(fetch, run_id)
-        c = L.write_period(conn, run_id, plan, fetch)
+        c = L.write_period(conn, run_id, plan, fetch, allow_mass_delete=allow_mass_delete)
         return plan["status"], (
             f"{cal[0]}..{cal[1]} expense={c['expense'][0]} (changed {c['expense'][1]}, "
             f"deleted {c['expense'][2]}) no_activity={plan['no_activity_rows']} "
@@ -391,7 +391,12 @@ def main(argv=None):
     g.add_argument("--period", nargs=2, type=int, metavar=("FISCAL_YEAR", "PERIOD"))
     g.add_argument("--backfill", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-mass-delete", action="store_true",
+                    help="with --period only: permit a verified intentional removal that the "
+                         "deletion safety bounds would refuse (recorded in the run)")
     args = ap.parse_args(argv)
+    if args.allow_mass_delete and not args.period:
+        ap.error("--allow-mass-delete requires --period FY P (one explicitly named period)")
 
     os.makedirs(os.path.dirname(LOCK_PATH), mode=0o700, exist_ok=True)
     lock = open(LOCK_PATH, "w")
@@ -444,7 +449,8 @@ def main(argv=None):
                                           args.dry_run, print))
         for fy, pn in periods:
             st = ingest_period(conn, src, fy, pn, calendar, cats, batch_id, trigger,
-                               args.dry_run, print)
+                               args.dry_run, print,
+                               allow_mass_delete=bool(args.allow_mass_delete))
             if st == L.STATUS_PARTIAL and calendar[(fy, pn)][1] >= today:
                 st = STATUS_OPEN          # an open period is expected to be partial
             results.append(st)

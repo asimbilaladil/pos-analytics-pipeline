@@ -65,11 +65,25 @@ and deletions are counted in the run row.
   COMPLETE**.
 - On a PARTIAL response the write is upsert-only, and the deferred deletions are recorded in
   the run's `reconciliation.deletion_policy`.
-- Even on a COMPLETE response, deleting more than `max(50, 25%)` of a table's rows for the
-  period **fails the target** and rolls back the whole period. That stops a truncated but
-  self-consistent response from ever wiping a period. P11 on 2026-11-25 would delete 449 of
-  4,279 lines (10.5%), within the bound.
-- The limits are set by `R365_FIN_DELETION_MAX_FRACTION` and `R365_FIN_DELETION_MIN_ROWS`.
+- Even on a COMPLETE response, a refresh **fails the target** and rolls back the whole period
+  when, for any table's rows in the period, it would:
+  - **empty the scope**: every existing row gone and nothing returned (any size, even 1 row);
+  - delete a **near-total** share: more than 80% of a scope of 2+ rows, even if replacements
+    were returned (a wholesale re-key is suspicious);
+  - delete more than `max(5, 25%)` of the scope.
+- An empty scope (no rows yet) has nothing to delete and loads normally.
+- That stops a truncated but self-consistent response from wiping a period, including a small
+  one (the earlier `max(50, 25%)` let a table of 50 rows or fewer be emptied).
+- The known P11 changes pass unchanged: 449 of 4,279 transaction lines (10.5%), 1 of 5
+  candidate rows, 1 of 413 account_period rows.
+- **Intentional mass deletion** (for example the source really removed a whole period):
+  re-run that one period with `r365_financial_ingest.py --period FY P --allow-mass-delete`,
+  after checking the dry run. The flag requires `--period`, never applies to the scheduled
+  run, and is **ignored on a PARTIAL source** (deletions stay deferred). Every other check
+  (schema, reconciliation, mapping, duplicates) still applies, and the run records
+  `deletion_policy.mass_delete_override=true`.
+- The limits are set by `R365_FIN_DELETION_MAX_FRACTION` (0.25), `R365_FIN_DELETION_MIN_ROWS`
+  (5) and `R365_FIN_DELETION_NEAR_TOTAL` (0.8).
 - Lines moved to another period are not duplicated: the transaction key is the source line ID,
   and the other period's upsert moves the row.
 
@@ -80,7 +94,13 @@ and deletions are counted in the run row.
 | FINAL | closed, with a COMPLETE, reconciled load on or after the 42-day correction window's last day | nothing extra |
 | PROVISIONAL | the current period refreshed within 30 h, or a closed period inside its window refreshed within 30 h | "label the figures provisional; they can still change" |
 | STALE | loaded before close; the window refresh is overdue; never re-pulled after the window; or the current period's last load is older than 30 h | "NOT current; give the last load date; never present as final" |
-| UNVERIFIED | never loaded; not reconciled; latest refresh failed; or the source reports a closed period incomplete | "do not present as verified" |
+| UNVERIFIED | never loaded; reconciliation failed **or unknown**; the latest refresh failed (open **or** closed period); or a closed period's source is incomplete **or of unknown status** | "do not present as verified" |
+
+**Fail closed.** Nothing is FINAL or PROVISIONAL without `reconciliation_ok = true`, and a
+closed period is never FINAL or PROVISIONAL without a confirmed COMPLETE source. A failed
+latest refresh is checked before anything else, so a current period that loaded fine earlier
+shows the failure, not PROVISIONAL. A PARTIAL source is expected for the **current** period
+and is not a defect; for a **closed** period it is UNVERIFIED.
 
 **AI Chat and MCP:**
 - `chat_sql._r365_fin_block` adds `refresh_state`, `refresh_state_reason` and `loaded_at` to
@@ -95,7 +115,7 @@ and deletions are counted in the run row.
 | Result | Detects |
 |---|---|
 | `scheduled_ingest` | timer missing or disabled (`scheduled_ingest_missing`), inactive, no successful scheduled run in 36 h (`scheduled_run_missed`), failed targets in 36 h (`scheduled_run_failed`) |
-| `period_coverage` | the shared rule, per period: `missing_ingestion`, `stale_after_close`, `refresh_overdue`, `not_refreshed_after_repair_window`, `current_period_stale`, `refresh_failed`, `source_incomplete`, `reconciliation_failed`, `source_changed_final_period` (a scheduled refresh changed rows of a FINAL period). PROVISIONAL and FINAL are OK, so an incident resolves once the sync catches up. |
+| `period_coverage` | the shared rule, per period: `missing_ingestion`, `stale_after_close`, `refresh_overdue`, `not_refreshed_after_repair_window`, `current_period_stale`, `refresh_failed`, `source_incomplete`, `source_status_unknown`, `reconciliation_failed`, `reconciliation_unknown` (HIGH), `source_changed_final_period` (a scheduled refresh changed rows of a FINAL period). PROVISIONAL and FINAL are OK, so an incident resolves once the sync catches up. |
 | `period_source_sync` | the **source server's** own freshness flag, kept separate from our latest local load. Evidence carries `source_freshness` and `last_load` separately. |
 
 Expected incidents on today's data once deployed:
