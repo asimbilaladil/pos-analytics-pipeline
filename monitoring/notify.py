@@ -18,6 +18,7 @@ import os
 import smtplib
 import ssl
 import urllib.request
+from datetime import timedelta
 from email.message import EmailMessage
 
 from .model import SOURCE_LABELS
@@ -120,6 +121,8 @@ class TelegramChannel(Channel):
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
+                if r.status != 200:
+                    raise DeliveryError(f"telegram HTTP {r.status}")
                 payload = json.loads(r.read() or b"{}")
                 if not payload.get("ok", False):
                     raise DeliveryError(f"telegram rejected message: "
@@ -149,7 +152,12 @@ class EmailChannel(Channel):
                     s.starttls(context=ssl.create_default_context())
                 if user:
                     s.login(user, pw or "")
-                s.send_message(msg)
+                refused = s.send_message(msg)
+            if refused:
+                raise DeliveryError(f"SMTP refused {len(refused)} of {len(e['to_addrs'])} "
+                                    f"recipient(s)")
+        except DeliveryError:
+            raise
         except Exception as ex:  # noqa: BLE001
             raise DeliveryError(scrub(f"{type(ex).__name__}: {ex}", pw)) from None
 
@@ -170,36 +178,68 @@ def subject_for(body: str) -> str:
     return f"{first}: {issue}"[:150] if issue else first
 
 
+def backoff_seconds(cfg: dict, attempts_done: int) -> int:
+    """Delay before attempt attempts_done+1: base * 2^(n-1), capped (60s, 2m, 4m, ... 1h)."""
+    n = cfg["notify"]
+    return int(min(n["retry_base_seconds"] * 2 ** max(0, attempts_done - 1), n["retry_max_seconds"]))
+
+
 def deliver_pending(store, cfg: dict, now, channels: dict | None = None) -> dict:
-    """Send every PENDING outbox row. Returns counts. Never raises."""
+    """Attempt every DUE outbox row once. Returns counts. Never raises.
+
+    Rows are leased first (Store.claim_due), so a concurrent run, the summary
+    unit or crash-notify never send the same row twice. Each attempt's outcome
+    is written only while this process still holds the lease:
+      success              -> SENT (or DRY_RUN: dry-run / log channel, no send() call)
+      failure, attempts left -> RETRYING, next_attempt_at = now + backoff
+      failure, exhausted   -> FAILED (permanent; monitor.notification_delivery reports it)
+      unknown channel      -> FAILED at once (a config error is not transient)
+    """
+    import secrets as _secrets
     channels = channels or {name: cls(cfg) for name, cls in CHANNELS.items()}
     dry = bool(cfg["notify"]["dry_run"])
     max_attempts = int(cfg["notify"]["max_attempts"])
-    stats = {"sent": 0, "dry_run": 0, "failed": 0, "retrying": 0}
-    for n in store.pending_notifications(max_attempts):
+    stats = {"sent": 0, "dry_run": 0, "failed": 0, "retrying": 0, "lost_lease": 0, "errors": []}
+    token = _secrets.token_hex(8)
+    try:
+        due = store.claim_due(now, token, int(cfg["notify"]["lease_seconds"]))
+    except Exception as e:  # noqa: BLE001 -- e.g. the store is locked: retried next run
+        log.error("could not claim notifications: %s", e)
+        stats["failed"] += 1
+        stats["errors"].append(f"claim: {type(e).__name__}")
+        return stats
+
+    def done(n, status, error=None, next_at=None):
+        if not store.complete_delivery(n["id"], token, status, now, error, next_at):
+            stats["lost_lease"] += 1
+            log.error("notification %s: lease lost before recording %s", n["id"], status)
+            return
+        key = {"SENT": "sent", "DRY_RUN": "dry_run", "RETRYING": "retrying",
+               "FAILED": "failed"}[status]
+        stats[key] += 1
+
+    for n in due:
         ch = channels.get(n["channel"])
         subject = subject_for(n["body"])
         if ch is None:
-            store.mark_notification(n["id"], "FAILED", now, f"unknown channel {n['channel']}")
-            stats["failed"] += 1
+            done(n, "FAILED", f"unknown channel {n['channel']}")
             continue
         if dry or n["channel"] == "log":
             log.warning("[notification:%s DRY-RUN] %s\n%s", n["channel"], subject, n["body"])
-            store.mark_notification(n["id"], "DRY_RUN", now)
-            stats["dry_run"] += 1
+            done(n, "DRY_RUN")
             continue
         try:
             ch.send(n["body"], subject)
         except Exception as e:  # noqa: BLE001
-            err = str(e)[:300]
+            err = str(e)[:300] or type(e).__name__
+            stats["errors"].append(f"{n['channel']}: {err[:120]}")
+            log.error("notification %s via %s failed (attempt %s/%s): %s", n["id"], n["channel"],
+                      n["attempts"] + 1, max_attempts, err)
             if n["attempts"] + 1 >= max_attempts:
-                store.mark_notification(n["id"], "FAILED", now, err)
-                stats["failed"] += 1
+                done(n, "FAILED", err)
             else:
-                store.bump_attempt(n["id"], err)
-                stats["retrying"] += 1
-            log.error("notification %s via %s failed: %s", n["id"], n["channel"], err)
+                done(n, "RETRYING", err,
+                     now + timedelta(seconds=backoff_seconds(cfg, n["attempts"] + 1)))
             continue
-        store.mark_notification(n["id"], "SENT", now)
-        stats["sent"] += 1
+        done(n, "SENT")
     return stats

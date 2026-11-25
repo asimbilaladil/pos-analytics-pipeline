@@ -17,4 +17,4 @@ Layout:
   cli.py        ``python -m monitoring run --tier ...`` and admin commands
 """
 
-VERSION = "laynes_monitor/1.0.0"
+VERSION = "laynes_monitor/1.1.0"

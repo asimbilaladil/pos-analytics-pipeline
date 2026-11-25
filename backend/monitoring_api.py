@@ -2,8 +2,18 @@
 
 Reads the data monitor's own SQLite store (monitoring/store.py). It never
 queries the production business database, so opening the dashboard costs the
-database nothing. The only write is an acknowledgement, which changes the
-monitor's incident record -- never business data.
+database nothing.
+
+Storage access is split:
+  * every GET opens the store with SQLite mode=ro (Store.open_readonly): no
+    schema creation, no migration, no PRAGMA writes -- a read cannot change it;
+  * the acknowledgement opens it read-write WITHOUT schema rights
+    (Store.open_for_ack) and runs exactly one statement family:
+    Store.acknowledge (UPDATE incidents ... WHERE status='OPEN' + one
+    incident_events row). Everything else in the store is written only by the
+    monitor process.
+  * a missing, locked, corrupt or wrong-version store is a 503 with a fixed
+    message, never a partial or empty "all clear".
 
 Every route depends on current_user (401 without a session) and then requires
 role super_admin (403 otherwise). Responses carry no credentials, customer data
@@ -28,18 +38,38 @@ def monitoring_admin(user=Depends(current_user)):
 router = APIRouter(prefix="/api/admin/monitoring", dependencies=[Depends(monitoring_admin)])
 
 
-def _store():
+def _cfg():
     from monitoring import config as mcfg
-    from monitoring.store import Store
     try:
-        cfg = mcfg.load()
+        return mcfg.load()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"Monitor config invalid: {type(e).__name__}")
-    path = cfg["monitor"]["state_db"]
+
+
+def _open(write: bool = False):
+    from monitoring.store import Store
+    path = _cfg()["monitor"]["state_db"]
     if not os.path.exists(path):
         raise HTTPException(status_code=503,
                             detail="The data monitor has not run yet (no incident store).")
-    return Store(path)
+    try:
+        return Store.open_for_ack(path) if write else Store.open_readonly(path)
+    except Exception as e:  # noqa: BLE001 -- permissions, schema version, corruption
+        raise HTTPException(status_code=503,
+                            detail=f"Monitor store unavailable ({type(e).__name__}).")
+
+
+def _read(fn):
+    """Run a read against the store; storage faults are 503, never a blank page."""
+    import sqlite3
+    s = _open()
+    try:
+        return fn(s)
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=503,
+                            detail=f"Monitor store unavailable ({type(e).__name__}).")
+    finally:
+        s.close()
 
 
 class AckIn(BaseModel):
@@ -50,11 +80,8 @@ class AckIn(BaseModel):
 def overview():
     from monitoring.clock import utcnow
     from monitoring.summary import overview as build
-    s = _store()
-    try:
-        return build(s, utcnow())
-    finally:
-        s.close()
+    cfg = _cfg()
+    return _read(lambda s: build(s, utcnow(), cfg))
 
 
 @router.get("/incidents")
@@ -62,34 +89,34 @@ def incidents(status: str | None = None, source: str | None = None, limit: int =
     from monitoring.store import row_dict
     if status and status not in ("OPEN", "ACKNOWLEDGED", "RESOLVED"):
         raise HTTPException(status_code=422, detail="bad status")
-    s = _store()
-    try:
-        return [row_dict(r) for r in s.history(min(max(limit, 1), 1000), status, source)]
-    finally:
-        s.close()
+    return _read(lambda s: [row_dict(r) for r in s.history(min(max(limit, 1), 1000), status,
+                                                          source)])
 
 
 @router.get("/incidents/{incident_id}")
 def incident(incident_id: str):
     from monitoring.store import row_dict
-    s = _store()
-    try:
+    def get(s):
         row = s.get(incident_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Incident not found")
         return {"incident": row_dict(row), "events": [row_dict(e) for e in s.events(incident_id)]}
-    finally:
-        s.close()
+    return _read(get)
 
 
 @router.post("/incidents/{incident_id}/ack")
 def acknowledge(incident_id: str, body: AckIn, user=Depends(monitoring_admin)):
+    import sqlite3
     from monitoring.clock import utcnow
-    s = _store()
+    s = _open(write=True)
     try:
         s.begin()
         ok = s.acknowledge(incident_id, utcnow(), user["email"], body.note)
         s.commit()
+    except sqlite3.Error as e:
+        s.rollback()
+        raise HTTPException(status_code=503,
+                            detail=f"Monitor store unavailable ({type(e).__name__}).")
     except Exception:
         s.rollback()
         raise
@@ -104,8 +131,4 @@ def acknowledge(incident_id: str, body: AckIn, user=Depends(monitoring_admin)):
 @router.get("/notifications")
 def notifications(limit: int = 50):
     from monitoring.store import row_dict
-    s = _store()
-    try:
-        return [row_dict(r) for r in s.notifications(min(max(limit, 1), 500))]
-    finally:
-        s.close()
+    return _read(lambda s: [row_dict(r) for r in s.notifications(min(max(limit, 1), 500))])

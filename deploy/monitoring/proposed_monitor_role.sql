@@ -5,6 +5,10 @@
 -- analytics views the checks use -- nothing else, and nothing writable.
 -- The monitor additionally forces default_transaction_read_only=on and checks it.
 --
+-- Every relation below is one a check (or chat_sql.revel_store_breakdown) reads;
+-- tests/test_monitoring_isolated_db.py applies THIS grant list verbatim and runs
+-- the whole data tier on it, so a missing grant fails the test.
+--
 -- Apply (approval required):   psql -v ON_ERROR_STOP=1 -v pw="'<generated>'" -f proposed_monitor_role.sql
 -- Roll back:                    DROP OWNED BY laynes_monitor; DROP ROLE laynes_monitor;
 
@@ -22,14 +26,20 @@ GRANT USAGE ON SCHEMA public TO laynes_monitor;
 GRANT SELECT ON
     -- reference
     establishments, ayg_business_periods,
-    -- Revel
+    -- Revel: sync status and the open-ticket explanation
     sync_state, v_orders_classified, v_order_payment_summary,
+    -- Revel: what chat_sql.revel_store_breakdown reads (_STORE_BREAKDOWN_SQL,
+    -- _STORE_LINKED_PAYMENTS_SQL). The monitor runs that function on THIS role
+    -- (checks/revel.py monitor_connection). The views run with their owner's
+    -- rights (no security_invoker; verified 2026-11-25), so SELECT on the view
+    -- is sufficient and no base-table grant is needed for them.
+    orders_v2, v_payments_daily_v2, v_labor_daily_context,
     -- HME
-    hme_ingest_run, hme_store_ingest_result, hme_store_mapping, hme_goal_conflict,
-    v_hme_store_day_trust_llm, v_hme_day_completeness_llm,
+    hme_ingest_run, hme_store_ingest_result, hme_store_mapping,
+    v_hme_store_day_trust_llm,
     -- R365
     r365_ingest_run, r365_store_daily, r365_store_mapping, v_r365_completeness_llm,
-    r365_financial_ingest_run, v_r365_financial_coverage_llm
+    r365_financial_ingest_run
 TO laynes_monitor;
 -- AI Chat: COLUMN-level grants only. The monitor can read job status and error
 -- classes, never the question/answer text or conversations.

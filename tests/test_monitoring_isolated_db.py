@@ -107,18 +107,29 @@ CREATE TABLE r365_financial_ingest_run (id bigint, requested_fiscal_year int,
     requested_period_number int, target_kind text, status text, completed_at timestamptz,
     reconciliation_ok bool, source_sync_stale bool, source_last_sync_at timestamptz, error_code text);
 CREATE TABLE chat_jobs (id bigint, status text, error_code text, created_at timestamptz,
-                        question text);
+                        started_at timestamptz, completed_at timestamptz, question text);
 CREATE TABLE chat_query_log (id bigint, asked_at timestamptz, error text, steps jsonb, question text);
 """
 cur.execute(DDL)
 ro, mon = os.environ["DB_RO_USER"], os.environ["MONITOR_DB_USER"]
-for role in {ro, mon}:
-    cur.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
-    cur.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}")
-cur.execute(f"REVOKE SELECT ON chat_jobs, chat_query_log FROM {mon}")
-cur.execute(f"GRANT SELECT (id, status, error_code, created_at) ON chat_jobs TO {mon}")
-cur.execute(f"GRANT SELECT (id, asked_at, error, steps) ON chat_query_log TO {mon}")
-
+cur.execute(f"GRANT USAGE ON SCHEMA public TO {ro}")
+cur.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {ro}")
+# The monitor role gets EXACTLY the proposed grants and role settings, parsed from
+# deploy/monitoring/proposed_monitor_role.sql -- so a relation a check (or
+# chat_sql.revel_store_breakdown) reads without a grant fails this test.
+ROLE_SQL = open(os.path.join(ROOT, "deploy", "monitoring", "proposed_monitor_role.sql")).read()
+role_stmts = []
+for stmt in "\n".join(l.split("--", 1)[0] for l in ROLE_SQL.splitlines()).split(";"):
+    stmt = " ".join(stmt.split())
+    if stmt.startswith(("GRANT SELECT", "GRANT USAGE", "ALTER ROLE")):
+        role_stmts.append(stmt.replace("laynes_monitor", mon))
+for stmt in role_stmts:
+    cur.execute(stmt)
+cur.execute(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC")
+cur.execute("SELECT table_name FROM information_schema.role_table_grants WHERE grantee = %s "
+            "UNION SELECT table_name FROM information_schema.column_privileges WHERE grantee = %s",
+            (mon, mon))
+GRANTED = {r[0] for r in cur.fetchall()}
 STORES = [(6, "LCF Katy"), (7, "LCF Ella"), (14, "LCF Beaumont"), (15, "LCF Shepherd"),
           (20, "LCF Pasadena"), (25, "LCF Mission Bend"), (26, "LCF Nederland"),
           (32, "LCF Airtex"), (36, "LCF Missouri City"), (40, "LCF Rosenberg"),
@@ -221,7 +232,7 @@ cur.execute("INSERT INTO ayg_business_periods VALUES (2026,12,'P12',%s,%s),(2026
 cur.execute("INSERT INTO r365_financial_ingest_run VALUES (1,2026,11,'PERIOD','PARTIAL',%s,true,false,NULL,NULL)",
             (datetime.combine(ps - timedelta(days=10), datetime.min.time(), tzinfo=timezone.utc),))
 
-cur.execute("INSERT INTO chat_jobs VALUES (1,'completed',NULL,now(),'SECRET QUESTION TEXT')")
+cur.execute("INSERT INTO chat_jobs VALUES (1,'completed',NULL,now(),now(),now(),'SECRET QUESTION TEXT')")
 cur.execute("INSERT INTO chat_query_log VALUES (1, now(), NULL, '[{\"error\": \"did not pass the hme trust gate\"}]',"
             " 'SECRET QUESTION TEXT')")
 
@@ -258,12 +269,42 @@ except psycopg2.Error:
 c.close()
 check("with the proposed grants the monitor cannot read chat question text", not leaked)
 
+check("proposed role statements applied verbatim (GRANT + ALTER ROLE)",
+      len(role_stmts) >= 5 and any(x.startswith("ALTER ROLE") for x in role_stmts), role_stmts)
+check("monitor role holds only the proposed table grants (no question/answer columns)",
+      "chat_jobs" in GRANTED and "orders_v2" in GRANTED and "v_payments_daily_v2" in GRANTED, GRANTED)
+
 # ── 2. Revel through the REAL chat_sql ──────────────────────────────────────
 print("2. Revel reconciliation via chat_sql.revel_store_breakdown")
 from monitoring.checks import revel  # noqa: E402
+# The analytics-role credentials are NOT needed: chat_sql runs on monitor sessions.
+saved_ro = {k: os.environ.pop(k) for k in ("DB_RO_USER", "DB_RO_PASS") if k in os.environ}
 ctx = engine.Context(cfg, Store(":memory:"), NOW, "data")
+sessions = []
+_orig_mpc = ctx.monitor_pg_connect
+
+
+def _recording_connect():
+    conn = _orig_mpc()
+    with conn.cursor() as k_:
+        k_.execute("SELECT current_user, current_setting('transaction_read_only'), "
+                   "current_setting('lock_timeout'), current_setting('application_name'), "
+                   "current_setting('idle_in_transaction_session_timeout')")
+        sessions.append(k_.fetchone())
+    conn.rollback()
+    return conn
+
+
+ctx.monitor_pg_connect = _recording_connect
 rv = {(r.check, r.store_id, r.business_date): r for r in revel.reconciliation(ctx)}
 ctx.close()
+check("chat_sql.revel_store_breakdown ran on monitor sessions only (role, read-only, bounded)",
+      sessions and all(x == (mon, "on", "2s", "laynes_monitor", "1min") for x in sessions), sessions)
+with owner.cursor() as k_:
+    k_.execute("SELECT count(*) FROM pg_stat_activity WHERE usename = %s", (mon,))
+    left = k_.fetchone()[0]
+check("every reconciliation connection was released", left == 0, left)
+os.environ.update(saved_ro)
 g = lambda est: rv[("sales_reconciliation", est, D.isoformat())]  # noqa: E731
 check("reconciled store -> OK", g(6).state == OK)
 check("delta exactly +0.50% -> OK (tolerance is inclusive, unchanged)", g(7).state == OK, g(7).difference)
@@ -284,7 +325,10 @@ ctxkw = dict(systemctl=fake_sys, http=lambda u, t: (200, None),
              newest_backup=lambda g: ("/b.dump", NOW - timedelta(hours=1)),
              cert_expiry=lambda h: NOW + timedelta(days=60))
 st = Store(":memory:")
-specs = [s for s in registry() if s.name not in ("mcp.tool_errors",)]
+# monitor.heartbeat is excluded: only the data tier runs here, so after the install
+# grace it would (correctly) report the never-run health tier -- covered by
+# tests/test_monitoring_remediation.py.
+specs = [s for s in registry() if s.name not in ("mcp.tool_errors", "monitor.heartbeat")]
 out = engine.run_tier(cfg, "data", store=st, now=NOW, specs=specs, ctx_kwargs=ctxkw)
 check("data tier completes with no crashed check", out["ok"] and not out["crashed"], out)
 act = {r["dedup_key"]: dict(r) for r in st.active_incidents()}
@@ -301,7 +345,13 @@ check("HME: all 11 mapped stores evaluated for each lookback day",
       sum(1 for key in lr if key.startswith("hme:store_day_trust:") and key.endswith(D.isoformat())) == 11)
 day1 = k("hme", "day_reconciliation", None, D1.isoformat())
 retry_done = NOW >= datetime.combine(TODAY, datetime.min.time(), tzinfo=CHICAGO).replace(hour=10, minute=45)
-if retry_done:
+morning_ready = NOW >= datetime.combine(TODAY, datetime.min.time(), tzinfo=CHICAGO).replace(hour=6, minute=30)
+if not morning_ready:
+    check("HME D-1 before 06:30 Chicago: no verdict yet (PENDING, no incident)",
+          day1 not in act and lr[day1]["state"] == "PENDING", lr.get(day1))
+    check("HME D-1 stores PENDING before 06:30, no incident",
+          all(k("hme", "store_day_trust", e, D1.isoformat()) not in act for e in (15, 36, 40)))
+elif retry_done:
     check("HME persistent goal mismatch after the retry -> HIGH",
           act[day1]["severity"] == HIGH and act[day1]["category"] == "goal_threshold_mismatch")
     check("HME unverified stores (Shepherd, Missouri City) and missing Rosenberg -> HIGH",

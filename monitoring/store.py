@@ -16,6 +16,20 @@ from datetime import datetime, timedelta, timezone
 OPEN, ACKNOWLEDGED, RESOLVED = "OPEN", "ACKNOWLEDGED", "RESOLVED"
 ACTIVE = (OPEN, ACKNOWLEDGED)
 
+RUN_SUCCESS, RUN_DEGRADED, RUN_FAILED, RUN_RUNNING = "SUCCESS", "DEGRADED", "FAILED", "RUNNING"
+N_QUEUED, N_RETRYING, N_SENT, N_DRY_RUN, N_FAILED = (
+    "QUEUED", "RETRYING", "SENT", "DRY_RUN", "FAILED")
+N_DUE = (N_QUEUED, N_RETRYING)
+
+# PRAGMA user_version of the schema below. Readers (the dashboard API) refuse a
+# store whose version they do not know instead of guessing at its columns.
+SCHEMA_VERSION = 2
+FILE_MODE, DIR_MODE = 0o640, 0o750
+
+
+class StoreSchemaError(RuntimeError):
+    pass
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS incidents (
     id               TEXT PRIMARY KEY,
@@ -94,9 +108,19 @@ CREATE TABLE IF NOT EXISTS monitor_runs (
     tier          TEXT NOT NULL,
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
+    -- RUNNING, then exactly one of:
+    --   SUCCESS  every due check ran, nothing crashed or was skipped, every
+    --            delivery attempted this run succeeded
+    --   DEGRADED the pass completed, but a check crashed, a check was skipped
+    --            (PostgreSQL unavailable) or a delivery failed
+    --   FAILED   the pass itself aborted
+    -- ok = 1 only for SUCCESS. The heartbeat counts only SUCCESS runs.
+    status        TEXT NOT NULL DEFAULT 'RUNNING'
+                  CHECK (status IN ('RUNNING','SUCCESS','DEGRADED','FAILED')),
     ok            INTEGER,
     checks_run    INTEGER,
     checks_failed INTEGER,
+    checks_skipped INTEGER,
     results       INTEGER,
     error         TEXT,
     version       TEXT
@@ -113,19 +137,24 @@ CREATE TABLE IF NOT EXISTS check_runs (
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at   TEXT NOT NULL,
-    kind         TEXT NOT NULL,     -- OPENED ESCALATED RESOLVED SUMMARY MONITOR
-    severity     TEXT,
-    incident_ids TEXT NOT NULL DEFAULT '[]',
-    channel      TEXT NOT NULL,
-    body         TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK (status IN ('PENDING','SENT','DRY_RUN','FAILED')),
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    last_error   TEXT,
-    sent_at      TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    kind            TEXT NOT NULL,     -- OPENED ESCALATED RESOLVED SUMMARY MONITOR TEST
+    severity        TEXT,
+    incident_ids    TEXT NOT NULL DEFAULT '[]',
+    channel         TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    -- QUEUED (never attempted) -> SENT | DRY_RUN | RETRYING -> ... -> SENT | FAILED
+    status          TEXT NOT NULL CHECK (status IN ('QUEUED','RETRYING','SENT','DRY_RUN','FAILED')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,              -- not eligible before this (exponential backoff)
+    last_attempt_at TEXT,
+    claim_token     TEXT,              -- a delivering process's lease ...
+    claimed_until   TEXT,              -- ... so two processes never send the same row
+    last_error      TEXT,
+    sent_at         TEXT
 );
-CREATE INDEX IF NOT EXISTS notifications_pending ON notifications(status, id);
+CREATE INDEX IF NOT EXISTS notifications_due ON notifications(status, next_attempt_at, id);
 """
 
 
@@ -138,22 +167,108 @@ def new_incident_id(now: datetime) -> str:
 
 
 class Store:
-    def __init__(self, path: str):
+    """The monitor's SQLite store.
+
+    Three ways to open it:
+      Store(path)                    the monitor itself: creates/migrates the
+                                     schema; the only writer of check state.
+      Store.open_readonly(path)      dashboard reads: SQLite mode=ro, no DDL,
+                                     no PRAGMA writes; any write raises.
+      Store.open_for_ack(path)       dashboard acknowledgement: read-write but
+                                     never creates or migrates anything; the API
+                                     only calls acknowledge() on it.
+    Files are 0640 in a 0750 directory: never world-readable. SQLite creates the
+    -wal / -shm files with the database file's mode.
+    """
+
+    def __init__(self, path: str, *, _mode: str = "owner"):
         self.path = path
-        if path != ":memory:":
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            fresh = not os.path.exists(path)
+        self.readonly = _mode == "ro"
+        if path == ":memory:":
+            self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        elif _mode == "owner":
+            d = os.path.dirname(path) or "."
+            if not os.path.isdir(d):
+                os.makedirs(d, mode=DIR_MODE, exist_ok=True)
+            if not os.path.exists(path):
+                # Create the file with its final mode before SQLite opens it, so
+                # there is no window in which it (or its -wal) is world-readable.
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, FILE_MODE))
+                os.chmod(path, FILE_MODE)
+            self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
         else:
-            fresh = False
-        self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            uri = f"file:{path}?mode={'ro' if self.readonly else 'rw'}"
+            self.db = sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout = 10000")
-        self.db.execute("PRAGMA foreign_keys = ON")
-        if path != ":memory:":
-            self.db.execute("PRAGMA journal_mode = WAL")
-            if fresh:
-                os.chmod(path, 0o640)
-        self.db.executescript(SCHEMA)
+        if _mode == "owner":
+            self.db.execute("PRAGMA foreign_keys = ON")
+            if path != ":memory:":
+                self.db.execute("PRAGMA journal_mode = WAL")
+            self._migrate()
+        else:
+            v = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if v != SCHEMA_VERSION:
+                self.db.close()
+                raise StoreSchemaError(f"monitor store schema v{v}, this code reads "
+                                       f"v{SCHEMA_VERSION}")
+
+    @classmethod
+    def open_readonly(cls, path: str) -> "Store":
+        return cls(path, _mode="ro")
+
+    @classmethod
+    def open_for_ack(cls, path: str) -> "Store":
+        return cls(path, _mode="ack")
+
+    def _migrate(self):
+        v = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if v == SCHEMA_VERSION:
+            return
+        has_tables = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'notifications'").fetchone()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if has_tables and v < 2:
+                self._migrate_v1_to_v2()
+            for stmt in _split_sql(SCHEMA):
+                self.db.execute(stmt)
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def _migrate_v1_to_v2(self):
+        """Phase-1 smoke stores (v0/v1): run status and the retrying outbox."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(monitor_runs)")}
+        if "status" not in cols:
+            self.db.execute("ALTER TABLE monitor_runs ADD COLUMN status TEXT NOT NULL "
+                            "DEFAULT 'RUNNING'")
+            self.db.execute("ALTER TABLE monitor_runs ADD COLUMN checks_skipped INTEGER")
+            # v1 wrote ok=1 for every completed pass, even with crashed checks.
+            # Only an error-free one is a SUCCESS; never upgrade a doubtful run.
+            self.db.execute("UPDATE monitor_runs SET status = CASE "
+                            "WHEN finished_at IS NULL THEN 'FAILED' "
+                            "WHEN ok = 1 AND error IS NULL THEN 'SUCCESS' "
+                            "WHEN ok = 1 THEN 'DEGRADED' ELSE 'FAILED' END")
+            self.db.execute("UPDATE monitor_runs SET ok = (status = 'SUCCESS')")
+        ncols = {r[1] for r in self.db.execute("PRAGMA table_info(notifications)")}
+        if "next_attempt_at" not in ncols:
+            self.db.execute("ALTER TABLE notifications RENAME TO notifications_v1")
+            self.db.execute("DROP INDEX IF EXISTS notifications_pending")
+            for stmt in _split_sql(SCHEMA[SCHEMA.index("CREATE TABLE IF NOT EXISTS notifications"):]):
+                self.db.execute(stmt)
+            self.db.execute(
+                "INSERT INTO notifications (id, created_at, kind, severity, incident_ids, channel, "
+                "body, status, attempts, last_error, sent_at, next_attempt_at) "
+                "SELECT id, created_at, kind, severity, incident_ids, channel, body, "
+                "CASE WHEN status = 'PENDING' AND attempts > 0 THEN 'RETRYING' "
+                "     WHEN status = 'PENDING' THEN 'QUEUED' ELSE status END, "
+                "attempts, last_error, sent_at, created_at FROM notifications_v1")
+            self.db.execute("DROP TABLE notifications_v1")
 
     def close(self):
         self.db.close()
@@ -293,21 +408,36 @@ class Store:
 
     # ── runs ──────────────────────────────────────────────────────────────
     def start_run(self, tier: str, now: datetime, version: str) -> int:
-        cur = self.db.execute("INSERT INTO monitor_runs (tier, started_at, version) VALUES (?,?,?)",
-                              (tier, iso(now), version))
+        cur = self.db.execute("INSERT INTO monitor_runs (tier, started_at, version, status) "
+                              "VALUES (?,?,?,'RUNNING')", (tier, iso(now), version))
         return cur.lastrowid
 
-    def finish_run(self, run_id: int, now: datetime, ok: bool, checks_run: int,
-                   checks_failed: int, results: int, error: str | None = None):
-        self.db.execute("UPDATE monitor_runs SET finished_at=?, ok=?, checks_run=?, "
-                        "checks_failed=?, results=?, error=? WHERE id=?",
-                        (iso(now), int(ok), checks_run, checks_failed, results, error, run_id))
+    def finish_run(self, run_id: int, now: datetime, status: str, checks_run: int = 0,
+                   checks_failed: int = 0, results: int = 0, error: str | None = None,
+                   checks_skipped: int = 0):
+        if status not in (RUN_SUCCESS, RUN_DEGRADED, RUN_FAILED):
+            raise ValueError(f"bad run status {status!r}")
+        self.db.execute("UPDATE monitor_runs SET finished_at=?, status=?, ok=?, checks_run=?, "
+                        "checks_failed=?, checks_skipped=?, results=?, error=? WHERE id=?",
+                        (iso(now), status, int(status == RUN_SUCCESS), checks_run, checks_failed,
+                         checks_skipped, results, error, run_id))
 
     def last_run(self, tier: str, ok_only: bool = False):
+        """Latest finished run of a tier; with ok_only, the latest SUCCESS only."""
         q = "SELECT * FROM monitor_runs WHERE tier = ? AND finished_at IS NOT NULL"
         if ok_only:
-            q += " AND ok = 1"
+            q += " AND status = 'SUCCESS' AND ok = 1"
         return self.db.execute(q + " ORDER BY id DESC LIMIT 1", (tier,)).fetchone()
+
+    def last_attempt(self, tier: str):
+        """Latest run of a tier, finished or not (a RUNNING row = in progress or killed)."""
+        return self.db.execute("SELECT * FROM monitor_runs WHERE tier = ? ORDER BY id DESC "
+                               "LIMIT 1", (tier,)).fetchone()
+
+    def first_run_at(self) -> str | None:
+        """When this store first saw any monitor run: the start of the install grace."""
+        r = self.db.execute("SELECT MIN(started_at) FROM monitor_runs").fetchone()
+        return r[0] if r else None
 
     def recent_runs(self, limit: int = 20):
         return self.db.execute("SELECT * FROM monitor_runs ORDER BY id DESC LIMIT ?",
@@ -338,26 +468,80 @@ class Store:
                 channel: str, body: str) -> int:
         cur = self.db.execute(
             "INSERT INTO notifications (created_at, kind, severity, incident_ids, channel, body, "
-            "status) VALUES (?,?,?,?,?,?,'PENDING')",
-            (iso(now), kind, severity, _j(incident_ids), channel, body))
+            "status, next_attempt_at) VALUES (?,?,?,?,?,?,'QUEUED',?)",
+            (iso(now), kind, severity, _j(incident_ids), channel, body, iso(now)))
         return cur.lastrowid
 
-    def pending_notifications(self, max_attempts: int):
-        return self.db.execute("SELECT * FROM notifications WHERE status = 'PENDING' "
-                               "AND attempts < ? ORDER BY id", (max_attempts,)).fetchall()
+    def claim_due(self, now: datetime, token: str, lease_seconds: int, limit: int = 50):
+        """Atomically lease the due QUEUED/RETRYING rows to one delivering process.
 
-    def mark_notification(self, nid: int, status: str, now: datetime, error: str | None = None):
-        self.db.execute("UPDATE notifications SET status=?, attempts=attempts+1, last_error=?, "
-                        "sent_at=CASE WHEN ? IN ('SENT','DRY_RUN') THEN ? ELSE sent_at END "
-                        "WHERE id=?", (status, error, status, iso(now), nid))
+        A row is due when next_attempt_at has passed and no unexpired lease is
+        held on it. Two processes can never both claim a row: the claim is one
+        UPDATE ... WHERE (no live lease) inside BEGIN IMMEDIATE. A process that
+        dies mid-send loses its lease after lease_seconds and the row becomes
+        due again (at-least-once; never silently dropped).
+        """
+        t, until = iso(now), iso(now + timedelta(seconds=lease_seconds))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "UPDATE notifications SET claim_token = ?, claimed_until = ? "
+                "WHERE id IN (SELECT id FROM notifications WHERE status IN ('QUEUED','RETRYING') "
+                "  AND COALESCE(next_attempt_at, created_at) <= ? "
+                "  AND (claimed_until IS NULL OR claimed_until < ?) ORDER BY id LIMIT ?)",
+                (token, until, t, t, int(limit)))
+            rows = self.db.execute("SELECT * FROM notifications WHERE claim_token = ? "
+                                   "AND status IN ('QUEUED','RETRYING') ORDER BY id",
+                                   (token,)).fetchall()
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return rows
 
-    def bump_attempt(self, nid: int, error: str):
-        self.db.execute("UPDATE notifications SET attempts=attempts+1, last_error=? WHERE id=?",
-                        (error, nid))
+    def complete_delivery(self, nid: int, token: str, status: str, now: datetime,
+                          error: str | None = None, next_attempt_at: datetime | None = None) -> bool:
+        """Record one attempt's outcome -- only if this process still holds the lease."""
+        if status not in (N_SENT, N_DRY_RUN, N_RETRYING, N_FAILED):
+            raise ValueError(f"bad notification status {status!r}")
+        cur = self.db.execute(
+            "UPDATE notifications SET status = ?, attempts = attempts + 1, last_error = ?, "
+            "last_attempt_at = ?, next_attempt_at = ?, claim_token = NULL, claimed_until = NULL, "
+            "sent_at = CASE WHEN ? IN ('SENT','DRY_RUN') THEN ? ELSE sent_at END "
+            "WHERE id = ? AND claim_token = ? AND status IN ('QUEUED','RETRYING')",
+            (status, error, iso(now), iso(next_attempt_at) if next_attempt_at else None,
+             status, iso(now), nid, token))
+        return bool(cur.rowcount)
+
+    def notification_counts(self, now: datetime) -> dict:
+        out = {s: 0 for s in (N_QUEUED, N_RETRYING, N_SENT, N_DRY_RUN, N_FAILED)}
+        for r in self.db.execute("SELECT status, COUNT(*) FROM notifications GROUP BY status"):
+            out[r[0]] = r[1]
+        out["failed_24h"] = self.db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE status = 'FAILED' AND last_attempt_at >= ?",
+            (iso(now - timedelta(days=1)),)).fetchone()[0]
+        row = self.db.execute("SELECT MIN(created_at) FROM notifications "
+                              "WHERE status IN ('QUEUED','RETRYING')").fetchone()
+        out["oldest_undelivered_at"] = row[0] if row else None
+        return out
 
     def notifications(self, limit: int = 50):
         return self.db.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT ?",
                                (limit,)).fetchall()
+
+
+def _split_sql(script: str) -> list[str]:
+    """SCHEMA as single statements (executescript() would COMMIT our transaction)."""
+    out, cur = [], []
+    for line in script.splitlines():
+        stripped = line.split("--", 1)[0]
+        cur.append(stripped)
+        if stripped.rstrip().endswith(";"):
+            stmt = "\n".join(cur).strip()
+            if stmt.strip(";").strip():
+                out.append(stmt)
+            cur = []
+    return out
 
 
 def _j(v) -> str:

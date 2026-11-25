@@ -270,34 +270,40 @@ check("PostgreSQL down -> CRITICAL db_unreachable incident",
 check("PostgreSQL down: SQL checks skipped, their incidents frozen (not resolved)",
       key in a and out["skipped"] == ["t.check"] and crash_key not in a)
 
-# heartbeat
+# heartbeat (only SUCCESS runs count; detailed cases in test_monitoring_remediation.py)
+ACTIVE_TIMER = lambda unit: {"LoadState": "loaded", "ActiveState": "active",  # noqa: E731
+                             "UnitFileState": "enabled"}
 st = Store(":memory:")
+rid = st.start_run("health", T0 - timedelta(hours=5), "x")
+st.finish_run(rid, T0 - timedelta(hours=5), "SUCCESS")
 rid = st.start_run("data", T0 - timedelta(hours=3), "x")
-st.finish_run(rid, T0 - timedelta(hours=3), True, 1, 0, 0)
-ctx = engine.Context(make_cfg(), st, T0, "health")
+st.finish_run(rid, T0 - timedelta(hours=3), "SUCCESS", 1, 0, 0)
+ctx = engine.Context(make_cfg(), st, T0, "health", systemctl=ACTIVE_TIMER)
 hb = {r.qualifier: r for r in selfmon.heartbeat(ctx)}
 check("data tier silent for 3h -> heartbeat FAIL HIGH", hb["data"].state == FAIL and hb["data"].severity == HIGH)
-check("tier never installed -> no heartbeat noise", "summary" not in hb)
+check("summary tier within its install grace -> PENDING (not OK, not an alert)",
+      hb["summary"].state == PENDING)
 rid = st.start_run("data", T0 - timedelta(minutes=10), "x")
-st.finish_run(rid, T0 - timedelta(minutes=10), True, 1, 0, 0)
+st.finish_run(rid, T0 - timedelta(minutes=10), "SUCCESS", 1, 0, 0)
 hb = {r.qualifier: r for r in selfmon.heartbeat(ctx)}
 check("recent data run -> heartbeat OK", hb["data"].state == OK)
 
-# delivery failure + retry + scrubbing
+# delivery failure + retry + scrubbing (backoff details in test_monitoring_remediation.py)
 st = Store(":memory:")
 bad = FakeChannel(cfg, fail_with="HTTPError: 502 for https://api.telegram.org/botSECRET123/sendMessage")
 state["r"] = R(state=FAIL, severity=HIGH, title="Sales reconciliation mismatch")
 out, _ = run(cfg, st, T0, S, channel=bad)
 n = st.notifications()[0]
-check("failed delivery stays PENDING for retry", n["status"] == "PENDING" and n["attempts"] == 1
-      and out["delivery"]["retrying"] == 1)
-for k in range(1, 5):
-    out, _ = run(cfg, st, T0 + timedelta(minutes=15 * k), S, channel=bad)
-n = st.notifications()[-1]
-check("after max_attempts the notification is FAILED and the run exits non-OK",
-      st.db.execute("SELECT status FROM notifications").fetchone()[0] == "FAILED" and out["ok"] is False)
-ctx = engine.Context(cfg, st, T0 + timedelta(hours=2), "health")
-nd = selfmon.notifications(ctx)[0]
+check("failed delivery is RETRYING with a next attempt time, and the run is DEGRADED",
+      n["status"] == "RETRYING" and n["attempts"] == 1 and n["next_attempt_at"] > n["created_at"]
+      and out["delivery"]["retrying"] == 1 and out["status"] == "DEGRADED" and out["ok"] is False)
+for k in range(1, 8):
+    out, _ = run(cfg, st, T0 + timedelta(hours=k), S, channel=bad)
+check("after max_attempts the notification is FAILED and the run is not OK",
+      st.db.execute("SELECT status FROM notifications WHERE id = ?", (n["id"],)).fetchone()[0]
+      == "FAILED", [dict(r) for r in st.notifications()])
+ctx = engine.Context(cfg, st, T0 + timedelta(hours=9), "health")
+nd = [r for r in selfmon.notifications(ctx) if r.qualifier == "fake"][0]
 check("delivery failure raises a monitor incident (shown on the dashboard, not re-sent)",
       nd.state == FAIL and nd.severity == HIGH and nd.notify is False)
 check("token scrubbed from a Telegram transport error",
@@ -325,6 +331,10 @@ print("3. Revel: reconciliation classes, readiness, freshness")
 
 class FakeChatSql:
     RECON_TOLERANCE_PCT = 0.5
+
+    @staticmethod
+    def _ro_conn():
+        raise AssertionError("chat_sql's own connection must not be used by the monitor")
 
     def __init__(self, stores):
         self.stores, self.calls = stores, []
@@ -692,7 +702,8 @@ check("disk 95% -> CRITICAL; low memory -> WARNING",
 ctx = engine.Context(make_cfg(), Store(":memory:"), now, "data", newest_backup=lambda g: (None, None))
 check("no backup -> HIGH", infra.backups(ctx)[0].severity == HIGH)
 ctx = engine.Context(make_cfg(), Store(":memory:"), now, "data",
-                     newest_backup=lambda g: ("/x.dump", now - timedelta(hours=2)))
+                     newest_backup=lambda g: ("/x.dump", now - timedelta(hours=2)),
+                     backup_format=lambda p: "pg_dump custom archive")
 check("fresh backup -> OK", infra.backups(ctx)[0].state == OK)
 ctx = engine.Context(make_cfg(), Store(":memory:"), now, "data", cert_expiry=lambda h: now + timedelta(days=5))
 check("TLS certificate 5 days from expiry -> WARNING", services.tls(ctx)[0].severity == WARNING)

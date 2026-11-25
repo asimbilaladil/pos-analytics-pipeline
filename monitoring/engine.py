@@ -29,7 +29,7 @@ from .checks import mcp as mcp_checks
 from .checks import services as svc_checks
 from .model import (ACCEPTED, FAIL, HIGH, OK, SEVERITY_RANK, SRC_MONITOR, CheckResult)
 from .notify import deliver_pending, format_group
-from .store import Store, row_dict
+from .store import RUN_DEGRADED, RUN_FAILED, RUN_SUCCESS, Store, row_dict
 
 log = logging.getLogger("laynes.monitor")
 
@@ -43,9 +43,13 @@ class Context:
 
     def __init__(self, cfg: dict, store: Store, now: datetime, tier: str, *,
                  pg_connect=None, http=None, systemctl=None, disk_usage=None,
-                 mem_available_mb=None, newest_backup=None, cert_expiry=None):
+                 mem_available_mb=None, newest_backup=None, cert_expiry=None,
+                 backup_format=None, read_status_json=None):
         self.cfg, self.store, self.now, self.tier = cfg, store, now, tier
         self._pg_connect = pg_connect or (lambda: pg.connect(cfg))
+        # A SEPARATE, fresh monitor session for code that manages its own
+        # connection (chat_sql's reconciliation; see checks/revel.py).
+        self.monitor_pg_connect = pg_connect or (lambda: pg.connect(cfg))
         self._pg = None
         self._pg_error: str | None = None
         self.http = http or mcp_checks.http_status
@@ -54,6 +58,8 @@ class Context:
         self.mem_available_mb = mem_available_mb or infra_checks.mem_available_mb
         self.newest_backup = newest_backup or infra_checks.newest_backup
         self.cert_expiry = cert_expiry or svc_checks.cert_expiry
+        self.backup_format = backup_format or infra_checks.dump_format
+        self.read_status_json = read_status_json or infra_checks.read_status_json
         self.source_updates: dict[str, tuple] = {}
 
     def pg(self):
@@ -153,9 +159,42 @@ def enqueue_events(store: Store, cfg: dict, events: list[tuple], now: datetime) 
     return n
 
 
+def run_status(summary: dict) -> tuple[str, str | None]:
+    """SUCCESS only when every due check ran cleanly AND every delivery attempted
+    this run succeeded. Anything less is DEGRADED, with the reason. Data-quality
+    FAILs found by the checks do not count: they are incidents, not monitor faults."""
+    d = summary.get("delivery") or {}
+    reasons = []
+    if summary["crashed"]:
+        reasons.append(f"crashed={summary['crashed']}")
+    if summary["skipped"]:
+        reasons.append(f"skipped(postgres unavailable)={summary['skipped']}")
+    if d.get("failed") or d.get("retrying") or d.get("lost_lease"):
+        reasons.append(f"delivery failed={d.get('failed', 0)} retrying={d.get('retrying', 0)} "
+                       f"lost_lease={d.get('lost_lease', 0)}")
+    return (RUN_SUCCESS, None) if not reasons else (RUN_DEGRADED, "; ".join(reasons))
+
+
+def close_unit_failure(store: Store, cfg: dict, unit: str, now: datetime) -> None:
+    """A SUCCESSFUL pass of a tier resolves its unit-failed incident (crash-notify)."""
+    from .checks.selfmon import unit_failed_result
+    store.begin()
+    try:
+        ev = apply_results(store, cfg, [unit_failed_result(unit, None)], now)
+        enqueue_events(store, cfg, ev, now)
+        store.commit()
+    except Exception:
+        store.rollback()
+        raise
+
+
 def run_tier(cfg: dict, tier: str, *, store: Store | None = None, now: datetime | None = None,
              specs: list[CheckSpec] | None = None, ctx_kwargs: dict | None = None,
              channels: dict | None = None) -> dict:
+    """One monitor pass. monitor_runs.status records the outcome honestly:
+    SUCCESS / DEGRADED (completed, but crash, skip or delivery failure) / FAILED
+    (aborted; re-raised). summary["ok"] is True only for SUCCESS, and the CLI
+    exit code is derived from the same status (0 / 1 / 2)."""
     from .clock import utcnow
     now = now or utcnow()
     own_store = store is None
@@ -163,73 +202,75 @@ def run_tier(cfg: dict, tier: str, *, store: Store | None = None, now: datetime 
     specs = [s for s in (specs if specs is not None else registry()) if tier in s.tiers]
     ctx = Context(cfg, store, now, tier, **(ctx_kwargs or {}))
     run_id = store.start_run(tier, now, VERSION)
-    summary = {"tier": tier, "checks_run": 0, "checks_failed": 0, "checks_skipped": 0,
-               "results": 0, "events": 0, "crashed": [], "skipped": []}
+    summary = {"tier": tier, "run_id": run_id, "checks_run": 0, "checks_failed": 0,
+               "checks_skipped": 0, "results": 0, "events": 0, "crashed": [], "skipped": []}
     events: list[tuple] = []
     try:
-        for spec in specs:
-            last = store.check_run(spec.name)
-            if spec.min_interval_minutes and last and last["last_ok_at"] and \
-                    now - datetime.fromisoformat(last["last_ok_at"]) < \
-                    timedelta(minutes=spec.min_interval_minutes):
-                summary["checks_skipped"] += 1
-                continue
-            t0 = time.monotonic()
-            err = None
-            try:
-                results = spec.fn(ctx)
-            except PgUnavailable as e:
-                # PostgreSQL itself is down: infra.postgres reports it (CRITICAL).
-                # Do not pile a check_error incident per SQL check on top of it.
-                summary["skipped"].append(spec.name)
-                store.record_check_run(spec.name, now, False, time.monotonic() - t0,
-                                       f"postgres unavailable: {e}")
-                continue
-            except Exception as e:  # noqa: BLE001
-                err = f"{type(e).__name__}: {e}"
-                log.error("check %s crashed:\n%s", spec.name, traceback.format_exc())
-                results = []
-                summary["checks_failed"] += 1
-                summary["crashed"].append(spec.name)
-            summary["checks_run"] += 1
+        try:
+            for spec in specs:
+                last = store.check_run(spec.name)
+                if spec.min_interval_minutes and last and last["last_ok_at"] and \
+                        now - datetime.fromisoformat(last["last_ok_at"]) < \
+                        timedelta(minutes=spec.min_interval_minutes):
+                    summary["checks_skipped"] += 1      # not due: not a fault
+                    continue
+                t0 = time.monotonic()
+                err = None
+                try:
+                    results = spec.fn(ctx)
+                except PgUnavailable as e:
+                    # PostgreSQL itself is down: infra.postgres reports it (CRITICAL).
+                    # Do not pile a check_error incident per SQL check on top of it,
+                    # but the check did NOT run: the pass is DEGRADED, never SUCCESS.
+                    summary["skipped"].append(spec.name)
+                    store.record_check_run(spec.name, now, False, time.monotonic() - t0,
+                                           f"postgres unavailable: {e}")
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    err = f"{type(e).__name__}: {e}"
+                    log.error("check %s crashed:\n%s", spec.name, traceback.format_exc())
+                    results = []
+                    summary["checks_failed"] += 1
+                    summary["crashed"].append(spec.name)
+                summary["checks_run"] += 1
+                store.begin()
+                try:
+                    events += apply_results(store, cfg, results + [_check_error_result(spec, err)],
+                                            now)
+                    store.record_check_run(spec.name, now, err is None, time.monotonic() - t0, err)
+                    store.commit()
+                except Exception:
+                    store.rollback()
+                    raise
+                summary["results"] += len(results)
+                if ctx._pg is not None:
+                    ctx._pg.rollback()
             store.begin()
-            try:
-                events += apply_results(store, cfg, results + [_check_error_result(spec, err)], now)
-                store.record_check_run(spec.name, now, err is None, time.monotonic() - t0, err)
-                store.commit()
-            except Exception:
-                store.rollback()
-                raise
-            summary["results"] += len(results)
-            if ctx._pg is not None:
-                ctx._pg.rollback()
-        store.begin()
-        for source, (ts, detail) in ctx.source_updates.items():
-            store.set_source_status(source, ts, detail, now)
-        summary["events"] = enqueue_events(store, cfg, events, now)
-        store.prune_results(now)
-        store.commit()
+            for source, (ts, detail) in ctx.source_updates.items():
+                store.set_source_status(source, ts, detail, now)
+            summary["events"] = enqueue_events(store, cfg, events, now)
+            store.prune_results(now)
+            store.commit()
+        finally:
+            ctx.close()
+        summary["delivery"] = deliver_pending(store, cfg, now, channels)
+        status, reason = run_status(summary)
+        store.finish_run(run_id, now, status, summary["checks_run"], summary["checks_failed"],
+                         summary["results"], reason, len(summary["skipped"]))
+        if status == RUN_SUCCESS:
+            close_unit_failure(store, cfg, f"laynes-monitor-{tier}.service", now)
     except Exception as e:
         store.rollback()
-        store.finish_run(run_id, now, False, summary["checks_run"], summary["checks_failed"],
-                         summary["results"], f"{type(e).__name__}: {e}")
-        ctx.close()
+        try:
+            store.finish_run(run_id, now, RUN_FAILED, summary["checks_run"],
+                             summary["checks_failed"], summary["results"],
+                             f"{type(e).__name__}: {str(e)[:300]}", len(summary["skipped"]))
+        except Exception:  # noqa: BLE001 -- the store itself may be what failed
+            log.exception("could not record the failed run")
         if own_store:
             store.close()
         raise
-    finally:
-        ctx.close()
-    summary["delivery"] = deliver_pending(store, cfg, now, channels)
-    ok = not summary["crashed"] and not summary["delivery"]["failed"]
-    # monitor_runs.ok means "the tier completed" (the heartbeat reads it); a
-    # crashed check or failed delivery is recorded in error and has its own
-    # incident, and makes the process exit non-zero.
-    store.finish_run(run_id, now, True, summary["checks_run"], summary["checks_failed"],
-                     summary["results"],
-                     None if ok else f"crashed={summary['crashed']} "
-                                     f"delivery_failed={summary['delivery']['failed']}")
-    summary["ok"] = ok
+    summary["status"], summary["ok"] = status, status == RUN_SUCCESS
     if own_store:
         store.close()
     return summary
-

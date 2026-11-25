@@ -7,9 +7,12 @@
   python -m monitoring crash-notify UNIT          OnFailure= hook for the monitor units
   python -m monitoring test-notify                one test message per channel
 
-Exit codes for `run`: 0 = completed; 1 = completed but a check crashed or an
-alert could not be delivered; 2 = the pass itself failed. Data problems found
-by the checks are NOT exit failures -- they are incidents.
+Exit codes for `run` and `summary` are the recorded monitor_runs.status:
+  0 = SUCCESS   every due check ran and every delivery attempted succeeded
+  1 = DEGRADED  completed, but a check crashed, a check was skipped (PostgreSQL
+                unavailable) or a delivery failed / is retrying
+  2 = FAILED    the pass itself aborted (or the config is invalid)
+Data problems found by the checks are NOT exit failures -- they are incidents.
 """
 from __future__ import annotations
 
@@ -34,6 +37,72 @@ def _setup_logging(cfg: dict | None):
             pass
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+EXIT_CODES = {"SUCCESS": 0, "DEGRADED": 1, "FAILED": 2}
+
+
+def _summary(cfg: dict, log) -> int:
+    """The daily summary, recorded as a 'summary' tier run with an honest status."""
+    from .engine import close_unit_failure, run_status
+    from .notify import deliver_pending
+    from .store import RUN_FAILED, RUN_SUCCESS, Store
+    from .summary import send_daily_summary
+    store = Store(cfg["monitor"]["state_db"])
+    now = utcnow()
+    rid = store.start_run("summary", now, VERSION)
+    try:
+        send_daily_summary(store, cfg, now)
+        stats = deliver_pending(store, cfg, now)
+        status, reason = run_status({"crashed": [], "skipped": [], "delivery": stats})
+        store.finish_run(rid, utcnow(), status, 1, 0, 0, reason)
+        if status == RUN_SUCCESS:
+            close_unit_failure(store, cfg, "laynes-monitor-summary.service", now)
+    except Exception as e:  # noqa: BLE001
+        log.exception("daily summary failed")
+        store.rollback()
+        try:
+            store.finish_run(rid, utcnow(), RUN_FAILED, 1, 1, 0, f"{type(e).__name__}: {e}"[:300])
+        except Exception:  # noqa: BLE001
+            log.exception("could not record the failed summary run")
+        return 2
+    finally:
+        store.close()
+    return EXIT_CODES[status]
+
+
+def _crash_notify(cfg: dict, unit: str, log) -> int:
+    """OnFailure= hook: open (or keep) ONE monitor:unit_failed incident per unit.
+
+    Deduplicated like every incident: a unit failing every 5 minutes alerts once,
+    and the tier's next SUCCESSFUL pass resolves it. Best effort: never fails.
+    """
+    from .checks.selfmon import unit_failed_result
+    from .engine import apply_results, enqueue_events
+    from .notify import deliver_pending
+    from .store import Store
+    now = utcnow()
+    try:
+        store = Store(cfg["monitor"]["state_db"])
+    except Exception:  # noqa: BLE001 -- e.g. disk full: the journal is all we have
+        log.exception("crash-notify: monitor store unavailable; %s failed", unit)
+        return 0
+    try:
+        tier = unit.removeprefix("laynes-monitor-").removesuffix(".service")
+        last = store.last_attempt(tier)
+        err = f"{unit} exited non-zero" + (
+            f"; latest run {last['status']}: {(last['error'] or '')[:200]}" if last else "")
+        store.begin()
+        ev = apply_results(store, cfg, [unit_failed_result(unit, err)], now)
+        enqueue_events(store, cfg, ev, now)
+        store.commit()
+        deliver_pending(store, cfg, now)
+    except Exception:  # noqa: BLE001
+        store.rollback()
+        log.exception("crash-notify could not record/deliver for %s", unit)
+    finally:
+        store.close()
+    return 0
 
 
 def main(argv=None) -> int:
@@ -76,55 +145,47 @@ def main(argv=None) -> int:
         except Exception:  # noqa: BLE001
             log.exception("monitor tier %s failed", args.tier)
             return 2
-        log.info("tier=%s ok=%s %s", args.tier, out["ok"],
-                 json.dumps({k: v for k, v in out.items() if k != "ok"}, default=str))
-        return 0 if out["ok"] else 1
+        log.info("tier=%s status=%s %s", args.tier, out["status"],
+                 json.dumps({k: v for k, v in out.items() if k not in ("ok", "status")},
+                            default=str))
+        return EXIT_CODES[out["status"]]
 
-    store = Store(cfg["monitor"]["state_db"])
-    now = utcnow()
     if args.cmd == "summary":
-        from .notify import deliver_pending
-        from .summary import send_daily_summary
-        rid = store.start_run("summary", now, VERSION)
-        send_daily_summary(store, cfg, now)
-        stats = deliver_pending(store, cfg, now)
-        store.finish_run(rid, utcnow(), True, 0, 0, 0,
-                         None if not stats["failed"] else f"delivery_failed={stats['failed']}")
-        return 0 if not stats["failed"] else 1
+        return _summary(cfg, log)
+    if args.cmd == "crash-notify":
+        return _crash_notify(cfg, args.unit, log)
+
+    now = utcnow()
     if args.cmd == "status":
         from .summary import daily_summary_text, overview
+        try:
+            store = Store.open_readonly(cfg["monitor"]["state_db"])   # a status read never writes
+        except Exception as e:  # noqa: BLE001
+            print(f"monitor store unavailable: {type(e).__name__}: {e}")
+            return 2
         if args.json:
-            print(json.dumps(overview(store, now), default=str, indent=2))
+            print(json.dumps(overview(store, now, cfg), default=str, indent=2))
         else:
-            print(daily_summary_text(store, now))
+            print(daily_summary_text(store, now, cfg=cfg))
         return 0
+    store = Store(cfg["monitor"]["state_db"])
     if args.cmd == "ack":
         store.begin()
         ok = store.acknowledge(args.incident_id, now, args.by, args.note)
         store.commit()
         print("acknowledged" if ok else "not found or not OPEN")
         return 0 if ok else 1
-    if args.cmd in ("crash-notify", "test-notify"):
+    if args.cmd == "test-notify":
         from .notify import deliver_pending
-        if args.cmd == "crash-notify":
-            body = (f"Laynes Intelligence — HIGH\n\nSource: Monitor\nIssue: monitor unit "
-                    f"{args.unit} failed\nStatus: OPEN\n\nRecommended action: "
-                    f"`journalctl -u {args.unit} -n 100`. Until fixed, part of the data "
-                    f"monitoring is not running.")
-            kind = "MONITOR"
-        else:
-            body = ("Laynes Intelligence — TEST\n\nThis is a test notification from the data "
-                    "monitor. No action needed.")
-            kind = "TEST"
-        try:
-            store.begin()
-            for ch in cfg["notify"]["channels"]:
-                store.enqueue(now, kind, "HIGH" if kind == "MONITOR" else None, [], ch, body)
-            store.commit()
-            deliver_pending(store, cfg, now)
-        except Exception:  # noqa: BLE001
-            log.exception("%s could not record/deliver", args.cmd)
-        return 0
+        body = ("Laynes Intelligence — TEST\n\nThis is a test notification from the data "
+                "monitor. No action needed.")
+        store.begin()
+        for ch in cfg["notify"]["channels"]:
+            store.enqueue(now, "TEST", None, [], ch, body)
+        store.commit()
+        stats = deliver_pending(store, cfg, now)
+        print(json.dumps({k: v for k, v in stats.items()}, default=str))
+        return 0 if not (stats["failed"] or stats["retrying"]) else 1
     return 2
 
 

@@ -18,6 +18,19 @@ const SEV_STYLE: Record<string, string> = {
   PENDING: 'bg-slate-100 text-slate-600',
   ACCEPTED: 'bg-slate-100 text-slate-500',
   FAIL: 'bg-red-100 text-red-800',
+  // operational states
+  HEALTHY: 'bg-emerald-100 text-emerald-800',
+  DEGRADED: 'bg-amber-100 text-amber-900',
+  FAILED: 'bg-red-100 text-red-800',
+  UNKNOWN: 'bg-slate-200 text-slate-700',
+  STALE: 'bg-orange-100 text-orange-900',
+  // run / delivery statuses
+  SUCCESS: 'bg-emerald-100 text-emerald-800',
+  RUNNING: 'bg-slate-100 text-slate-600',
+  QUEUED: 'bg-slate-100 text-slate-600',
+  RETRYING: 'bg-amber-100 text-amber-900',
+  SENT: 'bg-emerald-100 text-emerald-800',
+  DRY_RUN: 'bg-slate-100 text-slate-600',
 }
 
 function Badge({ v }: { v: string }) {
@@ -146,27 +159,45 @@ export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; o
               <div key={s.source} className="rounded-xl border border-line bg-white p-3.5">
                 <div className="flex items-center justify-between">
                   <p className="text-[13px] font-semibold text-ink-900">{s.label}</p>
-                  <Badge v={s.health} />
+                  <Badge v={s.state} />
                 </div>
-                <p className="mt-1 text-[12px] text-ink-500">
+                <p className="mt-1 text-[11px] text-ink-500">
+                  data <b>{s.data_state}</b> · monitoring <b>{s.monitoring_state}</b>
+                </p>
+                <p className="mt-0.5 text-[12px] text-ink-500">
                   ok {s.counts.OK ?? 0} · pending {s.counts.PENDING ?? 0} · failing {s.counts.FAIL ?? 0}
                   {s.open_incidents ? ` · ${s.open_incidents} open` : ''}
                 </p>
                 <p className="mt-0.5 flex items-center gap-1 text-[11px] text-ink-400">
-                  <Clock size={11} /> latest successful sync {s.last_success_at ? `${when(s.last_success_at)} (${ago(s.last_success_at)})` : '—'}
+                  <Clock size={11} /> source synced {s.last_success_at ? `${when(s.last_success_at)} (${ago(s.last_success_at)})` : '—'}
+                </p>
+                <p className="mt-0.5 text-[11px] text-ink-400">
+                  checked OK {ago(s.last_successful_check_at)} · last attempt {ago(s.last_attempted_check_at)}
                 </p>
               </div>
             ))}
             <div className="rounded-xl border border-line bg-white p-3.5">
-              <p className="text-[13px] font-semibold text-ink-900">Monitor runs</p>
-              {ov && Object.values(ov.last_runs).map((r) => (
-                <p key={r.tier} className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-600">
-                  {r.ok && !r.error ? <CheckCircle2 size={12} className="text-emerald-600" />
+              <div className="flex items-center justify-between">
+                <p className="text-[13px] font-semibold text-ink-900">Monitor itself</p>
+                {ov && <Badge v={ov.monitor.state} />}
+              </div>
+              {ov && Object.entries(ov.monitor.tiers).map(([tier, t]) => (
+                <p key={tier} className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-600">
+                  {t.state === 'HEALTHY' ? <CheckCircle2 size={12} className="text-emerald-600" />
                     : <AlertCircle size={12} className="text-red-600" />}
-                  {r.tier}: {ago(r.finished_at)}{r.error ? ` — ${r.error}` : ''}
+                  {tier}: <Badge v={t.state} />{' '}
+                  success {ago(t.last_success_at)}
+                  {t.last_attempt_status && t.last_attempt_status !== 'SUCCESS'
+                    ? ` · last attempt ${t.last_attempt_status}${t.last_attempt_error ? ` — ${t.last_attempt_error}` : ''}` : ''}
                 </p>
               ))}
-              {ov && Object.keys(ov.last_runs).length === 0 && <p className="text-[12px] text-ink-400">No runs yet.</p>}
+              {ov && (
+                <p className="mt-1.5 text-[12px] text-ink-600">
+                  alerts: <Badge v={ov.monitor.notifications.state} />{' '}
+                  {ov.monitor.notifications.FAILED} failed · {ov.monitor.notifications.RETRYING} retrying
+                  {' '}· {ov.monitor.notifications.QUEUED} queued
+                </p>
+              )}
             </div>
           </section>
 
@@ -221,11 +252,18 @@ export function AdminMonitoring({ onBack, onSignedOut }: { onBack: () => void; o
               <div className="max-h-[640px] overflow-y-auto scroll-thin">
                 {tab === 'open' && (ov?.open_incidents.length
                   ? ov.open_incidents.map(incidentRow)
-                  : <p className="p-6 text-center text-[13px] text-ink-400">No unresolved incidents.</p>)}
+                  : <p className="p-6 text-center text-[13px] text-ink-400">
+                      No unresolved incidents.
+                      {ov && ov.monitor.state !== 'HEALTHY' && (
+                        <span className="mt-1 block text-amber-800">
+                          The monitor itself is {ov.monitor.state}: this is not an all-clear.
+                        </span>
+                      )}
+                    </p>)}
                 {tab === 'history' && history.map(incidentRow)}
                 {tab === 'notifications' && notes.map((n) => (
                   <div key={n.id} className="border-b border-line px-4 py-2.5">
-                    <p className="text-[11px] text-ink-400">{when(n.created_at)} · {n.kind} · {n.channel} · <b>{n.status}</b>
+                    <p className="text-[11px] text-ink-400">{when(n.created_at)} · {n.kind} · {n.channel} · <Badge v={n.status} />{n.attempts ? ` · ${n.attempts} attempt(s)` : ''}{n.status === 'RETRYING' && n.next_attempt_at ? ` · next ${when(n.next_attempt_at)}` : ''}
                       {n.last_error ? ` · ${n.last_error}` : ''}</p>
                     <pre className="mt-1 whitespace-pre-wrap text-[12px] text-ink-700">{n.body}</pre>
                   </div>

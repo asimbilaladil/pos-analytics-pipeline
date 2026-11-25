@@ -11,6 +11,8 @@ Environment=LAYNES_MONITOR_CONFIG=/etc/laynes/monitor.toml PYTHONDONTWRITEBYTECO
 ExecStart=-/root/pos-analytics-pipeline/venv/bin/python -m monitoring crash-notify %i
 TimeoutStartSec=2min
 NoNewPrivileges=yes
+# New files (the store, its -wal/-shm, the log) are never world-readable.
+UMask=0027
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only

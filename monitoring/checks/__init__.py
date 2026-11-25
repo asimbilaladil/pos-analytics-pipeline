@@ -25,6 +25,16 @@ class CheckSpec:
     min_interval_minutes: int = 0
     needs_pg: bool = False
 
+    @property
+    def source(self) -> str:
+        """The dashboard source this check reports on (operational state per source)."""
+        return SPEC_SOURCES.get(self.name, SPEC_SOURCES.get(self.name.split(".")[0], "monitor"))
+
+
+SPEC_SOURCES = {"revel": "revel", "hme": "hme", "r365.weekly": "r365",
+                "r365.financial": "r365_financial", "chat": "ai_chat", "mcp": "mcp",
+                "infra": "infrastructure", "services": "infrastructure", "monitor": "monitor"}
+
 
 def registry() -> list[CheckSpec]:
     from . import chat, hme, infra, mcp, r365, revel, selfmon, services
@@ -36,7 +46,9 @@ def registry() -> list[CheckSpec]:
         CheckSpec("infra.resources", ("health",), infra.resources),
         CheckSpec("mcp.health", ("health",), mcp.health),
         CheckSpec("chat.stuck_jobs", ("health",), chat.stuck_jobs, needs_pg=True),
-        CheckSpec("monitor.heartbeat", ("health",), selfmon.heartbeat),
+        # Each tier checks the OTHER tiers (and the summary): a dead tier is
+        # always reported by a live one.
+        CheckSpec("monitor.heartbeat", ("health", "data"), selfmon.heartbeat),
         CheckSpec("monitor.notifications", ("health", "data"), selfmon.notifications),
         # data tier
         CheckSpec("services.jobs", ("data",), services.jobs),

@@ -46,14 +46,64 @@ export interface MonitorIncidentDetail {
   events: MonitorEvent[]
 }
 
+// Machine-readable operational states (monitoring/summary.py). Absence of
+// evidence is UNKNOWN or STALE -- never HEALTHY.
+export type OpState = 'HEALTHY' | 'PENDING' | 'DEGRADED' | 'FAILED' | 'UNKNOWN' | 'STALE'
+
 export interface MonitorSourceRow {
   source: string
   label: string
-  health: Severity | 'OK' | 'PENDING'
+  /** Combined: FAILED if the data fails; otherwise UNKNOWN/STALE if the monitor has no current evidence. */
+  state: OpState
+  /** Source-data health from incidents and results. */
+  data_state: OpState
+  /** Whether the monitor's checks of this source are running (operational health). */
+  monitoring_state: OpState
+  worst_open_severity: Severity | null
   open_incidents: number
   counts: Partial<Record<ResultState, number>>
+  /** The source's own latest successful sync. */
   last_success_at: string | null
   detail: Record<string, unknown> | null
+  last_successful_check_at: string | null
+  oldest_successful_check_at: string | null
+  last_attempted_check_at: string | null
+  checks: string[]
+}
+
+export interface MonitorCheckState {
+  check: string
+  source: string
+  tiers: string[]
+  state: OpState
+  reason: string | null
+  last_success_at: string | null
+  last_attempt_at: string | null
+  last_error: string | null
+  last_duration_s: number | null
+  stale_after_minutes: number
+}
+
+export interface MonitorTierState {
+  state: OpState
+  disabled: boolean
+  max_minutes: number
+  last_success_at: string | null
+  last_attempt_at: string | null
+  last_attempt_status: 'RUNNING' | 'SUCCESS' | 'DEGRADED' | 'FAILED' | null
+  last_attempt_error: string | null
+  last_run_id: number | null
+}
+
+export interface MonitorSelfStatus {
+  state: OpState
+  tiers: Record<string, MonitorTierState>
+  notifications: {
+    state: OpState
+    QUEUED: number; RETRYING: number; SENT: number; DRY_RUN: number; FAILED: number
+    failed_24h: number
+    oldest_undelivered_at: string | null
+  }
 }
 
 export interface MonitorStoreCell {
@@ -76,6 +126,7 @@ export interface MonitorRun {
   tier: string
   started_at: string
   finished_at: string | null
+  status: 'RUNNING' | 'SUCCESS' | 'DEGRADED' | 'FAILED'
   ok: number | null
   checks_run: number | null
   checks_failed: number | null
@@ -93,6 +144,9 @@ export interface MonitorOverview {
     difference: string; category: string | null; severity: Severity; status: IncidentStatus
   }[]
   last_runs: Record<string, MonitorRun>
+  checks: MonitorCheckState[]
+  monitor: MonitorSelfStatus
+  states: OpState[]
 }
 
 export interface MonitorNotification {
@@ -102,8 +156,10 @@ export interface MonitorNotification {
   severity: Severity | null
   channel: string
   body: string
-  status: 'PENDING' | 'SENT' | 'DRY_RUN' | 'FAILED'
+  status: 'QUEUED' | 'RETRYING' | 'SENT' | 'DRY_RUN' | 'FAILED'
   attempts: number
+  next_attempt_at: string | null
+  last_attempt_at: string | null
   last_error: string | null
   sent_at: string | null
 }

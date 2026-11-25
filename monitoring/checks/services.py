@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from ..model import CRITICAL, FAIL, HIGH, OK, SRC_INFRA, WARNING, CheckResult
 
 PROPS = ("ActiveState", "SubState", "Result", "ExecMainStatus", "ExecMainExitTimestamp",
-         "LoadState", "NextElapseUSecRealtime", "LastTriggerUSec")
+         "LoadState", "NextElapseUSecRealtime", "LastTriggerUSec", "UnitFileState")
 
 
 def systemctl_show(unit: str) -> dict:

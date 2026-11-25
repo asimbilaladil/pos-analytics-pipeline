@@ -7,6 +7,11 @@
 state_db = "/var/lib/laynes/monitor/monitor.db"
 log_file = "/var/lib/laynes/monitor/monitor.log"
 release_dir = "/root/pos-analytics-pipeline-release"
+# The heartbeat (run by BOTH tiers) needs every tier to SUCCEED within its limit
+# and its timer to be enabled + active. Grace after the first ever run:
+install_grace_minutes = 60
+# Tiers you deliberately do not run (shown as ACCEPTED, never alerted):
+disabled_tiers = []
 
 [revel]
 ready_after_local = "09:45"      # revel-daily-sync 09:00 + ~25 min
@@ -36,6 +41,9 @@ dry_run = true
 immediate_min_severity = "HIGH"  # WARNING goes to the dashboard + daily summary only
 notify_resolutions = true
 dashboard_url = "https://intelligence.aygchicken.com/"
+max_attempts = 5                 # then FAILED (permanent) + a delivery incident
+retry_base_seconds = 60          # backoff 1, 2, 4, 8 min ... capped at:
+retry_max_seconds = 3600
 
 # [notify.email]
 # smtp_host = "smtp.example.com"
@@ -44,16 +52,16 @@ dashboard_url = "https://intelligence.aygchicken.com/"
 # from_addr = "monitor@example.com"
 # to_addrs = ["owner@example.com"]
 
-[services]
-# Once the monitor timers are installed, add them so a disabled timer is caught:
-# timers = ["revel-daily-sync.timer", "hme-daily-ingest.timer",
-#           "hme-reconciliation-retry.timer", "r365-weekly-ingest.timer",
-#           "laynes-loyalty-labor-sync.timer", "revel-items-selfheal.timer",
-#           "laynes-monitor-data.timer", "laynes-monitor-summary.timer"]
+# [services] timers: the ingestion timers (defaults in monitoring/config.py).
+# The monitor's OWN timers are checked by the heartbeat; no need to list them.
 
 [infra]
 backup_globs = ["/root/deploy-backups/*/*.dump", "/var/backups/laynes/*.dump"]
-backup_max_age_hours = 26
+backup_max_age_hours = 26       # FRESHNESS only -- not proof of recoverability
+# Evidence from future offsite / restore-test jobs (docs/BACKUP_PROPOSAL.md).
+# Empty = "not monitored" on the dashboard.
+# offsite_status_glob = "/var/backups/laynes/status/offsite-*.json"
+# restore_test_status_glob = "/var/backups/laynes/status/restore-*.json"
 
 [summary]
 local_times = ["07:00"]

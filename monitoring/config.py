@@ -30,16 +30,32 @@ DEFAULTS: dict = {
         "log_file": "/var/lib/laynes/monitor/monitor.log",
         # Code the Revel check imports its reconciliation from (chat_sql).
         "release_dir": "/root/pos-analytics-pipeline-release",
-        # A tier whose last successful run is older than this is itself an incident.
+        # A tier whose last SUCCESSFUL run is older than this is itself an incident.
         "heartbeat_max_minutes": {"health": 15, "data": 45, "summary": 1500},
+        # How often each tier's timer fires (minutes). Used for staleness on the
+        # dashboard: a check whose last success is older than 3 periods is STALE.
+        "tier_period_minutes": {"health": 5, "data": 15, "summary": 1440},
+        # The systemd timer that drives each tier. The heartbeat checks it is
+        # loaded, enabled and active.
+        "tier_timers": {"health": "laynes-monitor-health.timer",
+                        "data": "laynes-monitor-data.timer",
+                        "summary": "laynes-monitor-summary.timer"},
+        # Tiers deliberately not run here (reported ACCEPTED, never alerted).
+        # Every other tier is EXPECTED: never having run is an incident once the
+        # install grace has passed.
+        "disabled_tiers": [],
+        # Grace after the store's first ever run, so installing the units one by
+        # one does not page. A tier is judged after max(grace, its heartbeat limit).
+        "install_grace_minutes": 60,
         "check_timeout_seconds": 120,
     },
     "postgres": {
         # Names of environment variables, never the values.
         "host_env": "DB_HOST", "port_env": "DB_PORT", "dbname_env": "DB_NAME",
         "user_env": "MONITOR_DB_USER", "password_env": "MONITOR_DB_PASS",
-        # The Revel reconciliation reuses chat_sql, which connects as the
-        # read-only analytics role (DB_RO_USER / DB_RO_PASS).
+        # The Revel reconciliation reuses chat_sql.revel_store_breakdown, but on a
+        # connection from monitoring/pg.py (this role, same limits) -- see
+        # checks/revel.py. DB_RO_USER / DB_RO_PASS are not used by the monitor.
         "statement_timeout_ms": 30000,
         "lock_timeout_ms": 2000,
         "connect_timeout_s": 10,
@@ -141,6 +157,12 @@ DEFAULTS: dict = {
         "backup_globs": ["/root/deploy-backups/*/*.dump", "/var/backups/laynes/*.dump"],
         "backup_max_age_hours": 26,
         "backup_severity": "HIGH",
+        # Optional evidence from future jobs (docs/BACKUP_PROPOSAL.md): JSON status
+        # files {"ok": bool, "completed_at": ISO, "dump": path}. Empty = not monitored.
+        "offsite_status_glob": "",
+        "offsite_max_age_hours": 30,
+        "restore_test_status_glob": "",
+        "restore_test_max_age_hours": 24 * 8,
     },
     "notify": {
         # "log" writes notifications to the log only. Real delivery needs
@@ -150,6 +172,11 @@ DEFAULTS: dict = {
         "immediate_min_severity": "HIGH",
         "notify_resolutions": True,
         "max_attempts": 5,
+        # Exponential backoff between attempts: 60s, 2m, 4m, 8m ... capped at 1h.
+        "retry_base_seconds": 60,
+        "retry_max_seconds": 3600,
+        # A delivering process's lease on a row (longer than any send timeout).
+        "lease_seconds": 300,
         "telegram": {"bot_token_env": "MONITOR_TELEGRAM_BOT_TOKEN",
                      "chat_id_env": "MONITOR_TELEGRAM_CHAT_ID",
                      "api_base": "https://api.telegram.org"},
@@ -201,6 +228,19 @@ def validate(cfg: dict) -> None:
         raise ValueError(f"notify.channels: unknown {sorted(unknown)}")
     for t in cfg["summary"]["local_times"]:
         parse_hhmm(t)
+    m = cfg["monitor"]
+    tiers = set(m["heartbeat_max_minutes"])
+    if tiers != {"health", "data", "summary"}:
+        raise ValueError("monitor.heartbeat_max_minutes must cover health, data and summary")
+    if not tiers <= set(m["tier_period_minutes"]) or not tiers <= set(m["tier_timers"]):
+        raise ValueError("monitor.tier_period_minutes / tier_timers must cover every tier")
+    if set(m["disabled_tiers"]) - tiers:
+        raise ValueError(f"monitor.disabled_tiers: unknown {sorted(set(m['disabled_tiers']) - tiers)}")
+    n = cfg["notify"]
+    if not (1 <= int(n["max_attempts"]) <= 20):
+        raise ValueError("notify.max_attempts must be 1..20")
+    if not (1 <= int(n["retry_base_seconds"]) <= int(n["retry_max_seconds"]) <= 86400):
+        raise ValueError("notify: need 1 <= retry_base_seconds <= retry_max_seconds <= 86400")
 
 
 def parse_hhmm(s: str) -> time:

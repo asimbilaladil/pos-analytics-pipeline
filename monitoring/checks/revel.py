@@ -13,6 +13,8 @@ same failure categories. The monitor only adds:
 from __future__ import annotations
 
 import sys
+import threading
+from contextlib import contextmanager
 from datetime import timedelta
 
 from .. import clock
@@ -20,6 +22,7 @@ from ..model import (ACCEPTED, CRITICAL, FAIL, HIGH, OK, PENDING, SRC_REVEL, WAR
                      CheckResult)
 from ..pg import rows
 
+_PATCH_LOCK = threading.Lock()
 CHECK_SYNC = "sync_freshness"
 CHECK_RECON = "sales_reconciliation"
 CHECK_NETWORK = "network_reconciliation"
@@ -53,6 +56,50 @@ def _chat_sql(ctx):
         sys.path.insert(0, rel)
     import chat_sql  # noqa: E402  (the production reconciliation, imported not copied)
     return chat_sql
+
+
+@contextmanager
+def monitor_connection(ctx, C):
+    """Run chat_sql's reconciliation on a connection the MONITOR controls.
+
+    chat_sql.revel_store_breakdown opens its own connection through
+    chat_sql._ro_conn() (DB_RO_USER, no connect/lock timeout) and closes it in a
+    finally. For the monitor's process only, _ro_conn is pointed at
+    monitoring.pg.connect for the duration of the call, so the SAME SQL and the
+    SAME verdict code run on a session that is:
+      * the monitor role (laynes_monitor), not the analytics role;
+      * read-only on the server (default_transaction_read_only=on, verified
+        before the first query; refused otherwise);
+      * bounded: connect_timeout, lock_timeout, idle_in_transaction timeout,
+        and statement_timeout (chat_sql then lowers it to its own 15 s);
+      * opened and closed per call (chat_sql's finally closes it; the wrapper
+        below also closes it if chat_sql never reached its finally).
+    chat_sql itself is not modified. Checks RUN only in the monitor's own process
+    (laynes-monitor-*.service, via engine.run_tier). laynes-api imports the
+    check registry only for metadata (names, tiers, sources) to compute the
+    dashboard states; it never calls engine.run_tier or a check function
+    (asserted by tests), so this swap can never happen inside AI Chat's process.
+    """
+    opened = []
+
+    def factory():
+        conn = ctx.monitor_pg_connect()
+        opened.append(conn)
+        return conn
+
+    with _PATCH_LOCK:
+        orig = C._ro_conn
+        C._ro_conn = factory
+        try:
+            yield
+        finally:
+            C._ro_conn = orig
+            for conn in opened:
+                if not getattr(conn, "closed", True):
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 def freshness(ctx) -> list[CheckResult]:
@@ -118,7 +165,8 @@ def reconciliation(ctx) -> list[CheckResult]:
                     store_name=s["name"], business_date=d,
                     title=f"Awaiting Revel daily sync (ready after {ready:%H:%M %Z} {ready:%m-%d})"))
             continue
-        b = C.revel_store_breakdown(d, (day + timedelta(days=1)).isoformat())
+        with monitor_connection(ctx, C):
+            b = C.revel_store_breakdown(d, (day + timedelta(days=1)).isoformat())
         seen = set()
         hard = 0
         for s in b["stores"]:
