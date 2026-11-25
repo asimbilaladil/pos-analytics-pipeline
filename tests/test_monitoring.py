@@ -611,7 +611,8 @@ RUNS = [{"requested_fiscal_year": 2026, "requested_period_number": 11, "id": 31,
 pg = FakePG([("FROM ayg_business_periods", P), ("FROM r365_financial_ingest_run", RUNS)])
 ctx = engine.Context(make_cfg(), Store(":memory:"), now, "data", pg_connect=lambda: pg)
 fres = {r.qualifier: r for r in r365.financial(ctx) if r.check == "period_coverage"}
-check("open fiscal period -> PENDING", fres["FY2026 P12"].state == PENDING)
+check("open fiscal period never loaded -> WARNING missing_ingestion (no longer hidden as 'open')",
+      fres["FY2026 P12"].category == "missing_ingestion" and fres["FY2026 P12"].severity == WARNING)
 check("closed period last loaded before close -> WARNING stale_after_close",
       fres["FY2026 P11"].severity == WARNING and fres["FY2026 P11"].category == "stale_after_close")
 check("P10 loaded after close but before the 42-day repair window ended -> WARNING "

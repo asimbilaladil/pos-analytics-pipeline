@@ -104,7 +104,7 @@ DEFAULTS: dict = {
         # 42 days. Inside this window a closed period must keep being refreshed;
         # after it, the last load must postdate the window to count as final.
         "financial_repair_window_days": 42,
-        "financial_refresh_max_age_hours": 72,
+        "financial_refresh_max_age_hours": 30,   # == r365_financial_freshness.MAX_REFRESH_AGE_HOURS
         "financial_timer": "r365-financial-ingest.timer",
         "financial_lookback_periods": 2,
     },

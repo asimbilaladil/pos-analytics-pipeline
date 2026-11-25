@@ -24,6 +24,18 @@ Environment=R365_FIN_RAW_DIR=/var/lib/laynes/r365-financial/raw
 Environment=R365_FIN_LOCK_PATH=/var/lib/laynes/r365-financial/state/ingest.lock
 # ~15 requests on a normal day (~3 s observed), ~150 on a Monday repair.
 TimeoutStartSec=1800
+# The log files below are opened by systemd BEFORE the process starts; their
+# directory must exist or the unit fails with 209/STDOUT before any code runs (the
+# reason the unit as first written could not have run). StateDirectory= creates
+# /var/lib/laynes/r365-financial/{state,logs} (0700, root) on every start.
+StateDirectory=laynes/r365-financial/state laynes/r365-financial/logs
+StateDirectoryMode=0700
+# Light and bounded: ~15 GET requests on a normal day, ~150 on Mondays.
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=600M
+NoNewPrivileges=yes
+PrivateTmp=yes
 # Exit contract (see r365_financial_ingest.py):
 #   0  every target COMPLETE (the open current period counts as expected)
 #   1  a target FAILED (or configuration error)                 -- red

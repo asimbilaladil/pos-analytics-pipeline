@@ -31,6 +31,7 @@ import psycopg2
 import re
 import psycopg2.errors
 import psycopg2.extras
+import r365_financial_freshness as R365_FRESH  # noqa: E402  (shared with the data monitor)
 from pglast import ast, parse_sql
 from pglast.parser import ParseError
 
@@ -3686,7 +3687,8 @@ _R365_FIN_COVERAGE_SQL = """
 SELECT fiscal_year, period_number, period_label, period_start, period_end,
        period_status, analytics_category, source_data_status,
        expected_store_count, stores_with_posting, stores_without_posting,
-       source_last_sync_at, source_sync_stale, latest_refresh_failed, loaded_at
+       source_last_sync_at, source_sync_stale, latest_refresh_failed, loaded_at,
+       reconciliation_ok
   FROM v_r365_financial_coverage_llm
  ORDER BY period_start, analytics_category
 """
@@ -3737,6 +3739,15 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
     def iso(d):
         return d.isoformat() if d else None
 
+    def refresh(c):
+        st, code, why = R365_FRESH.period_refresh_state(
+            period_end=c["period_end"], today=now.date(), now=now, loaded_at=c["loaded_at"],
+            period_open=c["period_status"] == "CURRENT",
+            source_complete=c["source_data_status"] == "COMPLETE",
+            reconciliation_ok=c.get("reconciliation_ok"),
+            refresh_failed=bool(c["latest_refresh_failed"]))
+        return st, why
+
     return {
         "available": bool(in_scope),
         "source": ("v_r365_financial_period_llm (VERIFIED stores and VERIFIED "
@@ -3754,6 +3765,10 @@ def _r365_fin_block(cur, establishment_id, period_start, period_end, now=None):
             "stores_without_posting": c["stores_without_posting"],
             "expected_store_count": c["expected_store_count"],
             "latest_refresh_failed": c["latest_refresh_failed"],
+            # FINAL / PROVISIONAL / STALE / UNVERIFIED (r365_financial_freshness)
+            "refresh_state": refresh(c)[0],
+            "refresh_state_reason": refresh(c)[1],
+            "loaded_at": iso(c["loaded_at"]),
         } for c in in_scope],
         "calendar_periods_not_loaded": not_loaded,
         "no_posting_in_scope": [f"{r['store_name']} {r['period_label']} "
@@ -3815,6 +3830,33 @@ def r365_fin_result_note(gate_meta, sql: str | None = None) -> str | None:
     """
     gate_meta = gate_meta or {}
     f = gate_meta.get("r365_financial") or {}
+    freshness = r365_fin_freshness_note(f)
+    note = _r365_fin_result_note_body(gate_meta, f, sql)
+    if freshness:
+        return freshness + (" " + note if note else "")
+    return note
+
+
+def r365_fin_freshness_note(f: dict) -> str | None:
+    """PURE. One sentence per non-FINAL period in scope, so a stale or provisional
+    figure is never shown without its label."""
+    parts = []
+    for p in f.get("periods_in_scope") or []:
+        st = p.get("refresh_state")
+        lbl = f"FY{p['fiscal_year']} {p['period_label']}"
+        if st == "STALE":
+            parts.append(f"{lbl} figures are STALE -- last loaded {(p.get('loaded_at') or '?')[:10]}; "
+                         "they may be missing later postings and must not be presented as current.")
+        elif st == "PROVISIONAL":
+            parts.append(f"{lbl} figures are PROVISIONAL and can still change.")
+        elif st == "UNVERIFIED":
+            parts.append(f"{lbl} figures are UNVERIFIED ({p.get('refresh_state_reason')}).")
+    if not parts:
+        return None
+    return "R365 FINANCIAL DATA STATE: " + " ".join(dict.fromkeys(parts))
+
+
+def _r365_fin_result_note_body(gate_meta, f, sql):
     no_posting = list(f.get("no_posting_in_scope") or [])
     no_ident = list(f.get("no_identifiable_posting") or [])
     named = {c for c in f.get("verified_categories") or [] if sql and f"'{c}'" in sql}
@@ -3923,6 +3965,22 @@ def _r365_fin_gate(f: dict) -> tuple[list, list]:
                      f"{f.get('refresh_schedule')}); recent postings may be missing")
     if f.get("source_sync_stale"):
         warns.append("R365 FINANCIAL: the source system reported its own sync as stale")
+    by_state: dict[str, dict[str, str]] = {}
+    for p in f.get("periods_in_scope") or []:
+        st = p.get("refresh_state")
+        if st in ("STALE", "PROVISIONAL", "UNVERIFIED"):
+            by_state.setdefault(st, {})[f"FY{p['fiscal_year']} {p['period_label']}"] = \
+                p.get("refresh_state_reason") or ""
+    for lbl, why in sorted((by_state.get("STALE") or {}).items()):
+        warns.append(f"R365 FINANCIAL {lbl} is STALE ({why}). Say these figures are NOT "
+                     f"current, give the last load date, and never present them as final or "
+                     f"compare them as if complete")
+    for lbl, why in sorted((by_state.get("PROVISIONAL") or {}).items()):
+        warns.append(f"R365 FINANCIAL {lbl} is PROVISIONAL ({why}): label the figures "
+                     "provisional -- they can still change")
+    for lbl, why in sorted((by_state.get("UNVERIFIED") or {}).items()):
+        warns.append(f"R365 FINANCIAL {lbl} is UNVERIFIED ({why}): do not present its figures "
+                     "as verified")
     return fails, warns
 
 
