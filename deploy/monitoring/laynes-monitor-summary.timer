@@ -1,0 +1,12 @@
+# Daily readiness summary before business users start. Revel's previous day is
+# still "pending" at 07:00 (revel-daily-sync runs 09:00); alerts for it follow
+# at readiness. Add a second OnCalendar line (e.g. 10:50) for a post-sync recap.
+[Unit]
+Description=Laynes data monitor, daily readiness summary
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 America/Chicago
+Persistent=true
+
+[Install]
+WantedBy=timers.target

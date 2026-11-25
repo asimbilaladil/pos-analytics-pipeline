@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ChevronDown, Eye, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
+import { Activity, ChevronDown, Eye, LogOut, Menu, Plus, Sparkles } from 'lucide-react'
 import type { ModelOption, ProviderInfo, User } from '../types'
 import { PROVIDER_NAMES } from '../lib/format'
 
@@ -12,7 +12,7 @@ import { PROVIDER_NAMES } from '../lib/format'
  */
 export function Header({
   user, models, providers = [], model, onModelChange, onNewChat, onSignOut, onOpenSidebar,
-  onOpenAdmin,
+  onOpenAdmin, onOpenMonitoring,
 }: {
   user: User | null
   /** Server-approved options only; the select can never send anything else. */
@@ -24,6 +24,7 @@ export function Header({
   onSignOut: () => void
   onOpenSidebar: () => void
   onOpenAdmin?: () => void
+  onOpenMonitoring?: () => void
 }) {
   // Real data only: initials come from the signed-in account, never invented.
   const name = user?.full_name?.trim() || user?.email?.split('@')[0] || null
@@ -104,7 +105,8 @@ export function Header({
 
         {initials ? (
           <ProfileMenu name={name!} email={user?.email ?? null} initials={initials}
-                       onSignOut={onSignOut} onOpenAdmin={onOpenAdmin} />
+                       onSignOut={onSignOut} onOpenAdmin={onOpenAdmin}
+                       onOpenMonitoring={onOpenMonitoring} />
         ) : (
           <button onClick={onSignOut}
             className="whitespace-nowrap rounded-lg px-2.5 py-2 text-[13px] font-medium
@@ -122,12 +124,13 @@ export function Header({
  * a deliberate second click on the menu item, which reuses the same `onSignOut`
  * handler the header already owns — there is no second copy of that logic.
  */
-function ProfileMenu({ name, email, initials, onSignOut, onOpenAdmin }: {
+function ProfileMenu({ name, email, initials, onSignOut, onOpenAdmin, onOpenMonitoring }: {
   name: string
   email: string | null
   initials: string
   onSignOut: () => void
   onOpenAdmin?: () => void
+  onOpenMonitoring?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
@@ -193,6 +196,18 @@ function ProfileMenu({ name, email, initials, onSignOut, onOpenAdmin }: {
             >
               <Eye size={14} className="text-ink-400" />
               All users' chats
+            </button>
+          )}
+          {onOpenMonitoring && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => { setOpen(false); onOpenMonitoring() }}
+              className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]
+                         font-medium text-ink-700 transition-colors hover:bg-app hover:text-ink-900"
+            >
+              <Activity size={14} className="text-ink-400" />
+              Data monitoring
             </button>
           )}
           <button

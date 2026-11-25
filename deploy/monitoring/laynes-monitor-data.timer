@@ -1,0 +1,15 @@
+# Every 15 minutes, offset 2 minutes from the health tier. Heavy checks inside
+# carry their own minimum interval (Revel reconciliation hourly, R365 financial
+# 6-hourly). Readiness windows in the config, not the timer, decide when a
+# business day is judged: Revel after 09:45, HME after 06:30 (settling) and
+# 10:45 (post-retry), R365 week after Thu 21:30 -- all America/Chicago.
+[Unit]
+Description=Laynes data monitor, data tier, every 15 minutes
+
+[Timer]
+OnCalendar=*:2/15
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

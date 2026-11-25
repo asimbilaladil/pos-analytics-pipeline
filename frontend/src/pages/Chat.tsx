@@ -11,8 +11,8 @@ import type { AskAccepted, ChatJob, Conversation, Message, ModelOption, ModelsIn
 import { modelLabel, providerOfId } from '../lib/format'
 import { loadResume, mayHaveReachedServer, saveResume, type InflightSend } from '../lib/chatResume'
 
-export function Chat({ user, onSignedOut, onOpenAdmin }: {
-  user: User; onSignedOut: () => void; onOpenAdmin?: () => void
+export function Chat({ user, onSignedOut, onOpenAdmin, onOpenMonitoring }: {
+  user: User; onSignedOut: () => void; onOpenAdmin?: () => void; onOpenMonitoring?: () => void
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
@@ -436,6 +436,7 @@ export function Chat({ user, onSignedOut, onOpenAdmin }: {
           user={user}
           models={models} providers={providers} model={model} onModelChange={setModel}
           onNewChat={newChat} onSignOut={signOut} onOpenAdmin={onOpenAdmin}
+          onOpenMonitoring={onOpenMonitoring}
           onOpenSidebar={() => setSidebarOpen(true)}
         />
 
