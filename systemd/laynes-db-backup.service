@@ -1,0 +1,43 @@
+[Unit]
+Description=Laynes PostgreSQL backup (pg_dump snapshot + manifest + archive verification)
+Documentation=file:///root/pos-analytics-pipeline-release/docs/DATABASE_BACKUP.md
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+# Peer authentication over the local UNIX socket: no password exists anywhere
+# (no Environment=, no EnvironmentFile=, nothing in `systemctl show`).
+User=postgres
+Group=postgres
+UMask=0077
+Environment=LAYNES_BACKUP_CONFIG=/etc/laynes-backup/backup.toml
+# Installed copy (root-owned): postgres cannot read /root, and the unit must not
+# depend on a git checkout. See docs/DATABASE_BACKUP.md "Install".
+ExecStart=/usr/bin/python3 -I /usr/local/lib/laynes-backup/laynes_db_backup.py backup
+# PREREQUISITE: /var/backups/laynes must exist (0700 postgres) BEFORE the unit
+# starts -- systemd sets up ReadWritePaths= before ExecStart and fails with
+# 226/NAMESPACE if it is missing. Created by laynes-db-backup.tmpfiles.conf.
+ReadWritePaths=/var/backups/laynes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2h
+# Resources: one core at most, idle I/O class. The PostgreSQL backend that serves
+# pg_dump runs in postgresql.service's cgroup, not here; the 02:30 window keeps it
+# away from every ingestion job (docs/DATABASE_BACKUP.md "Schedule").
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=768M
+# Sandboxing. /root (incl. /root/deploy-backups) is not even visible.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes

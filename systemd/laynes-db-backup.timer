@@ -1,0 +1,19 @@
+[Unit]
+Description=Laynes PostgreSQL backup, daily 02:30 America/Chicago
+
+[Timer]
+# Timezone inside the expression (systemd 252+; a Timezone= key does not exist).
+#   systemd-analyze calendar --iterations=2 '*-*-* 02:30:00 America/Chicago'
+#   CST -> 08:30 UTC, CDT -> 07:30 UTC.
+# 02:30 Chicago is the quietest point of the day: after the 21:30 self-heal and the
+# Thursday 20:00 R365 weekly ingest, before the 04:15 loyalty sync, 05:30 HME daily,
+# 07:00 R365 financial, 09:00 Revel sync and 10:15 HME retry. A dump takes minutes.
+OnCalendar=*-*-* 02:30:00 America/Chicago
+# No catch-up after downtime: a full dump at an arbitrary daytime hour would
+# compete with ingestion and users. A missed night is caught by the monitor
+# (no successful scheduled backup in 26 h -> HIGH).
+Persistent=false
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

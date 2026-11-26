@@ -44,7 +44,8 @@ class Context:
     def __init__(self, cfg: dict, store: Store, now: datetime, tier: str, *,
                  pg_connect=None, http=None, systemctl=None, disk_usage=None,
                  mem_available_mb=None, newest_backup=None, cert_expiry=None,
-                 backup_format=None, read_status_json=None):
+                 backup_format=None, read_status_json=None, read_status_jsons=None,
+                 file_size=None):
         self.cfg, self.store, self.now, self.tier = cfg, store, now, tier
         self._pg_connect = pg_connect or (lambda: pg.connect(cfg))
         # A SEPARATE, fresh monitor session for code that manages its own
@@ -60,6 +61,8 @@ class Context:
         self.cert_expiry = cert_expiry or svc_checks.cert_expiry
         self.backup_format = backup_format or infra_checks.dump_format
         self.read_status_json = read_status_json or infra_checks.read_status_json
+        self.read_status_jsons = read_status_jsons or infra_checks.read_status_jsons
+        self.file_size = file_size or infra_checks.file_size
         self.source_updates: dict[str, tuple] = {}
 
     def pg(self):

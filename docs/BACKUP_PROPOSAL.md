@@ -1,5 +1,12 @@
 # Proposal: scheduled PostgreSQL backups with verification
 
+> **Superseded by `docs/DATABASE_BACKUP.md`** (2026-11-26), which implements this
+> proposal with these corrections: it adds snapshot-consistent row counts and
+> fingerprints, a disk guard, a critical-table restore mode, and local retention
+> sized for the current disk. It also records that the monitor's file-age check
+> could be satisfied by a partial pre-deploy dump.
+> This file is kept as the record of the original proposal.
+
 **Status: PROPOSAL ONLY.** Nothing here has been installed, scheduled or run. PR
 #38 adds no backup job. It does not create, delete or modify backups.
 

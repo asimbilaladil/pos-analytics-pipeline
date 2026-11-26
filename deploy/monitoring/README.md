@@ -200,5 +200,5 @@ notices on, and WARNING via the 07:00 summary only.
   status API from outside (`docs/MONITORING_API.md`). Alert if it is
   unreachable, if `monitor.state` is not HEALTHY, or if a tier's
   `last_success_at` is too old.
-- Backups: see `docs/BACKUP_PROPOSAL.md`. The backup check reports freshness only
+- Backups: see `docs/DATABASE_BACKUP.md` (scheduled job, restore test, monitor settings). The backup check reports freshness only
   until offsite and restore-test status files exist.

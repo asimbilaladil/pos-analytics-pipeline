@@ -163,6 +163,12 @@ DEFAULTS: dict = {
         # this at the backup location once one exists.
         "backup_globs": ["/root/deploy-backups/*/*.dump", "/var/backups/laynes/*.dump"],
         "backup_max_age_hours": 26,
+        # The scheduled job's status files (docs/DATABASE_BACKUP.md). When set,
+        # ONLY a successful scheduled backup satisfies freshness; backup_globs
+        # (manual / pre-deploy dumps) are then listed for information only.
+        # Empty = legacy file-age check over backup_globs.
+        "backup_status_glob": "",
+        "backup_timer": "laynes-db-backup.timer",
         "backup_severity": "HIGH",
         # Optional evidence from future jobs (docs/BACKUP_PROPOSAL.md): JSON status
         # files {"ok": bool, "completed_at": ISO, "dump": path}. Empty = not monitored.
