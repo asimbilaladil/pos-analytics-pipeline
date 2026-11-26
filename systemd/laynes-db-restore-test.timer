@@ -1,0 +1,14 @@
+[Unit]
+Description=Laynes backup restore test, weekly Sunday 00:00 America/Chicago
+
+[Timer]
+#   systemd-analyze calendar --iterations=2 'Sun *-*-* 00:00:00 America/Chicago'
+# Tests the newest backup (Saturday 02:30). Runs >4 h ahead of the 04:15 loyalty
+# sync and >2 h ahead of Sunday's 02:30 backup; the shared lock serialises them
+# anyway. The monitor flags a restore test older than 8 days.
+OnCalendar=Sun *-*-* 00:00:00 America/Chicago
+Persistent=false
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+# /etc/laynes-backup/backup.toml  (root:postgres 0640). Contains NO secrets:
+# the backup connects as the OS user postgres over the UNIX socket (peer auth).
+# Every key is optional; defaults are in backup/laynes_db_backup.py (DEFAULTS).
+# Unknown keys are rejected.
+
+backup_dir = "/var/backups/laynes"
+database = "laynes"
+pg_bin = "/usr/lib/postgresql/18/bin"
+compress = "zstd:3"
+lock_wait_timeout = "120s"      # pg_dump gives up instead of queueing behind DDL
+
+# Local copies (same disk as the database: protects against mistakes and bad
+# deploys, NOT against losing the server). Long retention belongs off-server.
+keep_daily = 2
+keep_weekly = 0
+
+# Disk guard (monitor warns at 85 % used/total on "/").
+max_used_pct = 84.0
+min_free_bytes = 2147483648
+
+# "critical": schema + the critical tables (and their FK parents) restored and
+#             compared row-for-row; fits on the current disk.
+# "full":     the whole database; needs ~1.15 x database size free (~9.6 GB today).
+restore_mode = "critical"
+restore_port = 54399

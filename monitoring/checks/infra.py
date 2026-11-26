@@ -122,6 +122,116 @@ def read_status_json(path_glob: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
+def read_status_jsons(path_glob: str) -> list[tuple[str, dict | None]]:
+    """Every JSON status file matching a glob, newest first by file time (the job
+    writes each status once, atomically, when the attempt ends). Unreadable files
+    are kept as None so a corrupt status is visible, not skipped."""
+    out = []
+    for p in glob.glob(path_glob):
+        try:
+            with open(p) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            d = None
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        out.append((mt, p, d if isinstance(d, dict) else None))
+    out.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [(p, d) for _m, p, d in out]
+
+
+def file_size(path: str) -> int | None:
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
+def _parse_ts(v) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(v))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _scheduled_backup(ctx, c, out: list, detail: dict):
+    """Freshness from the scheduled job's OWN status files (laynes-db-backup):
+    only a backup the job recorded as complete and verified counts, the file it
+    names must still exist with the recorded size, and a failed attempt newer than
+    the last success is reported at once. Manual / pre-deploy dumps are listed for
+    information and never satisfy this check."""
+    base = dict(source=SRC_INFRA, check="backup_freshness",
+                expected=f"a successful SCHEDULED backup newer than {c['backup_max_age_hours']}h "
+                         f"(archive-verified; restore status reported separately)")
+    statuses = ctx.read_status_jsons(c["backup_status_glob"])
+    ok_i = next((i for i, (_p, d) in enumerate(statuses) if d and d.get("ok") is True
+                 and _parse_ts(d.get("completed_at"))), None)
+    fail_i = next((i for i, (_p, d) in enumerate(statuses) if not d or d.get("ok") is not True), None)
+    last_ok = statuses[ok_i] if ok_i is not None else None
+    last_fail = statuses[fail_i] if fail_i is not None else None
+    ok_at = _parse_ts(last_ok[1]["completed_at"]) if last_ok else None
+    t = ctx.systemctl(c["backup_timer"]) if c.get("backup_timer") else {}
+    detail["mode"] = "scheduled job status files"
+    detail["timer"] = {"unit": c.get("backup_timer"), "state": t.get("UnitFileState"),
+                       "next_scheduled": t.get("NextElapseUSecRealtime") or None}
+    if last_ok:
+        d = last_ok[1]
+        size_now = ctx.file_size(d.get("dump") or "")
+        detail["last_success"] = {
+            "completed_at": d.get("completed_at"), "dump": d.get("dump"),
+            "age_hours": round((ctx.now - ok_at).total_seconds() / 3600, 1),
+            "size_bytes": d.get("bytes"), "size_on_disk": size_now,
+            "sha256": (d.get("sha256") or "")[:16], "verified": d.get("verify"),
+            "status_file": last_ok[0]}
+        detail["local"] = {"path": d.get("dump"), "modified_at": d.get("completed_at"),
+                           "age_hours": detail["last_success"]["age_hours"], "format": "pg_dump custom archive",
+                           "restore_verified": False}
+    else:
+        detail["last_success"] = None
+    if last_fail:
+        f = last_fail[1] or {}
+        detail["last_failure"] = {"started_at": f.get("started_at"), "stage": f.get("stage"),
+                                  "error": str(f.get("error") or "unreadable status file")[:300],
+                                  "status_file": last_fail[0]}
+    else:
+        detail["last_failure"] = None
+    path, ts = ctx.newest_backup(c["backup_globs"]) if c.get("backup_globs") else (None, None)
+    detail["manual_backups"] = ({"newest": path, "modified_at": ts.isoformat(timespec="seconds"),
+                                 "note": "manual/pre-deploy dump: does NOT satisfy this check"}
+                                if ts else None)
+    ev = {**detail}
+    if last_fail and (ok_i is None or fail_i < ok_i):        # newest attempt failed
+        out.append(CheckResult(state=FAIL, severity=c["backup_severity"], category="backup_failed",
+                               title="Last scheduled database backup attempt failed",
+                               actual=f"{(last_fail[1] or {}).get('stage')}: "
+                                      f"{detail['last_failure']['error'][:160]}",
+                               evidence=ev, actions=_backup_actions(scheduled=True), **base))
+    elif not last_ok:
+        out.append(CheckResult(state=FAIL, severity=c["backup_severity"], category="no_backup",
+                               title="No successful scheduled database backup recorded",
+                               actual="none", evidence=ev, actions=_backup_actions(scheduled=True), **base))
+    elif detail["last_success"]["size_on_disk"] != last_ok[1].get("bytes"):
+        out.append(CheckResult(state=FAIL, severity=c["backup_severity"], category="backup_missing",
+                               title="Newest scheduled backup file is missing or changed",
+                               actual=f"{last_ok[1].get('dump')}: recorded {last_ok[1].get('bytes')} bytes, "
+                                      f"on disk {detail['last_success']['size_on_disk']}",
+                               evidence=ev, actions=_backup_actions(scheduled=True), **base))
+    elif detail["last_success"]["age_hours"] > c["backup_max_age_hours"]:
+        out.append(CheckResult(state=FAIL, severity=c["backup_severity"], category="stale_backup",
+                               title="Database backup is stale (no successful scheduled backup)",
+                               actual=f"last successful scheduled backup {last_ok[1]['completed_at']}",
+                               evidence=ev, actions=_backup_actions(scheduled=True), **base))
+    else:
+        mib = (last_ok[1].get("bytes") or 0) / 1024 / 1024
+        out.append(CheckResult(state=OK, title="Scheduled backup OK (archive verified)",
+                               actual=f"{detail['last_success']['age_hours']}h old, {mib:.0f} MiB",
+                               evidence=ev, **base))
+    return ok_at
+
+
 def backups(ctx) -> list[CheckResult]:
     """Backup FRESHNESS -- plus offsite and restore-test status only where a
     status file gives real evidence. A file's modification time proves a dump
@@ -129,6 +239,11 @@ def backups(ctx) -> list[CheckResult]:
     "recoverable" unless a restore test recorded success."""
     c = ctx.cfg["infra"]
     out = []
+    if c.get("backup_status_glob"):
+        detail = {"local": None, "offsite": "not monitored (no offsite status configured)",
+                  "restore_test": "not monitored (no restore-test status configured)"}
+        ts = _scheduled_backup(ctx, c, out, detail)
+        return _evidence_checks(ctx, c, out, detail, ts)
     path, ts = ctx.newest_backup(c["backup_globs"])
     base = dict(source=SRC_INFRA, check="backup_freshness",
                 expected=f"a local database dump newer than {c['backup_max_age_hours']}h "
@@ -161,6 +276,10 @@ def backups(ctx) -> list[CheckResult]:
         else:
             out.append(CheckResult(state=OK, title="Local backup fresh (not restore-verified)",
                                    actual=f"{age_h}h old", evidence=ev, **base))
+    return _evidence_checks(ctx, c, out, detail, ts)
+
+
+def _evidence_checks(ctx, c, out, detail, ts) -> list[CheckResult]:
     out += _status_file_check(ctx, detail, "offsite", c.get("offsite_status_glob"),
                               c["offsite_max_age_hours"], "backup_offsite",
                               "an offsite copy newer than {h}h")
@@ -194,8 +313,14 @@ def _status_file_check(ctx, detail, kind, path_glob, max_h, check, expected):
         at = None
     detail[kind] = {"status_file": path, "ok": st.get("ok"), "completed_at": st.get("completed_at"),
                     "dump": st.get("dump")}
+    if st.get("mode"):
+        detail[kind]["mode"] = st.get("mode")
     if kind == "restore_test" and st.get("ok") is True and at is not None:
         detail["newest_verified_backup"] = {"dump": st.get("dump"), "verified_at": st.get("completed_at")}
+        if st.get("mode"):
+            detail["newest_verified_backup"]["mode"] = st.get("mode")
+    if kind == "restore_test" and st.get("mode"):
+        label += f" ({st.get('mode')})"
     if st.get("ok") is not True:
         return [CheckResult(state=FAIL, severity=HIGH, category=f"{check}_failed",
                             title=f"{label} failed", actual=str(st.get("detail") or "ok=false")[:200],
@@ -209,7 +334,12 @@ def _status_file_check(ctx, detail, kind, path_glob, max_h, check, expected):
                         evidence=detail[kind], **base)]
 
 
-def _backup_actions() -> list[str]:
+def _backup_actions(scheduled: bool = False) -> list[str]:
+    if scheduled:
+        return ["`journalctl -u laynes-db-backup -n 200`; status files in /var/backups/laynes/status/.",
+                "Run one backup now (approved operators): `systemctl start laynes-db-backup.service`.",
+                "docs/DATABASE_BACKUP.md \"Failure handling\". This check never creates, deletes "
+                "or modifies backups."]
     return ["No scheduled pg_dump exists on this host (only manual pre-deploy dumps). "
             "Confirm whether the hosting provider takes snapshots.",
             "See docs/BACKUP_PROPOSAL.md; point infra.backup_globs (and the offsite / "
