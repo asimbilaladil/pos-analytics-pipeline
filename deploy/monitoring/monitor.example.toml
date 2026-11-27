@@ -61,7 +61,9 @@ backup_max_age_hours = 26       # FRESHNESS only -- not proof of recoverability
 # Scheduled backups (docs/DATABASE_BACKUP.md). Uncomment when laynes-db-backup is
 # installed: then ONLY a successful scheduled backup satisfies freshness, a failed
 # attempt alerts at once, and the backup_globs dumps above are listed for
-# information only (they no longer count).
+# information only (they no longer count). Dumps inside the scheduled backup
+# directory (the parent of status/) are never listed as manual dumps, and only a
+# run the backup_timer itself started counts as scheduled.
 # backup_status_glob = "/var/backups/laynes/status/backup-*.json"
 # backup_timer = "laynes-db-backup.timer"
 # restore_test_status_glob = "/var/backups/laynes/status/restore-*.json"

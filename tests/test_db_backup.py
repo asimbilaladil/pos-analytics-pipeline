@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -178,6 +179,38 @@ with tempfile.TemporaryDirectory() as t:
     os.unlink(outside.name)
 
 # ------------------------------------------------------------------------------ 2
+print("== pure: run trigger (scheduled ONLY when systemd says a timer started it)")
+T = B.trigger_info
+check("timer-started service -> scheduled, unit + elapse recorded",
+      T({"INVOCATION_ID": "x", "TRIGGER_UNIT": "laynes-db-backup.timer",
+         "TRIGGER_TIMER_REALTIME_USEC": "1795790931588590"})
+      == {"kind": "scheduled", "trigger": {"by": "timer", "unit": "laynes-db-backup.timer",
+                                           "timer_realtime_usec": "1795790931588590"}})
+check("`systemctl start` (manual validation run) -> manual, by=systemd",
+      T({"INVOCATION_ID": "x"}) == {"kind": "manual", "trigger": {"by": "systemd", "unit": None,
+                                                                   "timer_realtime_usec": None}})
+check("shell run -> manual, by=shell", T({})["kind"] == "manual" and T({})["trigger"]["by"] == "shell")
+check("a TRIGGER_UNIT typed in a shell (no INVOCATION_ID) is NOT scheduled",
+      T({"TRIGGER_UNIT": "laynes-db-backup.timer"})["kind"] == "manual")
+check("started by a non-timer unit (path/socket/dependency) -> manual, unit kept",
+      T({"INVOCATION_ID": "x", "TRIGGER_UNIT": "foo.path"}) == {
+          "kind": "manual", "trigger": {"by": "systemd", "unit": "foo.path", "timer_realtime_usec": None}})
+src = open(os.path.join(ROOT, "backup", "laynes_db_backup.py")).read()
+check("no status/manifest hard-codes kind=scheduled any more",
+      '"kind": "scheduled",' not in src and src.count("**trigger_info()") == 2)
+with tempfile.TemporaryDirectory() as t:
+    os.chmod(t, 0o700)
+    old_env = {k: os.environ.pop(k, None) for k in ("TRIGGER_UNIT", "INVOCATION_ID")}
+    try:
+        sp = B.write_status({"backup_dir": t}, "backup", "20261127T083113Z", {"ok": True, "kind": "scheduled"})
+        st = json.load(open(sp))
+    finally:
+        for k, v in old_env.items():
+            if v is not None:
+                os.environ[k] = v
+    check("write_status: the recorded trigger overrides any kind the caller passed",
+          st["kind"] == "manual" and st["trigger"]["by"] == "shell", st)
+
 print("== static: units")
 
 
@@ -354,8 +387,11 @@ grant select on all tables in schema public to laynes_ro;""")
         check("globals: roles present, NO password hashes", "laynes_ro" in gl and "SCRAM" not in gl
               and "PASSWORD" not in gl.upper().replace("NOPASSWORD", ""))
         st = statuses("backup")[-1]
-        check("status: ok, scheduled, dump path, size, sha256", st["ok"] is True and st["kind"] == "scheduled"
-              and st["dump"] == dump and st["bytes"] == man["dump"]["bytes"])
+        check("status: ok, dump path, size, sha256; a shell run is labelled MANUAL (by=shell)",
+              st["ok"] is True and st["kind"] == "manual" and st["trigger"]["by"] == "shell"
+              and st["dump"] == dump and st["bytes"] == man["dump"]["bytes"], st.get("trigger"))
+        check("manifest records the same trigger as the status",
+              man["kind"] == "manual" and man["trigger"]["by"] == "shell", man.get("trigger"))
         live_rows = int(sql("select count(*) from orders").stdout.strip())
         check("the writer kept writing after the snapshot (test is meaningful)",
               live_rows > man["tables"]["public.orders_2026_11"]["rows"] +
@@ -486,6 +522,25 @@ grant select on all tables in schema public to laynes_ro;""")
             check("backup inside the real unit's sandbox: exit 0, status ok",
                   cp.returncode == 0 and len(statuses("backup")) == n_before + 1 and statuses("backup")[-1]["ok"],
                   cp.stderr)
+            st = statuses("backup")[-1]
+            check("a direct `systemctl start`-style run (no timer) is MANUAL (by=systemd), never scheduled",
+                  st["kind"] == "manual" and st["trigger"] == {"by": "systemd", "unit": None,
+                                                               "timer_realtime_usec": None}, st.get("trigger"))
+            # the same sandboxed command, started by a TIMER -> systemd sets TRIGGER_UNIT
+            n_before = len(statuses("backup"))
+            targv = [a for a in argv if a not in ("--wait",)]
+            targv[targv.index(f"--unit=laynes-db-backup-test-{tag}")] = f"--unit=laynes-db-backup-ttest-{tag}"
+            targv.insert(1, "--on-active=1")
+            cp = subprocess.run(targv, capture_output=True, text=True, timeout=60)
+            deadline = time.monotonic() + 600
+            while len(statuses("backup")) == n_before and time.monotonic() < deadline:
+                time.sleep(3)
+            st = statuses("backup")[-1] if len(statuses("backup")) > n_before else {}
+            check("a TIMER-started run is SCHEDULED with the timer unit recorded",
+                  cp.returncode == 0 and st.get("ok") is True and st.get("kind") == "scheduled"
+                  and st["trigger"]["by"] == "timer"
+                  and st["trigger"]["unit"] == f"laynes-db-backup-ttest-{tag}.timer"
+                  and str(st["trigger"]["timer_realtime_usec"]).isdigit(), (cp.stderr, st.get("trigger")))
             argv[argv.index(f"--unit=laynes-db-backup-test-{tag}")] = f"--unit=laynes-db-restore-test-{tag}"
             argv[-1] = "restore-test"
             argv[argv.index("MemoryMax=768M")] = "MemoryMax=1G"

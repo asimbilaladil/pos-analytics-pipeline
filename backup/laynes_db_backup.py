@@ -510,11 +510,35 @@ class Lock:
         self.fh.close()
 
 
+def trigger_info(env=None) -> dict:
+    """WHO started this run, from what systemd itself sets -- never from a flag.
+
+    systemd (>= 254) exports TRIGGER_UNIT=<name>.timer (plus
+    TRIGGER_TIMER_REALTIME_USEC) to a service a timer activated, and
+    INVOCATION_ID to every service it runs. Only that combination is a
+    "scheduled" run. `systemctl start laynes-db-backup.service` (a manual
+    validation run) has INVOCATION_ID but no TRIGGER_UNIT; a shell run has
+    neither. Both are "manual", so the monitor never credits an operator's
+    run as proof that the unattended schedule works.
+    """
+    env = os.environ if env is None else env
+    unit = env.get("TRIGGER_UNIT") or ""
+    under_systemd = bool(env.get("INVOCATION_ID"))
+    timer = under_systemd and unit.endswith(".timer")
+    return {"kind": "scheduled" if timer else "manual",
+            "trigger": {"by": "timer" if timer else ("systemd" if under_systemd else "shell"),
+                        "unit": unit or None,
+                        "timer_realtime_usec": (env.get("TRIGGER_TIMER_REALTIME_USEC") or None)
+                        if timer else None}}
+
+
 def write_status(cfg: dict, kind: str, stamp: str, body: dict) -> str:
     sd = os.path.join(cfg["backup_dir"], "status")
     os.makedirs(sd, mode=0o700, exist_ok=True)
     path = os.path.join(sd, f"{kind}-{stamp}-{os.getpid()}.json")
-    write_json_atomic(path, {"tool": TOOL, "format_version": FORMAT_VERSION, **body})
+    # the trigger is recorded by the writer, so no status file can omit or guess it
+    write_json_atomic(path, {"tool": TOOL, "format_version": FORMAT_VERSION, **body,
+                             **trigger_info()})
     return path
 
 
@@ -630,7 +654,7 @@ def do_backup(cfg: dict) -> int:
             fsync_path(d)
             finished = utcnow()
             manifest = {
-                "tool": TOOL, "format_version": FORMAT_VERSION, "kind": "scheduled",
+                "tool": TOOL, "format_version": FORMAT_VERSION, **trigger_info(),
                 "name": name, "host": socket.gethostname(), "database": cfg["database"],
                 "started_at": iso(started), "snapshot_at": iso(snap_at), "completed_at": iso(finished),
                 "server_version": meta[0], "server_version_num": int(meta[1]),
@@ -647,7 +671,7 @@ def do_backup(cfg: dict) -> int:
             log(f"backup complete: {name}.dump {dump_bytes >> 20} MiB sha256 {sha[:16]}... "
                 f"{len(facts['tables'])} tables, archive decoded in full")
 
-            status = {"ok": True, "kind": "scheduled", "started_at": iso(started),
+            status = {"ok": True, "started_at": iso(started),
                       "completed_at": iso(finished), "dump": dump, "bytes": dump_bytes,
                       "sha256": sha, "verify": "archive (toc + full decode + table coverage)",
                       "tables": len(facts["tables"]),
@@ -676,7 +700,7 @@ def do_backup(cfg: dict) -> int:
         log(f"BACKUP FAILED at {st}: {err}")
         try:
             write_status(cfg, "backup", stamp, {
-                "ok": False, "kind": "scheduled", "started_at": iso(started),
+                "ok": False, "started_at": iso(started),
                 "completed_at": iso(utcnow()), "stage": st, "error": str(err)[:1000],
                 "dump": None})
         except Exception as e2:  # noqa: BLE001

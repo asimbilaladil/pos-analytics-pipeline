@@ -192,6 +192,21 @@ In addition:
 New setting `infra.backup_status_glob`. When set:
 - Only a **successful scheduled backup** recorded by the job satisfies
   `backup_freshness`. The threshold stays 26 h and the severity stays HIGH.
+- "Scheduled" means **started by the backup timer**, as recorded by the tool
+  itself. systemd sets `TRIGGER_UNIT=<name>.timer` (and `INVOCATION_ID`) for a
+  timer-started service; the tool writes `kind` and
+  `trigger: {by, unit, timer_realtime_usec}` into every status file and
+  manifest. `systemctl start laynes-db-backup.service` is `kind: manual`
+  (`by: systemd`); a shell run is `by: shell`. The monitor credits a success
+  only when `kind` is scheduled, `by` is timer and the unit equals
+  `infra.backup_timer`. Manual runs are listed under `manual_runs` and never
+  satisfy the check; a failed manual run does not turn it red either.
+- Status files written before the trigger was recorded (the 2026-11-26 manual
+  validation run and the 2026-11-27 first timer run) carry `kind: scheduled`
+  with no `trigger`. They are **not credited** (their origin cannot be proven
+  from the file); a failure of that shape still counts, fail-closed. So the
+  scheduled mode can be activated only after one timer run of the fixed tool
+  has written a `by: timer` status.
 - A **failed attempt newer than the last success** is HIGH (`backup_failed`)
   **immediately**, not after 26 h. An unreadable status file counts as failed.
 - The recorded dump must still exist with the recorded size, otherwise HIGH
@@ -201,7 +216,10 @@ New setting `infra.backup_status_glob`. When set:
   - the last failure (stage, error);
   - the timer state and the **next scheduled run**;
   - restore-test status **with its mode**, and offsite status;
-  - the newest manual dump, labelled "does NOT satisfy this check".
+  - the newest manual dump **outside the scheduled backup directory** (the
+    directory that holds `status/`), labelled "does NOT satisfy this check".
+    The job's own dumps are accounted for by its status files, so they are
+    never listed as manual dumps even if `backup_globs` still covers them.
 - When the setting is empty (the default), behaviour is unchanged, so deploying
   the code alone changes no incident.
 
@@ -348,9 +366,13 @@ installed script. Removing backups is a separate decision.
   off-server**, under the same key and destination as above. It ships with the
   off-server job.
 
-Separately: the release `.env` is currently mode **0777**. Its parent `/root` is
-0700, which limits exposure, but it should be 0600. That is an owner-approved
-change, outside this PR.
+Correction (2026-11-27): the release `.env` is **not** mode 0777. It is a
+symlink (the 0777 shown was the link's own mode, which carries no meaning) to
+`/root/pos-analytics-pipeline/.env`, which is `root:root 0600`. The real issue
+is a dependency: the API, the HME, R365 and Revel jobs and the monitor all read
+the release `.env` through that link, i.e. from the unfinished pricing
+checkout. Proposed fix (owner-approved, quiet window, zero active jobs): give
+the release its own 0600 copy and repoint the link. Outside this PR.
 
 ## Recovery targets
 
@@ -389,4 +411,5 @@ change, outside this PR.
    by the owner).
 8. **Hetzner Backups or Snapshots:** the owner confirms in the Cloud Console
    whether they are on.
-9. **`.env` permissions:** 0777 → 0600.
+9. **Release `.env` dependency:** give the release its own 0600 copy instead
+   of the symlink into the pricing checkout (see above).
