@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 import threading
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 
 from .. import clock
 from ..model import (ACCEPTED, CRITICAL, FAIL, HIGH, OK, PENDING, SRC_REVEL, WARNING,
@@ -159,7 +159,7 @@ def reconciliation(ctx) -> list[CheckResult]:
     accepted = {int(k): v for k, v in cfg["accepted_stores"].items()}
     out: list[CheckResult] = []
     stores = rows(ctx.pg(), "SELECT id, name FROM establishments WHERE active ORDER BY id")
-    for day in clock.closed_business_days(ctx.now, cfg["lookback_days"]):
+    for day in days_to_check(ctx, cfg):
         d = day.isoformat()
         ready = clock.ready_at(day, cfg["ready_after_local"])
         if ctx.now < ready:
@@ -209,6 +209,30 @@ def reconciliation(ctx) -> list[CheckResult]:
         else:
             out.append(CheckResult(state=OK, title="Network Revel reconciliation", **net))
     return out
+
+
+def days_to_check(ctx, cfg) -> list[date]:
+    """The lookback window, PLUS the day of every still-open reconciliation
+    incident that has aged out of it (up to recheck_open_max_days old).
+
+    An incident resolves only when its own store-day is evaluated again and
+    passes. Without this, a store-day that fell out of the window stayed OPEN
+    forever, even after the late sync made it reconcile (2026-11-22 Shepherd)
+    -- and a still-failing one was never re-checked either. Re-checking uses
+    the same verdict code and tolerance; nothing is resolved without evidence.
+    """
+    days = clock.closed_business_days(ctx.now, cfg["lookback_days"])
+    oldest = clock.chicago(ctx.now).date() - timedelta(days=cfg["recheck_open_max_days"])
+    extra = set()
+    for check in (CHECK_RECON, CHECK_NETWORK):
+        for inc in ctx.store.active_incidents(SRC_REVEL, check):
+            try:
+                d = date.fromisoformat(inc["business_date"] or "")
+            except ValueError:
+                continue
+            if d not in days and oldest <= d < clock.chicago(ctx.now).date():
+                extra.add(d)
+    return days + sorted(extra, reverse=True)
 
 
 def _classify(ctx, s, d, tol, cfg, accepted) -> CheckResult:

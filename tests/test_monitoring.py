@@ -412,6 +412,44 @@ try:
     check("accepted closed date: no-data store-days ACCEPTED, no network alarm",
           res[("sales_reconciliation", 40)].state == "ACCEPTED"
           and res[("network_reconciliation", None)].state == OK)
+    # aged-out OPEN incidents are re-checked until they resolve on evidence
+    D2, D_OLD = "2026-11-26", "2026-11-22"
+    st = Store(":memory:")
+    fake_cs.stores = {D_OLD: [bd(15, "LCF Shepherd", "FAIL", "reconciliation_mismatch", "+0.66%",
+                                 ["sales reconciliation off by +0.66% ($+59.15); tolerance ±0.5%"]),
+                              bd(36, "LCF Missouri City", "FAIL", "payment_timing", "+5.42%",
+                                 ["sales reconciliation off by +5.42% ($+334.51); tolerance ±0.5%"])]}
+    ctx = engine.Context(cfgr, st, ct(2026, 11, 23, 10, 0), "data", pg_connect=lambda: pg)
+    engine.apply_results(st, cfgr, revel.reconciliation(ctx), ctx.now)
+    opened = {i["store_id"] for i in st.active_incidents("revel", "sales_reconciliation")}
+    check("setup: incidents open for the 11-22 failures", {15, 36} <= opened, opened)
+    # four days later, lookback 1 = only 11-26; 11-22 Shepherd now passes, MC still fails
+    fake_cs.calls.clear()
+    fake_cs.stores = {D2: [bd(i["id"], i["name"], "PASS", delta="+0.00%") for i in STORES],
+                      D_OLD: [bd(15, "LCF Shepherd", "PASS", delta="+0.19%"),
+                              bd(6, "LCF Katy", "PASS", delta="+0.00%"),
+                              bd(40, "LCF Rosenberg", "PASS", delta="+0.00%"),
+                              bd(36, "LCF Missouri City", "FAIL", "payment_timing", "+5.42%",
+                                 ["sales reconciliation off by +5.42% ($+334.51); tolerance ±0.5%"])]}
+    ctx = engine.Context(cfgr, st, ct(2026, 11, 27, 10, 0), "data", pg_connect=lambda: pg)
+    check("days_to_check = window + the aged-out day of an open incident",
+          revel.days_to_check(ctx, cfgr["revel"]) == [date(2026, 11, 26), date(2026, 11, 22)])
+    engine.apply_results(st, cfgr, revel.reconciliation(ctx), ctx.now)
+    check("the aged-out day is evaluated by the SAME verdict code",
+          ("2026-11-22", "2026-11-23") in fake_cs.calls and ("2026-11-26", "2026-11-27") in fake_cs.calls,
+          fake_cs.calls)
+    still = {i["store_id"] for i in st.active_incidents("revel", "sales_reconciliation")}
+    check("now-passing aged-out store-day RESOLVES; still-failing one stays OPEN",
+          still == {36}, still)
+    # nothing open -> nothing extra; too old -> not re-checked
+    ctx = engine.Context(make_cfg(revel={"lookback_days": 1, "recheck_open_max_days": 3}), st,
+                         ct(2026, 11, 27, 10, 0), "data", pg_connect=lambda: pg)
+    check("beyond recheck_open_max_days: not re-checked (bounded work)",
+          revel.days_to_check(ctx, ctx.cfg["revel"]) == [date(2026, 11, 26)])
+    ctx = engine.Context(cfgr, Store(":memory:"), ct(2026, 11, 27, 10, 0), "data", pg_connect=lambda: pg)
+    check("no open incidents -> exactly the lookback window",
+          revel.days_to_check(ctx, cfgr["revel"]) == [date(2026, 11, 26)])
+    check("default re-check horizon is 35 days", mcfg.DEFAULTS["revel"]["recheck_open_max_days"] == 35)
 finally:
     revel._chat_sql = orig
 

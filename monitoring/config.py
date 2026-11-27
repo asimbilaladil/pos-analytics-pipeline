@@ -65,6 +65,9 @@ DEFAULTS: dict = {
         # D is complete only after that run on D+1.
         "ready_after_local": "09:45",
         "lookback_days": 3,
+        # Days older than the window that still have an OPEN reconciliation
+        # incident are re-checked (so it can resolve on evidence), up to this age.
+        "recheck_open_max_days": 35,
         # sync_state.last_success_at older than this = a missed nightly sync.
         "sync_max_age_hours": 26,
         # A store-day failing on payment timing (payments dated another day) is
