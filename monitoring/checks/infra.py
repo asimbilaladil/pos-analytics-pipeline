@@ -78,10 +78,15 @@ def disk_usage(path):
     return shutil.disk_usage(path)
 
 
-def newest_backup(globs: list[str]) -> tuple[str | None, datetime | None]:
+def newest_backup(globs: list[str], exclude_dirs=()) -> tuple[str | None, datetime | None]:
+    """Newest dump >= 1 MiB under the globs, skipping anything inside exclude_dirs
+    (the scheduled job's own directory, which its status files account for)."""
+    excl = [os.path.realpath(d).rstrip("/") + "/" for d in exclude_dirs if d]
     best, ts = None, None
     for g in globs:
         for p in glob.glob(g):
+            if any(os.path.realpath(p).startswith(x) for x in excl):
+                continue
             try:
                 st = os.stat(p)
             except OSError:
@@ -157,6 +162,21 @@ def _parse_ts(v) -> datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
+def _run_origin(d, timer_unit) -> str:
+    """'scheduled' only for a status the tool wrote for a run the expected timer
+    started; 'manual' for an operator run; 'unrecorded' for a status written
+    before the tool recorded its trigger (it cannot prove either)."""
+    if not isinstance(d, dict):
+        return "unreadable"
+    t = d.get("trigger")
+    if not isinstance(t, dict):
+        return "unrecorded"
+    if (d.get("kind") == "scheduled" and t.get("by") == "timer"
+            and (not timer_unit or t.get("unit") == timer_unit)):
+        return "scheduled"
+    return "manual"
+
+
 def _scheduled_backup(ctx, c, out: list, detail: dict):
     """Freshness from the scheduled job's OWN status files (laynes-db-backup):
     only a backup the job recorded as complete and verified counts, the file it
@@ -166,7 +186,16 @@ def _scheduled_backup(ctx, c, out: list, detail: dict):
     base = dict(source=SRC_INFRA, check="backup_freshness",
                 expected=f"a successful SCHEDULED backup newer than {c['backup_max_age_hours']}h "
                          f"(archive-verified; restore status reported separately)")
-    statuses = ctx.read_status_jsons(c["backup_status_glob"])
+    all_statuses = ctx.read_status_jsons(c["backup_status_glob"])
+    # Only a run the backup TIMER started counts (the tool records systemd's
+    # TRIGGER_UNIT). An unreadable file, and a failure whose trigger was never
+    # recorded (pre-trigger tool version), stay in the verdict: fail closed.
+    statuses, others = [], []
+    for p, d in all_statuses:
+        origin = _run_origin(d, c.get("backup_timer"))
+        counts = (origin in ("scheduled", "unreadable")
+                  or (origin == "unrecorded" and d.get("ok") is not True))
+        (statuses if counts else others).append((p, d))
     ok_i = next((i for i, (_p, d) in enumerate(statuses) if d and d.get("ok") is True
                  and _parse_ts(d.get("completed_at"))), None)
     fail_i = next((i for i, (_p, d) in enumerate(statuses) if not d or d.get("ok") is not True), None)
@@ -198,7 +227,19 @@ def _scheduled_backup(ctx, c, out: list, detail: dict):
                                   "status_file": last_fail[0]}
     else:
         detail["last_failure"] = None
-    path, ts = ctx.newest_backup(c["backup_globs"]) if c.get("backup_globs") else (None, None)
+    if others:
+        p0, d0 = others[0]
+        detail["manual_runs"] = {
+            "count": len(others), "newest_status_file": p0, "ok": d0.get("ok"),
+            "completed_at": d0.get("completed_at"),
+            "origin": _run_origin(d0, c.get("backup_timer")),
+            "note": "runs not started by the backup timer (manual / trigger not recorded): "
+                    "do NOT satisfy this check"}
+    else:
+        detail["manual_runs"] = None
+    sched_dir = os.path.dirname(os.path.dirname(c["backup_status_glob"]))
+    path, ts = (ctx.newest_backup(c["backup_globs"], exclude_dirs=(sched_dir,))
+                if c.get("backup_globs") else (None, None))
     detail["manual_backups"] = ({"newest": path, "modified_at": ts.isoformat(timespec="seconds"),
                                  "note": "manual/pre-deploy dump: does NOT satisfy this check"}
                                 if ts else None)

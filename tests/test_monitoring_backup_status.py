@@ -41,16 +41,21 @@ def cfg(**infra_over):
     return mcfg._merge(out, base)
 
 
-def ok_status(hours_ago, dump=DUMP, size=SIZE):
+TIMER = {"by": "timer", "unit": "laynes-db-backup.timer", "timer_realtime_usec": "1795854671000000"}
+MANUAL = {"by": "systemd", "unit": None, "timer_realtime_usec": None}
+
+
+def ok_status(hours_ago, dump=DUMP, size=SIZE, kind="scheduled", trigger=TIMER):
     t = NOW - timedelta(hours=hours_ago)
-    return {"ok": True, "kind": "scheduled", "started_at": (t - timedelta(minutes=4)).isoformat(),
+    return {"ok": True, "kind": kind, "trigger": trigger, "started_at": (t - timedelta(minutes=4)).isoformat(),
             "completed_at": t.isoformat(), "dump": dump, "bytes": size, "sha256": "ab" * 32,
             "verify": "archive (toc + full decode + table coverage)"}
 
 
-def fail_status(hours_ago, stage="preflight", error="insufficient_space: {...}"):
+def fail_status(hours_ago, stage="preflight", error="insufficient_space: {...}", kind="scheduled",
+                trigger=TIMER):
     t = NOW - timedelta(hours=hours_ago)
-    return {"ok": False, "kind": "scheduled", "started_at": t.isoformat(),
+    return {"ok": False, "kind": kind, "trigger": trigger, "started_at": t.isoformat(),
             "completed_at": (t + timedelta(seconds=3)).isoformat(), "stage": stage, "error": error,
             "dump": None}
 
@@ -61,9 +66,19 @@ def ctx(statuses, *, sizes=None, manual=(None, None), timer=None, **infra_over):
     return engine.Context(
         cfg(**infra_over), Store(":memory:"), NOW, "data",
         read_status_jsons=lambda g: [(f"/s/{i}.json", s) for i, s in enumerate(statuses)],
-        file_size=lambda p: sizes.get(p), newest_backup=lambda g: manual,
+        file_size=lambda p: sizes.get(p), newest_backup=lambda g, **k: SEEN.update(k) or manual,
         systemctl=lambda u: timer, backup_format=lambda p: "pg_dump custom archive",
         read_status_json=lambda g: (None, None))
+
+
+SEEN = {}
+
+
+def legacy(st):
+    """A status as the pre-fix tool wrote it: kind=scheduled hard-coded, no trigger."""
+    st = dict(st)
+    st.pop("trigger")
+    return st
 
 
 def run(c):
@@ -114,6 +129,52 @@ check("recorded dump changed size -> HIGH backup_missing", r.category == "backup
 r, d = run(ctx([ok_status(2)], timer={"UnitFileState": "disabled", "NextElapseUSecRealtime": ""}))
 check("disabled timer is visible in evidence (freshness still decides the state)",
       d["timer"]["state"] == "disabled" and d["timer"]["next_scheduled"] is None)
+
+print("== only TIMER-started runs count (manual validation runs never do)")
+r, d = run(ctx([ok_status(1, kind="manual", trigger=MANUAL)]))
+check("a manual `systemctl start` backup alone -> HIGH no_backup (not 'Scheduled backup OK')",
+      r.state == FAIL and r.category == "no_backup", r)
+check("...and it is listed under manual_runs, labelled as not counting",
+      d["manual_runs"]["count"] == 1 and d["manual_runs"]["origin"] == "manual"
+      and "do NOT satisfy" in d["manual_runs"]["note"], d.get("manual_runs"))
+r, _ = run(ctx([legacy(ok_status(1))]))
+check("a pre-fix status (kind=scheduled but NO recorded trigger) is not credited",
+      r.state == FAIL and r.category == "no_backup", r)
+r, _ = run(ctx([legacy(fail_status(1)), ok_status(3)]))
+check("...but a pre-fix FAILURE still counts (fail closed)", r.category == "backup_failed", r)
+r, _ = run(ctx([ok_status(1, trigger={**TIMER, "unit": "some-other.timer"})]))
+check("a timer run from a DIFFERENT timer unit is not credited", r.category == "no_backup", r)
+r, d = run(ctx([fail_status(1, kind="manual", trigger=MANUAL), ok_status(3)]))
+check("a failed MANUAL run after a scheduled success does not turn the check red",
+      r.state == OK and d["last_failure"] is None and d["manual_runs"]["ok"] is False, r)
+r, d = run(ctx([ok_status(1, kind="manual", trigger=MANUAL), ok_status(30)]))
+check("a fresh manual run cannot rescue a stale scheduled backup -> HIGH stale_backup",
+      r.category == "stale_backup" and d["last_success"]["age_hours"] == 30.0, r)
+r, d = run(ctx([ok_status(3)]))
+check("timer run -> OK, no manual runs listed", r.state == OK and d["manual_runs"] is None, r)
+
+print("== manual-dump listing excludes the scheduled backup directory")
+SEEN.clear()
+run(ctx([ok_status(3)]))
+check("monitor passes the scheduled directory (from backup_status_glob) as excluded",
+      SEEN.get("exclude_dirs") == ("/var/backups/laynes",), SEEN)
+with tempfile.TemporaryDirectory() as t:
+    sched, man = os.path.join(t, "laynes"), os.path.join(t, "deploy-x")
+    os.makedirs(sched)
+    os.makedirs(man)
+    for i, p in enumerate((os.path.join(man, "pre.dump"), os.path.join(sched, "laynes-1.dump"))):
+        with open(p, "wb") as fh:
+            fh.write(b"PGDMP" + b"0" * (2 * 1024 * 1024))
+        os.utime(p, (1_800_000_000 + i * 60,) * 2)
+    globs = [os.path.join(t, "*", "*.dump")]
+    got, _ = infra.newest_backup(globs, exclude_dirs=(sched,))
+    check("newest_backup(exclude_dirs): the newer scheduled dump is skipped, the manual one listed",
+          got == os.path.join(man, "pre.dump"), got)
+    check("newest_backup without exclusions is unchanged (legacy mode)",
+          infra.newest_backup(globs)[0] == os.path.join(sched, "laynes-1.dump"))
+    check("a directory that merely shares the prefix is NOT excluded",
+          infra.newest_backup([os.path.join(t, "deploy-x", "*.dump")],
+                              exclude_dirs=(os.path.join(t, "deploy"),))[0] == os.path.join(man, "pre.dump"))
 
 print("== restore-test evidence carries its mode")
 rt = {"ok": True, "mode": "critical", "completed_at": (NOW - timedelta(days=2)).isoformat(), "dump": DUMP}
